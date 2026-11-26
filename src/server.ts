@@ -3,6 +3,7 @@ import { closePoolGracefully, closeServerGracefully } from "./shutdown.js";
 import { pool } from "./v1/config/db.config.js";
 import { getStartupConfigProblems } from "./v1/config/env.config.js";
 import { HOST, PORT } from "./v1/config/server.config.js";
+import { setDatabaseReadyService } from "./v1/services/databaseReadiness.service.js";
 import { getDatabaseRoleProblemsService } from "./v1/services/databaseRole.service.js";
 import { getMigrationStateService } from "./v1/services/schema.service.js";
 import { isDatabaseUnreachableError } from "./v1/utils/databaseError.util.js";
@@ -11,6 +12,9 @@ import { isDatabaseUnreachableError } from "./v1/utils/databaseError.util.js";
 // then the database connections get 2 more (a request stuck on a frozen database holds its connection until then).
 const SHUTDOWN_TIMEOUT_MS = 6_000;
 const POOL_CLOSE_TIMEOUT_MS = 2_000;
+
+// how long after a check that found the database unreachable the next one starts
+const DATABASE_RETRY_INTERVAL_MS = 3_000;
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -21,24 +25,12 @@ if (problems.length > 0) {
     process.exit(1);
 }
 
+let stopping = false;
+let retryTimer: NodeJS.Timeout | undefined;
+
 // Refuses to run against a database whose schema is not this checkout's: pending migrations would fail on the
-// first query that needs them, and migrations this checkout does not have mean the wrong database. A database
-// that cannot be reached is not a reason to stay down: the API starts and GET /v1/health reports it as down.
-// A database that answers and refuses (a wrong password, a missing database) will not get better by itself, so
-// the server stops and says what is wrong.
-const checkDatabaseSchema = async (): Promise<void> => {
-    try {
-        await pool.query("SELECT 1");
-    } catch (error) {
-        if (!isDatabaseUnreachableError(error)) {
-            console.error(`Cannot start the server: the database refused the connection (${describeError(error)}). Check DATABASE_URL.`);
-            process.exit(1);
-        }
-
-        console.warn("Warning: the database cannot be reached; the API starts and GET /v1/health reports it as down");
-        return;
-    }
-
+// first query that needs them, and migrations this checkout does not have mean the wrong database.
+const checkRoleAndSchema = async (): Promise<void> => {
     // The API runs with the least rights it needs: the role rag_lab_api. A connection that can change the schema, create
     // roles or databases, or own the tables is the owner's, and it must not be the API's. The message names the role
     // to use and never the URL, which has the password in it.
@@ -52,7 +44,7 @@ const checkDatabaseSchema = async (): Promise<void> => {
         process.exit(1);
     }
 
-    const { pending, unknown, foreignTables } = await getMigrationStateService();
+    const { pending, unknown, foreignTables } = await getMigrationStateService(pool);
     const schemaProblems: string[] = [];
 
     if (foreignTables.length > 0) {
@@ -71,11 +63,61 @@ const checkDatabaseSchema = async (): Promise<void> => {
     }
 };
 
-try {
-    await checkDatabaseSchema();
-} catch (error) {
-    console.error("Cannot start the server: the database schema could not be checked", error);
-    process.exit(1);
+// True when the database passed the check; false when it cannot be reached right now. A PostgreSQL that is restarting
+// and ends the connection (57P01) counts as unreachable: it comes back, so it is a reason to try again, not to stop.
+// A database that answers and refuses (a wrong password, a missing database), a role or a schema that is wrong, or
+// any other failure will not get better by itself: the process exits with code 1 and says what is wrong. While the
+// server shuts down, a check that fails is not a reason to exit with an error: the shutdown is already on its way.
+const checkDatabase = async (): Promise<boolean> => {
+    try {
+        await pool.query("SELECT 1");
+    } catch (error) {
+        if (stopping || isDatabaseUnreachableError(error)) {
+            return false;
+        }
+
+        console.error(`Cannot start the server: the database refused the connection (${describeError(error)}). Check DATABASE_URL.`);
+        process.exit(1);
+    }
+
+    try {
+        await checkRoleAndSchema();
+        return true;
+    } catch (error) {
+        if (stopping || isDatabaseUnreachableError(error)) {
+            return false;
+        }
+
+        console.error("Cannot start the server: the database schema could not be checked", error);
+        process.exit(1);
+    }
+};
+
+// Repeats the check until it passes, then lets the routes through. The next check starts DATABASE_RETRY_INTERVAL_MS
+// after the last one ended, so two never overlap. The timer does not keep the process alive, and shutDown stops it.
+const retryDatabaseCheck = (): void => {
+    retryTimer = setTimeout(async () => {
+        retryTimer = undefined;
+
+        if (await checkDatabase()) {
+            setDatabaseReadyService(true);
+            console.log("The database answers and passed the check: the API serves requests");
+            return;
+        }
+
+        if (!stopping) {
+            retryDatabaseCheck();
+        }
+    }, DATABASE_RETRY_INTERVAL_MS);
+    retryTimer.unref();
+};
+
+// A database that cannot be reached is not a reason to stay down: the API starts, GET /v1/health reports it as down,
+// and every other route answers 503 (databaseReadyMiddleware) until a later check has passed.
+if (!(await checkDatabase())) {
+    setDatabaseReadyService(false);
+    console.warn("Warning: the database cannot be reached; the API starts and GET /v1/health reports it as down. The role and the migrations are checked again until the database answers; until then the other routes answer 503");
+    retryDatabaseCheck();
 }
 
 // Express 5 calls the callback with the error when listening fails (the port is in use, for example), so
@@ -89,10 +131,12 @@ const server = app.listen(PORT, HOST, (error?: Error) => {
     console.log(`Server running on http://${HOST}:${PORT}`);
 });
 
-// On docker stop (SIGTERM) or Ctrl+C (SIGINT): let the requests in progress finish, then close the database.
-// There are no streams or background work yet.
+// On docker stop (SIGTERM) or Ctrl+C (SIGINT): stop the background check, let the requests in progress finish, then
+// close the database. There are no streams yet.
 const shutDown = async (signal: string): Promise<void> => {
     console.log(`${signal} received: finishing the requests in progress`);
+    stopping = true;
+    clearTimeout(retryTimer);
 
     try {
         await closeServerGracefully(server, () => {}, SHUTDOWN_TIMEOUT_MS);

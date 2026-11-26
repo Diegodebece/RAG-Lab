@@ -40,11 +40,13 @@ const emailAndIpKey = (req: Request): string => {
         : `email:${trimmed.normalize("NFC").toLowerCase()}|${clientAddressKey(req)}`;
 };
 
-// A user keeps one counter whatever address they use. It is keyed by the token's user id, which is all there is
-// before the database is asked about the account (this limit runs before currentUserMiddleware, so that a user over
-// the limit costs the database nothing). Without a token (a route mounted outside the protected section by
-// mistake), the address is the key, so the limit still applies.
-const userKey = (req: Request): string => (req.decoded ? `user:${req.decoded.id}` : clientAddressKey(req));
+// A user keeps one counter whatever address they use. It is keyed by the token's user id and its version, which is all
+// there is before the database is asked about the account (this limit runs before currentUserMiddleware, so that a user
+// over the limit costs the database nothing). The version is part of the key because a token that was revoked (a logout,
+// a password change) still gets here: without it, whoever holds an old token of an account would use up the limit of
+// the account's current session. Without a token (a route mounted outside the protected section by mistake), the
+// address is the key, so the limit still applies.
+const userKey = (req: Request): string => (req.decoded ? `user:${req.decoded.id}:v${req.decoded.tokenVersion}` : clientAddressKey(req));
 
 const KEY_GENERATORS: Record<RateLimitOptions["keyBy"], (req: Request) => string> = {
     ip: clientAddressKey,

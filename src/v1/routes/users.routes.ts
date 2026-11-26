@@ -24,12 +24,14 @@ usersRouter.patch(
     changeUserPassword
 );
 
-// After the permission check, so a user is told 403 and what they try does not use up an admin's attempts. Only the
-// accounts actually created count: a typo in an email does not use up the hour's allowance.
+// After the permission check, so a user is told 403 and what they try does not use up an admin's attempts. Every
+// attempt that gets past it counts, the failed ones too and before the body is read: the route hashes a password
+// before it answers a duplicate email, so a failed attempt costs the server as much as a good one (as on the password
+// route above).
 usersRouter.post(
     "/",
     authorizeMiddleware(["admin"]),
-    rateLimitMiddleware({ limit: USER_CREATIONS_PER_HOUR, windowMs: USER_CREATION_WINDOW_MS, keyBy: "user", onlySuccesses: true }),
+    rateLimitMiddleware({ limit: USER_CREATIONS_PER_HOUR, windowMs: USER_CREATION_WINDOW_MS, keyBy: "user" }),
     express.json(),
     validateBodyMiddleware(createUserSchema),
     createUser

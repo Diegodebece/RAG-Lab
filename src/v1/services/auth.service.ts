@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { pool } from "../config/db.config.js";
 import { getSecretKey } from "../config/auth.config.js";
 import { AppError } from "../utils/appError.util.js";
-import { hashPassword, needsRehash, verifyPassword } from "../utils/password.util.js";
+import { hashPassword, isUsableHash, needsRehash, verifyPassword } from "../utils/password.util.js";
 import { signToken } from "../utils/token.util.js";
 import { USER_COLUMNS } from "./users.service.js";
 import type { AuthResult } from "../types/auth.type.js";
@@ -54,6 +54,13 @@ export const loginUserService = async (loginData: LoginUserInput): Promise<AuthR
     // a stored hash that cannot be used (not one of ours, or cost parameters outside the allowed ranges) is a
     // password that does not match, not an error of the server
     if (!(await verifyPassword(loginData.password, record.passwordHash))) {
+        // A hash made with cheaper parameters, or one that cannot be used at all (refused without any work), would
+        // answer a wrong password much faster than an unknown email does, and the difference would show which accounts
+        // have such a hash: the dummy hash is checked as well, so the answer takes as long as the others.
+        if (needsRehash(record.passwordHash) || !isUsableHash(record.passwordHash)) {
+            await verifyPassword(loginData.password, await getDummyPasswordHash());
+        }
+
         throw new AppError(401, INVALID_CREDENTIALS_MESSAGE);
     }
 

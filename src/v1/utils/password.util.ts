@@ -64,14 +64,21 @@ export const needsRehash = (storedHash: string): boolean => {
     return parseWholeNumber(N ?? "") !== COST.N || parseWholeNumber(r ?? "") !== COST.r || parseWholeNumber(p ?? "") !== COST.p;
 };
 
-// Recomputes the hash with the stored salt and parameters. timingSafeEqual takes the same time whether the
-// first or the last byte differs, so response times reveal nothing about the hash. A malformed value, or cost
-// parameters outside the allowed ranges, is false: it never throws.
-export const verifyPassword = async (password: string, storedHash: string): Promise<boolean> => {
+interface ParsedHash {
+    N: number;
+    r: number;
+    p: number;
+    salt: Buffer;
+    expected: Buffer;
+}
+
+// The parts of a stored hash, or null when it is not one this code can check (the wrong shape, hex that is not hex, or
+// cost parameters outside the allowed ranges).
+const parseStoredHash = (storedHash: string): ParsedHash | null => {
     const parts = storedHash.split("$");
 
     if (parts.length !== 6 || parts[0] !== "scrypt") {
-        return false;
+        return null;
     }
 
     const [, costN, costR, costP, saltHex, hashHex] = parts;
@@ -82,9 +89,27 @@ export const verifyPassword = async (password: string, storedHash: string): Prom
     const expected = parseHex(hashHex, MIN_KEY_BYTES, MAX_KEY_BYTES);
 
     if (!isUsableCost(N, r, p) || !salt || !expected) {
+        return null;
+    }
+
+    return { N, r, p, salt, expected };
+};
+
+// True when verifyPassword can check a password against the stored hash; when it cannot, it answers false without
+// doing any work.
+export const isUsableHash = (storedHash: string): boolean => parseStoredHash(storedHash) !== null;
+
+// Recomputes the hash with the stored salt and parameters. timingSafeEqual takes the same time whether the
+// first or the last byte differs, so response times reveal nothing about the hash. A malformed value, or cost
+// parameters outside the allowed ranges, is false: it never throws.
+export const verifyPassword = async (password: string, storedHash: string): Promise<boolean> => {
+    const parsed = parseStoredHash(storedHash);
+
+    if (!parsed) {
         return false;
     }
 
+    const { N, r, p, salt, expected } = parsed;
     let actual: Buffer;
 
     try {

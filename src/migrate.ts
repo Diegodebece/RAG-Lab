@@ -2,7 +2,7 @@ import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Pool } from "pg";
-import { createPool, withTransaction } from "./v1/config/db.config.js";
+import { createPool, runInTransaction } from "./v1/config/pool.config.js";
 import { getMigrationStateService, MIGRATIONS_DIR } from "./v1/services/schema.service.js";
 
 // Any number works; it only has to be the same for every process that runs migrations.
@@ -49,10 +49,10 @@ const applyPendingMigrations = async (migrationPool: Pool): Promise<void> => {
 
         try {
             // the file and its record are applied together, or not at all
-            await withTransaction(async (client) => {
+            await runInTransaction(migrationPool, async (client) => {
                 await client.query(sql);
                 await client.query("INSERT INTO schema_migrations (version) VALUES ($1)", [file]);
-            }, migrationPool);
+            });
         } catch (error) {
             throw new Error(`Migration ${file} failed`, { cause: error });
         }
@@ -87,7 +87,8 @@ if (!migrationUrl) {
     console.error("MIGRATION_DATABASE_URL is not set: it is the owner's connection to the database, used only to apply migrations (see .env.example). Nothing was applied.");
     process.exitCode = 1;
 } else {
-    // This script has its own pool, without the API's query timeout (db.config.ts): a migration can take longer than
+    // This script has its own pool, without the API's query timeout (db.config.ts, which it never imports: it needs
+    // DATABASE_URL, and this script needs only MIGRATION_DATABASE_URL): a migration can take longer than
     // any query the API runs, and waiting for the advisory lock below lasts as long as another process takes to migrate.
     const migrationPool = createPool({ connectionString: migrationUrl });
 

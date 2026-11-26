@@ -1,4 +1,4 @@
-import { pool } from "../config/db.config.js";
+import { pool, withTransaction } from "../config/db.config.js";
 import { getSecretKey } from "../config/auth.config.js";
 import { AppError } from "../utils/appError.util.js";
 import { isUniqueViolation } from "../utils/dbErrors.util.js";
@@ -105,19 +105,36 @@ export const updateUserService = async (actorId: string, id: string, userData: U
         throw new AppError(409, "You cannot change your own role or status");
     }
 
-    const { rows } = await pool.query<User>(
-        `UPDATE users SET
-             role = COALESCE($2::text, role),
-             status = COALESCE($3::text, status),
-             token_version = token_version + CASE WHEN $3::text = 'disabled' AND status <> 'disabled' THEN 1 ELSE 0 END
-         WHERE id = $1
-         RETURNING ${USER_COLUMNS}`,
-        [id, userData.role ?? null, userData.status ?? null]
-    );
+    // The route checked that the actor is an admin before this change, but another admin may have demoted or disabled
+    // them since: two admins who change each other at the same moment would each pass that check and both lose the right
+    // to undo it. So the actor is checked again here, with the rows of the actor and the target locked in id order
+    // (the same order in every call, so two calls cannot wait for each other), and the change is made in the same
+    // transaction. The second of two such calls waits for the first one's commit, then sees the actor as it is now.
+    return withTransaction(async (client) => {
+        const { rows: locked } = await client.query<{ id: string; role: string; status: string }>(
+            "SELECT id, role, status FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+            [[actorId, id]]
+        );
+        const actor = locked.find((row) => row.id === actorId.toLowerCase());
 
-    if (rows.length === 0) {
-        throw new AppError(404, "User not found");
-    }
+        if (!actor || actor.role !== "admin" || actor.status !== "active") {
+            throw new AppError(403, "You do not have permission to perform this action");
+        }
 
-    return rows[0];
+        const { rows } = await client.query<User>(
+            `UPDATE users SET
+                 role = COALESCE($2::text, role),
+                 status = COALESCE($3::text, status),
+                 token_version = token_version + CASE WHEN $3::text = 'disabled' AND status <> 'disabled' THEN 1 ELSE 0 END
+             WHERE id = $1
+             RETURNING ${USER_COLUMNS}`,
+            [id, userData.role ?? null, userData.status ?? null]
+        );
+
+        if (rows.length === 0) {
+            throw new AppError(404, "User not found");
+        }
+
+        return rows[0];
+    });
 };
