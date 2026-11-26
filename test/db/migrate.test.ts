@@ -53,6 +53,53 @@ describe("migrate script", () => {
     });
 });
 
+describe("migrate script against another project's database", () => {
+    // A database with tables of its own and no schema_migrations table: DATABASE_URL points at the wrong place.
+    before(async () => {
+        await emptyTestDatabase();
+        await pool.query("CREATE TABLE other_projects_notes (id integer PRIMARY KEY, body text)");
+        await pool.query("INSERT INTO other_projects_notes VALUES (1, 'keep me')");
+    });
+
+    it("refuses to run, applies nothing and leaves the database as it was", async () => {
+        await assert.rejects(runMigrateScript(), (error: unknown) => {
+            assert.ok(isScriptFailure(error), "the script exits with a failure");
+            assert.notEqual(error.code, 0);
+            assert.match(error.stderr, /another project/i, "it says the database looks like another project's");
+            assert.match(error.stderr, /DATABASE_URL/, "it points at the setting to check");
+            assert.doesNotMatch(error.stdout, /Applied /);
+            return true;
+        });
+
+        const { rows: extensions } = await pool.query("SELECT 1 FROM pg_extension WHERE extname = 'vector'");
+        assert.equal(extensions.length, 0, "001_init.sql was not applied");
+
+        const { rows: tables } = await pool.query<{ table_name: string }>(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+        );
+        assert.deepEqual(tables.map((row) => row.table_name), ["other_projects_notes"], "schema_migrations was not even created");
+
+        const { rows } = await pool.query<{ body: string }>("SELECT body FROM other_projects_notes");
+        assert.deepEqual(rows, [{ body: "keep me" }], "the other project's data is untouched");
+    });
+});
+
+describe("migrate script against a database it already set up", () => {
+    // The rule against other projects' databases must not catch the normal case: schema_migrations exists next
+    // to the tables of the later layers.
+    before(async () => {
+        await emptyTestDatabase();
+        await runMigrateScript();
+        await pool.query("CREATE TABLE later_layer_table (id integer PRIMARY KEY)");
+    });
+
+    it("runs normally when other tables sit next to schema_migrations", async () => {
+        const output = await runMigrateScript();
+
+        assert.match(output, /Database is up to date/);
+    });
+});
+
 describe("migrate script against the wrong database", () => {
     // A database that has a migration this checkout does not have: for example the development database of
     // another branch, or another project's database.

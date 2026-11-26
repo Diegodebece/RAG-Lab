@@ -1,17 +1,22 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, startFakeOllama } from "../doubles/fakeOllama.js";
+import { dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama } from "../doubles/fakeOllama.js";
 import type { FakeOllamaHandler } from "../doubles/fakeOllama.js";
 
 // The fake answers on a free port of this computer; the base URL is read when the service loads, so it is set first.
 const fake = await startFakeOllama();
+// a second server, where the first one sends redirects: it must never receive a request
+const redirectTarget = await startFakeOllama();
 process.env.OLLAMA_BASE_URL = fake.url;
 
 const { listInstalledModelsService } = await import("../../src/v1/services/ollama.service.js");
 const { AppError } = await import("../../src/v1/utils/appError.util.js");
 const { ModelUnavailableError } = await import("../../src/v1/utils/modelUnavailableError.util.js");
 
-after(() => fake.close());
+after(async () => {
+    await fake.close();
+    await redirectTarget.close();
+});
 
 // Failures that are not the client's fault and not "Ollama is down": a plain Error, which errorMiddleware answers with a 500.
 const isPlainError = (error: unknown): boolean => error instanceof Error && !(error instanceof AppError);
@@ -58,6 +63,19 @@ describe("listInstalledModelsService", () => {
             fake.respond("/api/tags", httpError(status));
 
             await assert.rejects(listInstalledModelsService({ timeoutMs: 2000 }), isPlainError, `status ${status}`);
+        }
+    });
+
+    // A model server that redirects is misconfigured or has been taken over: following it would send the request
+    // to an address nobody chose. The redirect is an error answer like any other, and its target is never asked.
+    it("does not follow a redirect: throws a plain Error and the target receives nothing", { timeout: 5000 }, async () => {
+        redirectTarget.respond("/api/tags", modelList(["qwen3.5:4b", "qwen3-embedding:0.6b"]));
+
+        for (const status of [301, 302, 303, 307, 308]) {
+            fake.respond("/api/tags", redirectTo(`${redirectTarget.url}/api/tags`, status));
+
+            await assert.rejects(listInstalledModelsService({ timeoutMs: 2000 }), isPlainError, `status ${status}`);
+            assert.deepEqual(redirectTarget.requests, [], `status ${status}: the redirect target was asked`);
         }
     });
 

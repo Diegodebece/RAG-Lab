@@ -5,7 +5,8 @@ import request from "supertest";
 // The real app with its default proxy setting: the tests connect from this computer, as cloudflared does,
 // and X-Forwarded-For carries the address Cloudflare saw. A low limit, so the counters are easy to reach.
 process.env.HEALTH_CHECKS_PER_MINUTE = "2";
-delete process.env.TRUSTED_PROXIES;
+// the app's default; set rather than deleted, because the app would load a value from the developer's .env
+process.env.TRUSTED_PROXIES = "loopback";
 
 const { app } = await import("../../src/app.js");
 const { pool } = await import("../../src/v1/config/db.config.js");

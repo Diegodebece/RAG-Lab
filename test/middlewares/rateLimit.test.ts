@@ -60,6 +60,25 @@ describe("failed-login limit and account lockout", () => {
         assert.equal((await guess()).status, 401);
         assert.equal((await guess()).status, 401);
         assert.equal((await guess()).status, 429);
+
+        // the counter is that account's, not the address's: another account from the same address is not locked
+        const other = await app.post("/login").set("X-Forwarded-For", "203.0.113.66").send({ email: "other@example.com", password: "guess" });
+        assert.equal(other.status, 401);
+    });
+
+    // The counter belongs to the email and the address together: a count per address alone would also lock the
+    // attacker's other accounts, and the owner of any account who shares their address (a household, an office).
+    it("keeps a separate counter for each email from the same address", async () => {
+        const app = request(buildTwoClientApp());
+        const attempt = (email: string, password: string) =>
+            app.post("/login").set("X-Forwarded-For", "203.0.113.66").send({ email, password });
+
+        await attempt("victim@example.com", "guess");
+        await attempt("victim@example.com", "guess");
+        assert.equal((await attempt("victim@example.com", "guess")).status, 429, "the guessed account is locked for this address");
+
+        assert.equal((await attempt("someone-else@example.com", "guess")).status, 401, "another account from this address has its own counter");
+        assert.equal((await attempt("someone-else@example.com", "right")).status, 200, "and its owner can still log in from here");
     });
 });
 

@@ -61,9 +61,37 @@ describe("authenticateMiddleware", () => {
     });
 
     it("rejects a header that does not use the Bearer scheme", async () => {
-        const response = await request(buildApp()).get("/me").set("Authorization", `Basic ${sign()}`);
+        for (const header of [`Basic ${sign()}`, "Basic abc", `Token ${sign()}`, sign()]) {
+            const response = await request(buildApp()).get("/me").set("Authorization", header);
 
-        assert.equal(response.status, 401);
+            assert.equal(response.status, 401, header);
+        }
+    });
+
+    it("accepts the Bearer scheme in any capitalization", async () => {
+        for (const scheme of ["bearer", "BEARER", "bEaReR"]) {
+            const response = await request(buildApp()).get("/me").set("Authorization", `${scheme} ${sign()}`);
+
+            assert.equal(response.status, 200, scheme);
+            assert.equal(response.body.decoded.id, payload.id, scheme);
+        }
+    });
+
+    it("rejects a header with anything after the token", async () => {
+        for (const extra of ["junk", "Bearer", sign()]) {
+            const response = await request(buildApp()).get("/me").set("Authorization", `Bearer ${sign()} ${extra}`);
+
+            assert.equal(response.status, 401, extra);
+        }
+    });
+
+    it("rejects an empty token, also when the extra space hides a valid-looking one behind it", async () => {
+        // two spaces: the token between them is empty
+        for (const header of [`Bearer  ${sign()}`, "Bearer  x", "Bearer", "Bearer  "]) {
+            const response = await request(buildApp()).get("/me").set("Authorization", header);
+
+            assert.equal(response.status, 401, JSON.stringify(header));
+        }
     });
 
     it("rejects malformed, expired, foreign and unsigned tokens with the same message", async () => {

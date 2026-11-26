@@ -37,8 +37,16 @@ describe("verifyToken", () => {
         assert.equal(verifyToken(signToken(payload, "another-secret"), SECRET), null);
     });
 
-    it("returns null for a correctly signed token with an unexpected payload", () => {
-        assert.equal(verifyToken(jwt.sign({ id: "not-a-uuid", role: "user" }, SECRET), SECRET), null);
-        assert.equal(verifyToken(jwt.sign({ id: payload.id, role: "root" }, SECRET), SECRET), null);
+    // The tokens carry an expiry and a valid signature, so the only thing wrong with them is the payload: it is
+    // the id and role validation that has to refuse them, not the missing-expiry check.
+    it("returns null for a correctly signed, unexpired token with an unexpected payload", () => {
+        const signed = (claims: object): string => jwt.sign(claims, SECRET, { algorithm: "HS256", expiresIn: "1h" });
+
+        assert.notEqual(verifyToken(signed({ id: payload.id, role: "user" }), SECRET), null, "the same token with a valid payload is accepted");
+
+        assert.equal(verifyToken(signed({ id: "not-a-uuid", role: "user" }), SECRET), null, "id that is not a UUID");
+        assert.equal(verifyToken(signed({ id: payload.id, role: "root" }), SECRET), null, "unknown role");
+        assert.equal(verifyToken(signed({ id: payload.id }), SECRET), null, "no role");
+        assert.equal(verifyToken(signed({ role: "user" }), SECRET), null, "no id");
     });
 });

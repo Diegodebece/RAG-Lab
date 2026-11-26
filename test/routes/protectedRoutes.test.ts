@@ -52,9 +52,11 @@ describe("requests per minute to the protected routes", () => {
         assert.equal((await request(app).get("/v1/first").set(...bob)).status, 404, "another user has their own counter");
     });
 
+    // more checks than the per-minute limit of the protected routes (3 here), all answered: the health check is
+    // neither counted against that limit nor asked for a token
     it("leaves the public routes out", { timeout: 10_000 }, async () => {
         for (let attempt = 0; attempt < 5; attempt++) {
-            assert.notEqual((await request(app).get("/v1/health")).status, 429);
+            assert.equal((await request(app).get("/v1/health")).status, 200, `check ${attempt + 1}`);
         }
     });
 });

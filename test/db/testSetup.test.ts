@@ -5,31 +5,71 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { cleanChildEnvironment } from "../childEnvironment.js";
+import { OPERATIONAL_DEFAULTS } from "../operationalSettings.js";
 
 const execFileAsync = promisify(execFile);
 
 const ROOT = path.join(import.meta.dirname, "..", "..");
 const FIXTURE = path.join(import.meta.dirname, "fixtures", "printDatabaseUrl.ts");
+const SETTINGS_FIXTURE = path.join(import.meta.dirname, "fixtures", "printSettings.ts");
+const PROXIES_FIXTURE = path.join(import.meta.dirname, "fixtures", "printTrustedProxies.ts");
 
 let emptyEnvDirectory = "";
 let emptyEnvFile = "";
+let developerEnvFile = "";
+
+// What a developer's own .env might hold: values that change how the app runs, none of them the test defaults.
+const DEVELOPER_SETTINGS: Record<string, string> = {
+    HOST: "0.0.0.0",
+    PORT: "8080",
+    TRUSTED_PROXIES: "10.0.0.0/8",
+    CORS_ORIGINS: "https://app.example.com",
+    HEALTH_CACHE_SECONDS: "99",
+    HEALTH_CHECKS_PER_MINUTE: "1",
+    AUTHENTICATED_REQUESTS_PER_MINUTE: "2",
+    TOKEN_LIFETIME_SECONDS: "5",
+    OLLAMA_BASE_URL: "http://localhost:11434"
+};
+
+// the values every test run starts from, written out here on purpose: they are the app's own defaults
+const TEST_DEFAULTS: Record<string, string> = {
+    HOST: "127.0.0.1",
+    PORT: "3000",
+    TRUSTED_PROXIES: "loopback",
+    CORS_ORIGINS: "",
+    HEALTH_CACHE_SECONDS: "10",
+    HEALTH_CHECKS_PER_MINUTE: "30",
+    AUTHENTICATED_REQUESTS_PER_MINUTE: "120",
+    TOKEN_LIFETIME_SECONDS: "3600",
+    OLLAMA_BASE_URL: "http://127.0.0.1:1"
+};
 
 before(async () => {
     // an empty .env, so the child process does not read the real one
     emptyEnvDirectory = await mkdtemp(path.join(tmpdir(), "rag-lab-setup-"));
     emptyEnvFile = path.join(emptyEnvDirectory, ".env");
     await writeFile(emptyEnvFile, "");
+
+    developerEnvFile = path.join(emptyEnvDirectory, "developer.env");
+    await writeFile(developerEnvFile, Object.entries(DEVELOPER_SETTINGS).map(([name, value]) => `${name}=${value}`).join("\n"));
 });
 
 after(() => rm(emptyEnvDirectory, { recursive: true, force: true }));
 
 // Runs node with the same --import chain as `npm test`, in a clean environment, and returns the last line it printed.
 const runAfterSetup = async (extraEnv: Record<string, string>, args: string[]): Promise<string> => {
-    const env: Record<string, string | undefined> = { ...process.env };
+    const env = cleanChildEnvironment();
     delete env.RAG_LAB_TEST_DATABASE_URL;
     delete env.TEST_DATABASE_URL;
     delete env.DATABASE_URL;
-    delete env.OLLAMA_BASE_URL;
+
+    // Like a developer's shell, which does not define these: only the test's own extraEnv or the .env file does,
+    // and test/setup.ts must replace what they hold.
+    for (const name of Object.keys(OPERATIONAL_DEFAULTS)) {
+        delete env[name];
+    }
+
     Object.assign(env, { DOTENV_CONFIG_PATH: emptyEnvFile, DOTENV_CONFIG_QUIET: "true" }, extraEnv);
 
     const { stdout } = await execFileAsync(
@@ -82,6 +122,38 @@ describe("test setup: database", () => {
         }, [FIXTURE]);
 
         assert.equal(printed, "unset");
+    });
+});
+
+// A test must give the same result on every computer: the developer's .env or shell must not change it.
+describe("test setup: operational settings", () => {
+    const settingsAfterSetup = async (extraEnv: Record<string, string>): Promise<Record<string, string | null>> =>
+        JSON.parse(await runAfterSetup(extraEnv, [SETTINGS_FIXTURE])) as Record<string, string | null>;
+
+    it("sets every operational setting to its default when the developer's .env changes them", { timeout: 30_000 }, async () => {
+        assert.deepEqual(await settingsAfterSetup({ DOTENV_CONFIG_PATH: developerEnvFile }), TEST_DEFAULTS);
+    });
+
+    it("sets every operational setting to its default when the shell changes them", { timeout: 30_000 }, async () => {
+        assert.deepEqual(await settingsAfterSetup(DEVELOPER_SETTINGS), TEST_DEFAULTS);
+    });
+
+    it("keeps a TRUSTED_PROXIES value from the environment out of the app under test", { timeout: 30_000 }, async () => {
+        const databaseUrl = "postgres://tester:secret@127.0.0.1:1/some_test";
+
+        // from the shell
+        assert.deepEqual(
+            JSON.parse(await runAfterSetup({ TRUSTED_PROXIES: "10.0.0.0/8", RAG_LAB_TEST_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
+            ["loopback"],
+            "shell"
+        );
+
+        // from the developer's .env, which the app loads itself when the setup left the variable alone
+        assert.deepEqual(
+            JSON.parse(await runAfterSetup({ DOTENV_CONFIG_PATH: developerEnvFile, RAG_LAB_TEST_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
+            ["loopback"],
+            ".env"
+        );
     });
 });
 

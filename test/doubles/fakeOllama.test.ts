@@ -1,6 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, startFakeOllama } from "./fakeOllama.js";
+import { dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama } from "./fakeOllama.js";
 
 // The double itself: every other test that uses it trusts these behaviors.
 const fake = await startFakeOllama();
@@ -35,6 +35,21 @@ describe("fake Ollama", () => {
         const response = await fetch(`${fake.url}/api/tags`);
         assert.equal(response.status, 200);
         await assert.rejects(response.json());
+    });
+
+    it("records the path exactly as received, so a doubled slash shows", { timeout: 5000 }, async () => {
+        await fetch(`${fake.url}//api/tags?x=1`);
+
+        assert.deepEqual(fake.requests.at(-1), { method: "GET", path: "//api/tags" });
+    });
+
+    it("can redirect, without following it for the caller", { timeout: 5000 }, async () => {
+        fake.respond("/api/tags", redirectTo("http://127.0.0.1:1/elsewhere", 307));
+
+        const response = await fetch(`${fake.url}/api/tags`, { redirect: "manual" });
+
+        assert.equal(response.status, 307);
+        assert.equal(response.headers.get("location"), "http://127.0.0.1:1/elsewhere");
     });
 
     it("can drop the connection", { timeout: 5000 }, async () => {

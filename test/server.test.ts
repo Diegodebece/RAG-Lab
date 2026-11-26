@@ -4,10 +4,12 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Server as NetServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Pool } from "pg";
+import { cleanChildEnvironment } from "./childEnvironment.js";
+import { SECRET_KEY_PLACEHOLDER } from "./config/placeholder.js";
 
 // These tests start the real src/server.ts in a child process, as `npm run dev` does, and look at what it prints,
 // how it exits and what it answers.
@@ -67,20 +69,14 @@ const getFreePort = (): Promise<number> => new Promise((resolve, reject) => {
 
 const startServer = async (overrides: Record<string, string | undefined> = {}): Promise<RunningServer> => {
     const port = await getFreePort();
-    const env: Record<string, string | undefined> = {
-        ...process.env,
+    // starts from the test defaults, not from whatever the test process's environment holds
+    const env = cleanChildEnvironment({
         PORT: String(port),
         SECRET_KEY: VALID_SECRET,
         DOTENV_CONFIG_PATH: emptyEnvFile,
         DOTENV_CONFIG_QUIET: "true",
         ...overrides
-    };
-
-    for (const name of Object.keys(env)) {
-        if (env[name] === undefined) {
-            delete env[name];
-        }
-    }
+    });
 
     const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -140,13 +136,63 @@ describe("server startup: configuration", () => {
         assert.doesNotMatch(server.output().stdout, /Server running/);
     });
 
+    // the placeholder is long enough for the length rule, so only the check for the placeholder itself rejects it
     it("refuses to start with the placeholder SECRET_KEY from .env.example", { timeout: 15_000 }, async () => {
-        const server = await startServer({ SECRET_KEY: "change-me", DATABASE_URL: UNREACHABLE_DATABASE_URL });
+        const server = await startServer({ SECRET_KEY: SECRET_KEY_PLACEHOLDER, DATABASE_URL: UNREACHABLE_DATABASE_URL });
 
-        assert.equal(await waitForExit(server), 1);
+        assert.equal(await waitForExit(server, 8_000), 1);
         assert.match(server.output().stderr, /Cannot start the server/);
         assert.match(server.output().stderr, /SECRET_KEY/);
         assert.doesNotMatch(server.output().stdout, /Server running/);
+    });
+
+    it("refuses to start when OLLAMA_BASE_URL is not an http or https address", { timeout: 15_000 }, async () => {
+        const server = await startServer({ OLLAMA_BASE_URL: "localhost:11434", DATABASE_URL: UNREACHABLE_DATABASE_URL });
+
+        assert.equal(await waitForExit(server, 8_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(server.output().stderr, /OLLAMA_BASE_URL/);
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+    });
+
+    it("does not take its settings from the test process's own environment", { timeout: 15_000 }, async () => {
+        // a value that would stop any server at startup, if the child process inherited it
+        const previous = process.env.HEALTH_CACHE_SECONDS;
+        process.env.HEALTH_CACHE_SECONDS = "not-a-number";
+        let server: RunningServer;
+
+        try {
+            server = await startServer({ DATABASE_URL: UNREACHABLE_DATABASE_URL });
+        } finally {
+            if (previous === undefined) {
+                delete process.env.HEALTH_CACHE_SECONDS;
+            } else {
+                process.env.HEALTH_CACHE_SECONDS = previous;
+            }
+        }
+
+        await waitForOutput(server, "Server running");
+    });
+});
+
+describe("server startup: port", () => {
+    it("exits with an error when the port is already in use, and never says it is running", { timeout: 15_000 }, async () => {
+        const occupant = createServer();
+        await new Promise<void>((resolve) => occupant.listen(0, "127.0.0.1", resolve));
+
+        try {
+            const { port } = occupant.address() as AddressInfo;
+            const server = await startServer({ PORT: String(port), DATABASE_URL: UNREACHABLE_DATABASE_URL });
+
+            assert.equal(await waitForExit(server, 8_000), 1);
+            assert.match(server.output().stderr, /Cannot start the server/);
+            assert.match(server.output().stderr, /EADDRINUSE|in use/i, "it says why");
+            assert.doesNotMatch(server.output().stdout, /Server running/);
+        } finally {
+            await new Promise<void>((resolve) => {
+                occupant.close(() => resolve());
+            });
+        }
     });
 });
 
@@ -194,5 +240,100 @@ describe("server startup: database schema", () => {
         const health = await getHealth(server);
         assert.equal(health.status, 200);
         assert.equal(health.body.data.database, "down");
+    });
+});
+
+// Only a database that cannot be reached is a reason to start anyway (the API reports it as down and recovers
+// when it comes back). A database that answers and says no, such as a wrong password or a missing database,
+// will not get better by itself: the server must stop and say what is wrong.
+describe("server startup: a database that answers with an error", () => {
+    const testDatabaseUrl = (): URL => {
+        assert.ok(process.env.RAG_LAB_TEST_DATABASE_URL, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        return new URL(process.env.RAG_LAB_TEST_DATABASE_URL);
+    };
+
+    const openSockets = new Set<Socket>();
+    const fakes: NetServer[] = [];
+
+    // a server that speaks just enough of PostgreSQL's protocol to answer the startup with the given reply
+    const startFakePostgres = async (onConnection: (socket: Socket) => void): Promise<number> => {
+        const fake = createServer((socket) => {
+            openSockets.add(socket);
+            socket.on("error", () => {});
+            socket.on("close", () => openSockets.delete(socket));
+            onConnection(socket);
+        });
+        fakes.push(fake);
+        await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve));
+        return (fake.address() as AddressInfo).port;
+    };
+
+    afterEach(async () => {
+        for (const socket of openSockets) {
+            socket.destroy();
+        }
+        await Promise.all(fakes.splice(0).map((fake) => new Promise<void>((resolve) => {
+            fake.close(() => resolve());
+        })));
+    });
+
+    // a PostgreSQL ErrorResponse message: 'E', its length, then fields (code letter and text, ending in a zero byte)
+    const errorResponse = (sqlState: string, message: string): Buffer => {
+        const field = (code: string, value: string): Buffer => Buffer.concat([Buffer.from(code), Buffer.from(value), Buffer.from([0])]);
+        const fields = Buffer.concat([field("S", "FATAL"), field("V", "FATAL"), field("C", sqlState), field("M", message), Buffer.from([0])]);
+        const header = Buffer.alloc(5);
+        header.write("E");
+        header.writeInt32BE(fields.length + 4, 1);
+        return Buffer.concat([header, fields]);
+    };
+
+    it("refuses to start with a wrong password, and names the problem", { timeout: 15_000 }, async () => {
+        const url = testDatabaseUrl();
+        url.password = "not-the-password";
+        const server = await startServer({ DATABASE_URL: url.toString() });
+
+        assert.equal(await waitForExit(server, 8_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(server.output().stderr, /password|authentication|credentials/i, "it says the login was refused");
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+    });
+
+    it("refuses to start when the database does not exist, and names the problem", { timeout: 15_000 }, async () => {
+        const url = testDatabaseUrl();
+        url.pathname = "/rag_lab_database_that_does_not_exist_test";
+        const server = await startServer({ DATABASE_URL: url.toString() });
+
+        assert.equal(await waitForExit(server, 8_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(server.output().stderr, /does not exist/i, "it says the database is missing");
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+    });
+
+    // The next three keep working today and must keep working: they stop the check for "any other failure" from
+    // becoming a check that refuses every failure.
+    it("still starts, with a warning, when PostgreSQL is starting up (57P03)", { timeout: 15_000 }, async () => {
+        const port = await startFakePostgres((socket) => {
+            socket.once("data", () => socket.end(errorResponse("57P03", "the database system is starting up")));
+        });
+        const server = await startServer({ DATABASE_URL: `postgres://rag_lab:secret@127.0.0.1:${port}/rag_lab_test` });
+
+        await waitForOutput(server, "Server running");
+        assert.match(server.output().stderr + server.output().stdout, /warning/i, "it warns");
+    });
+
+    it("still starts, with a warning, when the database host does not exist", { timeout: 20_000 }, async () => {
+        // .invalid never resolves (RFC 2606)
+        const server = await startServer({ DATABASE_URL: "postgres://rag_lab:secret@no-such-host.invalid:5432/rag_lab_test" });
+
+        await waitForOutput(server, "Server running", 15_000);
+        assert.match(server.output().stderr + server.output().stdout, /warning/i, "it warns");
+    });
+
+    it("still starts, with a warning, when the database accepts the connection and never answers", { timeout: 20_000 }, async () => {
+        const port = await startFakePostgres(() => {});
+        const server = await startServer({ DATABASE_URL: `postgres://rag_lab:secret@127.0.0.1:${port}/rag_lab_test` });
+
+        await waitForOutput(server, "Server running", 15_000);
+        assert.match(server.output().stderr + server.output().stdout, /warning/i, "it warns");
     });
 });

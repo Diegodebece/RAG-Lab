@@ -45,6 +45,11 @@ export const malformedBody: FakeOllamaHandler = (req, res) => {
 // Accepts the request and never answers, like a model server that hangs.
 export const neverAnswer: FakeOllamaHandler = () => {};
 
+// A redirect to another address, like a model server behind a proxy that moved.
+export const redirectTo = (location: string, status = 302): FakeOllamaHandler => (req, res) => {
+    res.writeHead(status, { Location: location }).end();
+};
+
 // Closes the connection without answering, like a server that crashes mid-request.
 export const dropConnection: FakeOllamaHandler = (req) => {
     req.socket.destroy();
@@ -55,7 +60,8 @@ export const startFakeOllama = async (): Promise<FakeOllama> => {
     const requests: FakeOllamaRequest[] = [];
 
     const server = createServer((req, res) => {
-        const path = new URL(req.url ?? "/", "http://fake-ollama.invalid").pathname;
+        // the path exactly as received, without the query string: new URL() would read "//api/tags" as a host
+        const path = (req.url ?? "/").split("?")[0];
         requests.push({ method: req.method ?? "GET", path });
 
         const handler = handlers.get(path);
