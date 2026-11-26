@@ -5,11 +5,12 @@
 //
 // Places a path can be in:
 // - project:   this repository, minus secrets (.env), .git, local settings, worktrees and private-data folders;
+//              for an agent working in a worktree (.claude/worktrees/<name>), that worktree instead;
 // - code:      only src/, test/, migrations/, node_modules/ and a few config files (the independent auditors and
 //              the verifier, so they judge the code and not the author's notes);
 // - reference: RAG Web's code, tests, skills and docs (RAG_WEB_DIR), for porting; never its .env or RAG1's data;
 // - data:      the private data folder outside the repository (RAG_LAB_DATA_DIR): evaluation sets and results.
-// RAG_WEB_DIR and RAG_LAB_DATA_DIR come from the environment or from the project's .env.
+// RAG_WEB_DIR and RAG_LAB_DATA_DIR come from the environment or from the main checkout's .env.
 //
 // GitHub: subagents never push, fetch or use gh, whatever their role; test-writer and implementer may commit in
 // their own worktree. Only the orchestrator (the main session, which has no agent-scope hook) pushes feature/*
@@ -122,6 +123,16 @@ const partsBelow = (root, target) => {
 };
 
 const startsWith = (parts, prefix) => prefix.every((part, index) => parts[index] === part);
+
+// The root of the worktree that `cwd` is in (.claude/worktrees/<name> below the main checkout `root`), or null.
+// Claude Code sets CLAUDE_PROJECT_DIR to the main checkout even for an agent working in a worktree.
+const worktreeRoot = (root, cwd) => {
+    const parts = partsBelow(root, path.resolve(cwd));
+    if (parts === null || parts.length < 3 || parts[0] !== ".claude" || parts[1] !== "worktrees") {
+        return null;
+    }
+    return path.join(path.resolve(root), ...path.relative(path.resolve(root), path.resolve(cwd)).split(path.sep).slice(0, 3));
+};
 
 const isReadableProjectPath = (parts) => {
     if (parts.length === 0) {
@@ -298,12 +309,15 @@ await runHook(async (input) => {
         deny(`Unknown agent role "${role}": every tool call is blocked.`);
     }
 
-    const project = process.env.CLAUDE_PROJECT_DIR || String(input.cwd ?? "") || process.cwd();
+    // An agent working in a worktree has that worktree as its project: it cannot reach the main checkout or
+    // another worktree. The settings still come from the main checkout's .env, since worktrees have none.
+    const root = process.env.CLAUDE_PROJECT_DIR || String(input.cwd ?? "") || process.cwd();
+    const cwd = String(input.cwd ?? "") || root;
     const places = {
-        project,
-        cwd: String(input.cwd ?? "") || project,
-        data: readSetting(project, "RAG_LAB_DATA_DIR"),
-        reference: readSetting(project, "RAG_WEB_DIR")
+        project: worktreeRoot(root, cwd) ?? root,
+        cwd,
+        data: readSetting(root, "RAG_LAB_DATA_DIR"),
+        reference: readSetting(root, "RAG_WEB_DIR")
     };
     const prefix = `[${role}]`;
 

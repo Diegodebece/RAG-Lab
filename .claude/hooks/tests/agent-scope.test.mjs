@@ -27,7 +27,14 @@ before(() => {
         ".env.example": "",
         ".claude/hooks/agent-scope.mjs": "",
         ".claude/settings.local.json": "{}",
-        "data/copy.json": "{}"
+        "data/copy.json": "{}",
+        // worktrees of this repository, as the orchestrator creates them (they have no .env of their own)
+        ".claude/worktrees/feature-a/src/app.ts": "",
+        ".claude/worktrees/feature-a/test/app.test.ts": "",
+        ".claude/worktrees/feature-a/package.json": "{}",
+        ".claude/worktrees/feature-a/.claude/hooks/agent-scope.mjs": "",
+        ".claude/worktrees/feature-a/.env.local": "SECRET=1",
+        ".claude/worktrees/feature-b/test/app.test.ts": ""
     });
     writeFiles(data, { "evaluation-100.json": "[]", ".env": "" });
     writeFiles(reference, {
@@ -273,6 +280,55 @@ describe("agent-scope: implementer", () => {
         assert.equal(bash("implementer", "npm run lint"), "allow");
         assert.equal(bash("implementer", "npm run eval"), "deny");
         assert.equal(bash("implementer", "npm run migrate"), "deny");
+    });
+});
+
+describe("agent-scope: inside a worktree", () => {
+    // Claude Code sets CLAUDE_PROJECT_DIR to the main checkout; an agent working in a worktree has its cwd there.
+    const worktree = () => path.join(project, ".claude", "worktrees", "feature-a");
+    const callIn = (cwd, role, toolName, toolInput) =>
+        runHook("agent-scope.mjs", { tool_name: toolName, tool_input: toolInput, cwd },
+            { args: [role], env: { CLAUDE_PROJECT_DIR: project } }).decision;
+    const writeIn = (role, file) => callIn(worktree(), role, "Write", { file_path: file, content: "x" });
+    const readIn = (role, file) => callIn(worktree(), role, "Read", { file_path: file });
+
+    test("the worktree is the agent's project: the test-writer writes its test/ and reads its files", () => {
+        assert.equal(writeIn("test-writer", path.join(worktree(), "test/new.test.ts")), "allow");
+        assert.equal(writeIn("test-writer", "test/relative.test.ts"), "allow");
+        assert.equal(readIn("test-writer", path.join(worktree(), "package.json")), "allow");
+        assert.equal(callIn(worktree(), "test-writer", "Grep", { pattern: "x", path: "src" }), "allow");
+        assert.equal(callIn(path.join(worktree(), "test"), "test-writer", "Write",
+            { file_path: path.join(worktree(), "test/deeper.test.ts"), content: "x" }), "allow");
+    });
+
+    test("the implementer writes the worktree's src/, and the same limits hold there", () => {
+        assert.equal(writeIn("implementer", path.join(worktree(), "src/app.ts")), "allow");
+        assert.equal(writeIn("implementer", path.join(worktree(), "test/app.test.ts")), "deny");
+        assert.equal(writeIn("test-writer", path.join(worktree(), "src/app.ts")), "deny");
+        assert.equal(writeIn("implementer", path.join(worktree(), ".claude/hooks/agent-scope.mjs")), "deny");
+        assert.equal(writeIn("implementer", path.join(worktree(), "package.json")), "deny");
+        assert.equal(readIn("implementer", path.join(worktree(), ".env.local")), "deny");
+        assert.equal(callIn(worktree(), "implementer", "Grep", { pattern: "x", path: "." }), "deny");
+    });
+
+    test("an agent in a worktree reaches neither the main checkout nor another worktree", () => {
+        assert.equal(writeIn("test-writer", path.join(project, "test/new.test.ts")), "deny");
+        assert.equal(readIn("test-writer", path.join(project, "src/app.ts")), "deny");
+        assert.equal(readIn("test-writer", path.join(project, ".env")), "deny");
+        assert.equal(writeIn("test-writer", path.join(project, ".claude/worktrees/feature-b/test/app.test.ts")), "deny");
+        assert.equal(writeIn("test-writer", "../feature-b/test/app.test.ts"), "deny");
+    });
+
+    test("RAG Web and the data folder come from the main checkout's .env", () => {
+        assert.equal(readIn("implementer", path.join(reference, "src/v1/services/questions.service.ts")), "allow");
+        assert.equal(readIn("analyst", path.join(data, "evaluation-100.json")), "allow");
+    });
+
+    test("from the main checkout, the worktrees stay out of reach", () => {
+        assert.equal(write("test-writer", ".claude/worktrees/feature-a/test/new.test.ts"), "deny");
+        assert.equal(read("test-writer", ".claude/worktrees/feature-a/package.json"), "deny");
+        assert.equal(callIn(path.join(project, ".claude", "worktrees"), "test-writer", "Write",
+            { file_path: path.join(worktree(), "test/new.test.ts"), content: "x" }), "deny");
     });
 });
 
