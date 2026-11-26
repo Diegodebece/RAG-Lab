@@ -3,10 +3,14 @@ import { getSecretKey } from "../config/auth.config.js";
 import { AppError } from "../utils/appError.util.js";
 import { verifyToken } from "../utils/token.util.js";
 
-export const authenticateMiddleware = (req: Request, res: Response, next: NextFunction) => {
-    const [scheme, token] = (req.headers.authorization ?? "").split(" ");
+// "Bearer <token>": the scheme name is case-insensitive (RFC 9110), and there is exactly one space and exactly one
+// token, so an empty token or anything after it does not match.
+const BEARER_HEADER = /^bearer (\S+)$/i;
 
-    if (scheme !== "Bearer" || !token) {
+export const authenticateMiddleware = (req: Request, res: Response, next: NextFunction) => {
+    const token = BEARER_HEADER.exec(req.headers.authorization ?? "")?.[1];
+
+    if (!token) {
         return next(new AppError(401, "Authentication token is missing"));
     }
 

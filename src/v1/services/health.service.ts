@@ -1,3 +1,4 @@
+import type { QueryConfig } from "pg";
 import { pool } from "../config/db.config.js";
 import { HEALTH_CACHE_SECONDS } from "../config/limits.config.js";
 import { REQUIRED_MODELS } from "../config/ollama.config.js";
@@ -5,11 +6,17 @@ import type { HealthReport, ServiceState } from "../types/health.type.js";
 import { listInstalledModelsService } from "./ollama.service.js";
 
 const OLLAMA_TIMEOUT_MS = 2000;
+const DATABASE_TIMEOUT_MS = 2000;
+
+// pg accepts a timeout in each query's config, but its type definitions do not list it
+const databaseProbe: QueryConfig & { query_timeout: number } = { text: "SELECT 1", query_timeout: DATABASE_TIMEOUT_MS };
 
 // Errors are caught on purpose in this file: a failing dependency is reported as "down", not thrown.
+// A connection that stays open but stops answering is "down" too: the probe gives up after DATABASE_TIMEOUT_MS,
+// and pg drops that connection instead of returning it to the pool.
 const checkDatabase = async (): Promise<ServiceState> => {
     try {
-        await pool.query("SELECT 1");
+        await pool.query(databaseProbe);
         return "up";
     } catch {
         return "down";

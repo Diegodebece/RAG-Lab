@@ -22,7 +22,10 @@ const getFromOllama = async (path: string, { timeoutMs }: RequestOptions): Promi
     const timeout = AbortSignal.timeout(timeoutMs);
 
     try {
-        const response = await fetch(`${OLLAMA_BASE_URL}${path}`, { method: "GET", signal: timeout });
+        // A redirect is not followed: a model server that redirects is misconfigured or has been taken over, and
+        // following it would send the request to an address nobody chose. A 3xx answer is not OK, so it is handled
+        // below like any other error answer.
+        const response = await fetch(`${OLLAMA_BASE_URL}${path}`, { method: "GET", signal: timeout, redirect: "manual" });
 
         if (!response.ok) {
             throw new Error(`Ollama answered HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);

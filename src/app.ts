@@ -18,7 +18,8 @@ app.set("trust proxy", TRUSTED_PROXIES);
 app.use(securityHeadersMiddleware);
 app.use(cors(CORS_ORIGINS.length > 0 ? { origin: CORS_ORIGINS } : undefined));
 // No global body parser: each route that takes a body parses it with express.json(), after authentication
-// and the per-address rate limits, so rejected requests never get their body read.
+// and the per-user rate limit, so rejected requests never get their body read. A limit per client address in
+// front of authentication is planned for layer 2; until then only the public health route has one.
 
 app.use("/v1", v1Router);
 
