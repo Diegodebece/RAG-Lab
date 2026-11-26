@@ -135,8 +135,84 @@ describe("rateLimitMiddleware", () => {
     });
 });
 
+// The email is part of the key, and the key is held in memory: an email of 90,000 characters in each request would
+// fill it with one entry of that size per request. Past the longest email there can be (254), the email stops being
+// part of the key, so the address alone counts those requests, and the counters stay small.
+describe("the email in the key of the failed-login limit", () => {
+    const buildApp = () => {
+        const app = express();
+        app.set("trust proxy", "loopback");
+        app.use(express.json({ limit: "1mb" }));
+        app.post("/login", rateLimitMiddleware({ limit: 2, windowMs: MINUTE, keyBy: "emailAndIp", onlyFailures: true }), (req, res) => {
+            res.status(401).json({});
+        });
+        app.use(errorMiddleware);
+        return app;
+    };
+
+    // an address of exactly this many characters (what comes after the name is 12 characters)
+    const emailOfLength = (length: number, filler: string): string => `${filler.repeat(length - 12)}@example.com`;
+
+    const attempt = (app: ReturnType<typeof request>, email: string) =>
+        app.post("/login").set("X-Forwarded-For", "203.0.113.66").send({ email, password: "wrong" });
+
+    it("makes emails longer than 254 characters from one address share the address's counter", async () => {
+        const app = request(buildApp());
+
+        assert.equal((await attempt(app, emailOfLength(300, "a"))).status, 401);
+        assert.equal((await attempt(app, emailOfLength(400, "b"))).status, 401);
+        assert.equal((await attempt(app, emailOfLength(500, "c"))).status, 429, "a third, different long email is counted with the others");
+    });
+
+    it("takes the length after trimming: an email of 255 characters is long, with or without spaces around it", async () => {
+        const app = request(buildApp());
+
+        assert.equal((await attempt(app, `  ${emailOfLength(255, "a")}  `)).status, 401);
+        assert.equal((await attempt(app, emailOfLength(255, "b"))).status, 401);
+        assert.equal((await attempt(app, `${emailOfLength(255, "c")}   `)).status, 429);
+    });
+
+    it("keeps an email of exactly 254 characters on a counter of its own", async () => {
+        const app = request(buildApp());
+
+        assert.equal((await attempt(app, emailOfLength(254, "a"))).status, 401);
+        assert.equal((await attempt(app, emailOfLength(254, "a"))).status, 401);
+        assert.equal((await attempt(app, emailOfLength(254, "a"))).status, 429, "the same email is counted together");
+        assert.equal((await attempt(app, emailOfLength(254, "b"))).status, 401, "another email of 254 characters has its own counter");
+    });
+
+    it("keeps an email that is padded with spaces to more than 254 characters, but fits once trimmed, on its own counter", async () => {
+        const app = request(buildApp());
+        const email = emailOfLength(254, "a");
+
+        assert.equal((await attempt(app, `     ${email}     `)).status, 401);
+        assert.equal((await attempt(app, email)).status, 401);
+        assert.equal((await attempt(app, `${email} `)).status, 429, "all three spellings are one counter");
+        assert.equal((await attempt(app, emailOfLength(254, "b"))).status, 401, "and it is not the address's counter");
+    });
+
+    it("keeps long emails away from the counter of a normal email from the same address", async () => {
+        const app = request(buildApp());
+
+        await attempt(app, emailOfLength(300, "a"));
+        await attempt(app, emailOfLength(301, "a"));
+
+        assert.equal((await attempt(app, "ana@example.com")).status, 401, "a normal email still has its own counter");
+    });
+
+    // keyed by the address alone, as before: a value that is not text cannot be an email
+    it("counts a request whose email is not text on the address's counter", async () => {
+        const app = request(buildApp());
+
+        assert.equal((await attempt(app, ["a@example.com"] as unknown as string)).status, 401);
+        assert.equal((await attempt(app, { $gt: "" } as unknown as string)).status, 401);
+        assert.equal((await attempt(app, "" as string)).status, 429);
+    });
+});
+
 describe("per-user limit", () => {
-    // stands in for authenticateMiddleware: the test says who is logged in with a header
+    // stands in for authenticateMiddleware: the test says who is logged in with a header. The limit runs before the
+    // database is asked about the account, so it knows the token's user id and nothing else.
     const buildUserLimitedApp = (limit: number) => {
         const app = express();
         app.set("trust proxy", "loopback");
@@ -144,7 +220,7 @@ describe("per-user limit", () => {
             const userId = req.header("X-Test-User");
 
             if (userId) {
-                req.decoded = { id: userId, role: "user", expiresAt: Date.now() + 60_000 };
+                req.decoded = { id: userId, tokenVersion: 0, expiresAt: Date.now() + 60_000 };
             }
 
             next();

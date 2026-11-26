@@ -3,13 +3,25 @@
 import "dotenv/config";
 import { OPERATIONAL_DEFAULTS } from "./operationalSettings.js";
 
-// Without RAG_LAB_TEST_DATABASE_URL, DATABASE_URL is removed rather than left pointing at the development
-// database, so db.config.ts fails with "DATABASE_URL is not set" instead of emptying real data.
-if (process.env.RAG_LAB_TEST_DATABASE_URL) {
-    process.env.DATABASE_URL = process.env.RAG_LAB_TEST_DATABASE_URL;
-} else {
-    delete process.env.DATABASE_URL;
-}
+// The app runs as the API role (rag_lab_api), which can read and write the tables but cannot change the schema; the
+// migrations and the tests' own setup (DDL, TRUNCATE, seeding) run as the owner. Each URL has its own variable, so
+// the tests exercise the app with the rights it has in production.
+//
+// A missing source variable removes its target rather than leaving it pointing at the development database, so the
+// app fails with "DATABASE_URL is not set" (and the migration script with "MIGRATION_DATABASE_URL is not set")
+// instead of emptying real data.
+const copyOrDelete = (source: string, target: string): void => {
+    const value = process.env[source];
+
+    if (value) {
+        process.env[target] = value;
+    } else {
+        delete process.env[target];
+    }
+};
+
+copyOrDelete("RAG_LAB_TEST_API_DATABASE_URL", "DATABASE_URL");
+copyOrDelete("RAG_LAB_TEST_DATABASE_URL", "MIGRATION_DATABASE_URL");
 
 // The developer's .env (loaded above) and shell may hold their own HOST, PORT, TRUSTED_PROXIES, limits and
 // model server address. A test that reads one of them passes on one computer and fails on another, so each is

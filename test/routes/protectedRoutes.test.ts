@@ -1,4 +1,4 @@
-import { after, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import request from "supertest";
@@ -8,10 +8,14 @@ process.env.SECRET_KEY = "test-secret-only-for-these-tests-0123456789";
 process.env.AUTHENTICATED_REQUESTS_PER_MINUTE = "3";
 
 const { app } = await import("../../src/app.js");
-const { pool } = await import("../../src/v1/config/db.config.js");
-const { authAs } = await import("./testTokens.js");
+const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
+const { createTestUser, signTestToken, validClaims } = await import("./testUsers.js");
 
-after(() => pool.end());
+before(resetTestDatabase);
+
+beforeEach(() => ownerPool.query("TRUNCATE users CASCADE"));
+
+after(closeTestPools);
 
 describe("the protected section of /v1", () => {
     it("asks for a token on any unknown /v1 path", { timeout: 10_000 }, async () => {
@@ -21,11 +25,35 @@ describe("the protected section of /v1", () => {
         assert.deepEqual(response.body, { message: "Authentication token is missing" });
     });
 
-    it("answers 404 for an unknown /v1 path when the token is valid", { timeout: 10_000 }, async () => {
-        const response = await request(app).get("/v1/nothing-here").set(...authAs(randomUUID()));
+    it("answers 404 for an unknown /v1 path when the token belongs to an active account", { timeout: 10_000 }, async () => {
+        const user = await createTestUser({ email: "ana@example.com" });
+
+        const response = await request(app).get("/v1/nothing-here").set(...user.auth);
 
         assert.equal(response.status, 404);
         assert.deepEqual(response.body, { message: "Route not found" });
+    });
+
+    it("answers 401, not 404, on an unknown path when the token is valid but its account is not", { timeout: 10_000 }, async () => {
+        const active = await createTestUser({ email: "active@example.com" });
+        const gone = await createTestUser({ email: "gone@example.com" });
+        const disabled = await createTestUser({ email: "disabled@example.com", status: "disabled" });
+        await ownerPool.query("DELETE FROM users WHERE id = $1", [gone.id]);
+
+        assert.equal((await request(app).get("/v1/nothing-here").set(...active.auth)).status, 404, "an active account gets the 404");
+
+        const cases: [string, [string, string]][] = [
+            ["a deleted account", gone.auth],
+            ["a disabled account", disabled.auth],
+            ["an id that was never an account", ["Authorization", `Bearer ${signTestToken(validClaims(randomUUID(), 0))}`]]
+        ];
+
+        for (const [label, auth] of cases) {
+            const response = await request(app).get("/v1/nothing-here").set(...auth);
+
+            assert.equal(response.status, 401, label);
+            assert.deepEqual(response.body, { message: "Invalid or expired authentication token" }, label);
+        }
     });
 
     it("answers 404, not 401, for a path outside /v1", { timeout: 10_000 }, async () => {
@@ -34,22 +62,44 @@ describe("the protected section of /v1", () => {
         assert.equal(response.status, 404);
         assert.deepEqual(response.body, { message: "Route not found" });
     });
+
+    it("leaves login public and asks for a token on every other account route", { timeout: 15_000 }, async () => {
+        const noToken: [string, string][] = [
+            ["post", "/v1/auth/logout"],
+            ["get", "/v1/users/me"],
+            ["patch", "/v1/users/me/password"],
+            ["post", "/v1/users"],
+            ["patch", `/v1/users/${randomUUID()}`]
+        ];
+
+        for (const [method, path] of noToken) {
+            const response = await request(app)[method as "get"](path);
+
+            assert.equal(response.status, 401, `${method} ${path}`);
+            assert.deepEqual(response.body, { message: "Authentication token is missing" }, `${method} ${path}`);
+        }
+
+        const login = await request(app).post("/v1/auth/login").send({});
+
+        assert.equal(login.status, 400, "login does not ask for a token: it answers the empty body with a validation error");
+        assert.equal(login.body.message, "Validation error");
+    });
 });
 
 describe("requests per minute to the protected routes", () => {
     it("counts every protected request of a user, and each user apart", { timeout: 10_000 }, async () => {
-        const ana = authAs(randomUUID());
-        const bob = authAs(randomUUID());
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const bob = await createTestUser({ email: "bob@example.com" });
 
         for (const path of ["/v1/first", "/v1/second", "/v1/third"]) {
-            assert.equal((await request(app).get(path).set(...ana)).status, 404, path);
+            assert.equal((await request(app).get(path).set(...ana.auth)).status, 404, path);
         }
 
-        const blocked = await request(app).get("/v1/fourth").set(...ana);
+        const blocked = await request(app).get("/v1/fourth").set(...ana.auth);
         assert.equal(blocked.status, 429);
         assert.deepEqual(blocked.body, { message: "Too many requests, please try again later" });
 
-        assert.equal((await request(app).get("/v1/first").set(...bob)).status, 404, "another user has their own counter");
+        assert.equal((await request(app).get("/v1/first").set(...bob.auth)).status, 404, "another user has their own counter");
     });
 
     // more checks than the per-minute limit of the protected routes (3 here), all answered: the health check is

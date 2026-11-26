@@ -16,6 +16,12 @@ export const OPERATIONAL_DEFAULTS: Record<string, string> = {
     HEALTH_CHECKS_PER_MINUTE: "30",
     AUTHENTICATED_REQUESTS_PER_MINUTE: "120",
     TOKEN_LIFETIME_SECONDS: "3600",
+    // the floor under every request of one address, then the limits of the account routes
+    REQUESTS_PER_ADDRESS_PER_MINUTE: "300",
+    LOGINS_PER_15_MINUTES: "10",
+    FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES: "5",
+    PASSWORD_CHANGES_PER_15_MINUTES: "5",
+    USER_CREATIONS_PER_HOUR: "20",
     // a closed port: a test that forgets to start the fake Ollama gets "connection refused" instead of reaching
     // the real models on this computer
     OLLAMA_BASE_URL: "http://127.0.0.1:1"

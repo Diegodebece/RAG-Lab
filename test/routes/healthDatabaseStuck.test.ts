@@ -4,13 +4,14 @@ import request from "supertest";
 import { startPausableProxy, urlThroughProxy } from "../doubles/pausableProxy.js";
 
 // The database is reached through a proxy that can go silent: the connection stays established, but nothing
-// answers, as when a network drops packets or PostgreSQL freezes. Set before the app is imported.
-const testDatabaseUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
-assert.ok(testDatabaseUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+// answers, as when a network drops packets or PostgreSQL freezes. Set before the app is imported. The app's
+// connection is the API role's, as in production.
+const apiDatabaseUrl = process.env.RAG_LAB_TEST_API_DATABASE_URL;
+assert.ok(apiDatabaseUrl, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
 
-const target = new URL(testDatabaseUrl);
+const target = new URL(apiDatabaseUrl);
 const proxy = await startPausableProxy({ host: target.hostname, port: Number(target.port || 5432) });
-process.env.DATABASE_URL = urlThroughProxy(testDatabaseUrl, proxy.port);
+process.env.DATABASE_URL = urlThroughProxy(apiDatabaseUrl, proxy.port);
 
 // every request checks again, so the cache cannot hide the stuck connection
 process.env.HEALTH_CACHE_SECONDS = "0";

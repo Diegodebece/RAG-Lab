@@ -29,6 +29,11 @@ const DEVELOPER_SETTINGS: Record<string, string> = {
     HEALTH_CHECKS_PER_MINUTE: "1",
     AUTHENTICATED_REQUESTS_PER_MINUTE: "2",
     TOKEN_LIFETIME_SECONDS: "5",
+    REQUESTS_PER_ADDRESS_PER_MINUTE: "7",
+    LOGINS_PER_15_MINUTES: "1",
+    FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES: "1",
+    PASSWORD_CHANGES_PER_15_MINUTES: "1",
+    USER_CREATIONS_PER_HOUR: "1",
     OLLAMA_BASE_URL: "http://localhost:11434"
 };
 
@@ -42,6 +47,11 @@ const TEST_DEFAULTS: Record<string, string> = {
     HEALTH_CHECKS_PER_MINUTE: "30",
     AUTHENTICATED_REQUESTS_PER_MINUTE: "120",
     TOKEN_LIFETIME_SECONDS: "3600",
+    REQUESTS_PER_ADDRESS_PER_MINUTE: "300",
+    LOGINS_PER_15_MINUTES: "10",
+    FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES: "5",
+    PASSWORD_CHANGES_PER_15_MINUTES: "5",
+    USER_CREATIONS_PER_HOUR: "20",
     OLLAMA_BASE_URL: "http://127.0.0.1:1"
 };
 
@@ -61,8 +71,10 @@ after(() => rm(emptyEnvDirectory, { recursive: true, force: true }));
 const runAfterSetup = async (extraEnv: Record<string, string>, args: string[]): Promise<string> => {
     const env = cleanChildEnvironment();
     delete env.RAG_LAB_TEST_DATABASE_URL;
+    delete env.RAG_LAB_TEST_API_DATABASE_URL;
     delete env.TEST_DATABASE_URL;
     delete env.DATABASE_URL;
+    delete env.MIGRATION_DATABASE_URL;
 
     // Like a developer's shell, which does not define these: only the test's own extraEnv or the .env file does,
     // and test/setup.ts must replace what they hold.
@@ -82,46 +94,83 @@ const runAfterSetup = async (extraEnv: Record<string, string>, args: string[]): 
 };
 
 describe("test setup: database", () => {
-    it("points the app's pool at the test database", { timeout: 15_000 }, async () => {
-        const testDatabaseUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
-        assert.ok(testDatabaseUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+    // what test/setup.ts left in the two database variables
+    const databaseVariablesAfterSetup = async (extraEnv: Record<string, string>): Promise<Record<string, string | null>> =>
+        JSON.parse(await runAfterSetup(extraEnv, [FIXTURE])) as Record<string, string | null>;
+
+    const DEVELOPMENT_URL = "postgres://dev:dev@127.0.0.1:5433/rag_lab";
+
+    it("points the app's pool at the test database, as the API role", { timeout: 15_000 }, async () => {
+        const apiUrl = process.env.RAG_LAB_TEST_API_DATABASE_URL;
+        assert.ok(apiUrl, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
 
         const { pool } = await import("../../src/v1/config/db.config.js");
 
         try {
-            const { rows } = await pool.query<{ name: string }>("SELECT current_database() AS name");
+            const { rows } = await pool.query<{ name: string; role: string }>("SELECT current_database() AS name, current_user AS role");
 
             assert.ok(rows[0].name.endsWith("_test"), `connected to "${rows[0].name}"`);
-            assert.equal(rows[0].name, decodeURIComponent(new URL(testDatabaseUrl).pathname.slice(1)));
+            assert.equal(rows[0].name, decodeURIComponent(new URL(apiUrl).pathname.slice(1)));
+            assert.equal(rows[0].role, "rag_lab_api", "the app runs with the API role's rights, not the owner's");
         } finally {
             await pool.end();
         }
     });
 
-    it("removes DATABASE_URL when no test database is configured", { timeout: 30_000 }, async () => {
-        const printed = await runAfterSetup({ DATABASE_URL: "postgres://dev:dev@127.0.0.1:5433/rag_lab" }, [FIXTURE]);
+    it("copies RAG_LAB_TEST_API_DATABASE_URL over a DATABASE_URL that points elsewhere", { timeout: 30_000 }, async () => {
+        const apiUrl = "postgres://rag_lab_api:secret@127.0.0.1:5433/some_test";
 
-        assert.equal(printed, "unset");
+        const printed = await databaseVariablesAfterSetup({
+            DATABASE_URL: DEVELOPMENT_URL,
+            RAG_LAB_TEST_API_DATABASE_URL: apiUrl,
+            RAG_LAB_TEST_DATABASE_URL: "postgres://owner:secret@127.0.0.1:5433/some_test"
+        });
+
+        assert.equal(printed.DATABASE_URL, apiUrl);
     });
 
-    it("copies RAG_LAB_TEST_DATABASE_URL over a DATABASE_URL that points elsewhere", { timeout: 30_000 }, async () => {
-        const testUrl = "postgres://tester:secret@127.0.0.1:5433/some_test";
+    it("copies RAG_LAB_TEST_DATABASE_URL over a MIGRATION_DATABASE_URL that points at the development database", { timeout: 30_000 }, async () => {
+        const ownerUrl = "postgres://owner:secret@127.0.0.1:5433/some_test";
 
-        const printed = await runAfterSetup({
-            DATABASE_URL: "postgres://dev:dev@127.0.0.1:5433/rag_lab",
-            RAG_LAB_TEST_DATABASE_URL: testUrl
-        }, [FIXTURE]);
+        const printed = await databaseVariablesAfterSetup({
+            MIGRATION_DATABASE_URL: "postgres://owner:dev@127.0.0.1:5433/rag_lab",
+            RAG_LAB_TEST_API_DATABASE_URL: "postgres://rag_lab_api:secret@127.0.0.1:5433/some_test",
+            RAG_LAB_TEST_DATABASE_URL: ownerUrl
+        });
 
-        assert.equal(printed, testUrl);
+        assert.equal(printed.MIGRATION_DATABASE_URL, ownerUrl);
+    });
+
+    it("removes DATABASE_URL and MIGRATION_DATABASE_URL when no test database is configured", { timeout: 30_000 }, async () => {
+        const printed = await databaseVariablesAfterSetup({ DATABASE_URL: DEVELOPMENT_URL, MIGRATION_DATABASE_URL: DEVELOPMENT_URL });
+
+        assert.deepEqual(printed, { DATABASE_URL: null, MIGRATION_DATABASE_URL: null });
+    });
+
+    // the owner's URL must never become the app's: the app would then run with rights it does not have in production
+    it("removes DATABASE_URL when only the owner's test URL is set, and still sets MIGRATION_DATABASE_URL", { timeout: 30_000 }, async () => {
+        const ownerUrl = "postgres://owner:secret@127.0.0.1:5433/some_test";
+
+        const printed = await databaseVariablesAfterSetup({ DATABASE_URL: DEVELOPMENT_URL, RAG_LAB_TEST_DATABASE_URL: ownerUrl });
+
+        assert.deepEqual(printed, { DATABASE_URL: null, MIGRATION_DATABASE_URL: ownerUrl });
+    });
+
+    it("removes MIGRATION_DATABASE_URL when only the API's test URL is set, and still sets DATABASE_URL", { timeout: 30_000 }, async () => {
+        const apiUrl = "postgres://rag_lab_api:secret@127.0.0.1:5433/some_test";
+
+        const printed = await databaseVariablesAfterSetup({ MIGRATION_DATABASE_URL: DEVELOPMENT_URL, RAG_LAB_TEST_API_DATABASE_URL: apiUrl });
+
+        assert.deepEqual(printed, { DATABASE_URL: apiUrl, MIGRATION_DATABASE_URL: null });
     });
 
     it("does not read TEST_DATABASE_URL, which belongs to other projects", { timeout: 30_000 }, async () => {
-        const printed = await runAfterSetup({
-            DATABASE_URL: "postgres://dev:dev@127.0.0.1:5433/rag_lab",
+        const printed = await databaseVariablesAfterSetup({
+            DATABASE_URL: DEVELOPMENT_URL,
             TEST_DATABASE_URL: "postgres://other:other@127.0.0.1:5432/other_test"
-        }, [FIXTURE]);
+        });
 
-        assert.equal(printed, "unset");
+        assert.deepEqual(printed, { DATABASE_URL: null, MIGRATION_DATABASE_URL: null });
     });
 });
 
@@ -139,18 +188,19 @@ describe("test setup: operational settings", () => {
     });
 
     it("keeps a TRUSTED_PROXIES value from the environment out of the app under test", { timeout: 30_000 }, async () => {
+        // the app only needs its own URL to load; nothing connects
         const databaseUrl = "postgres://tester:secret@127.0.0.1:1/some_test";
 
         // from the shell
         assert.deepEqual(
-            JSON.parse(await runAfterSetup({ TRUSTED_PROXIES: "10.0.0.0/8", RAG_LAB_TEST_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
+            JSON.parse(await runAfterSetup({ TRUSTED_PROXIES: "10.0.0.0/8", RAG_LAB_TEST_API_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
             ["loopback"],
             "shell"
         );
 
         // from the developer's .env, which the app loads itself when the setup left the variable alone
         assert.deepEqual(
-            JSON.parse(await runAfterSetup({ DOTENV_CONFIG_PATH: developerEnvFile, RAG_LAB_TEST_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
+            JSON.parse(await runAfterSetup({ DOTENV_CONFIG_PATH: developerEnvFile, RAG_LAB_TEST_API_DATABASE_URL: databaseUrl }, [PROXIES_FIXTURE])),
             ["loopback"],
             ".env"
         );

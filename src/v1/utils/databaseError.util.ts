@@ -1,5 +1,9 @@
+// what a client is told when the database cannot be reached (503), by errorMiddleware and by the readiness gate
+export const DATABASE_UNAVAILABLE_MESSAGE = "The database is not available, please try again later";
+
 // SQLSTATE and system error codes that mean "the database cannot be reached right now" and may get better by
-// themselves: the connection was refused, the host is unknown or unreachable, or PostgreSQL is still starting up.
+// themselves: the connection was refused, the host is unknown or unreachable, PostgreSQL is still starting up, or it
+// is going away (a restart, a crash, an administrator ending the session) and ended the connection under a query.
 const UNREACHABLE_CODES = new Set([
     "ECONNREFUSED",
     "ECONNRESET",
@@ -9,7 +13,14 @@ const UNREACHABLE_CODES = new Set([
     "EHOSTUNREACH",
     "ENETUNREACH",
     // PostgreSQL: cannot_connect_now (the database system is starting up)
-    "57P03"
+    "57P03",
+    // PostgreSQL: admin_shutdown and crash_shutdown (the server ended the connection)
+    "57P01",
+    "57P02",
+    // PostgreSQL: connection_exception, connection_does_not_exist and connection_failure
+    "08000",
+    "08003",
+    "08006"
 ]);
 
 // pg reports these without a code: the pool gave up waiting for a connection, the connection attempt timed out, a

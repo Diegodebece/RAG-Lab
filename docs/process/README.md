@@ -33,5 +33,6 @@ The per-call records (`calls.jsonl`) and gzip copies of the transcripts are kept
 | #1 `feature/hook-reference-folders` | 2026-11-26 04:52 | 29 | 22,353 | 4,821,896 | USD 1.75 | 100 % |
 | #2 `feature/hook-worktree-root` | 2026-11-26 05:04 | 15 | 12,126 | 2,317,831 | USD 0.87 | 90 % |
 | #4 `feature/token-metrics` | 2026-11-26 15:31 | 150 | 236,838 | 38,744,062 | USD 16.57 | 85 % |
-| `feature/report-currency` | 2026-11-26 16:26 | 11 | 9,966 | 4,937,637 | USD 1.29 | 100 % |
+| #5 `feature/report-currency` | 2026-11-26 16:26 | 15 | 13,581 | 6,772,773 | USD 1.78 | 100 % |
+| `feature/accounts` | 2026-11-26 16:50 | 608 | 777,803 | 94,251,581 | USD 32.28 | 21 % |
 <!-- usage-summary:end -->

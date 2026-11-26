@@ -1,12 +1,11 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { cleanChildEnvironment } from "../childEnvironment.js";
-import { pool } from "../../src/v1/config/db.config.js";
-import { emptyTestDatabase } from "./testDatabase.js";
+import { closeTestPools, emptyTestDatabase, ownerPool } from "./testDatabase.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +29,13 @@ let workFolder = "";
 let emptyEnvFile = "";
 
 before(async () => {
+    // a run that was killed before its `after` leaves its copy of src/ behind; they pile up otherwise
+    for (const entry of await readdir(import.meta.dirname)) {
+        if (entry.startsWith(".migrations-copy-")) {
+            await rm(path.join(import.meta.dirname, entry), { recursive: true, force: true });
+        }
+    }
+
     workFolder = await mkdtemp(path.join(import.meta.dirname, ".migrations-copy-"));
     emptyEnvFile = path.join(workFolder, "empty.env");
     await writeFile(emptyEnvFile, "");
@@ -49,12 +55,13 @@ before(async () => {
 });
 
 after(async () => {
-    await pool.end();
+    await closeTestPools();
     await rm(workFolder, { recursive: true, force: true });
 });
 
+// through the owner's pool: for the API role a table is invisible until the migrations grant it USAGE on the schema
 const tableExists = async (name: string): Promise<boolean> => {
-    const { rows } = await pool.query<{ found: string | null }>("SELECT to_regclass($1) AS found", [name]);
+    const { rows } = await ownerPool.query<{ found: string | null }>("SELECT to_regclass($1) AS found", [name]);
     return rows[0].found !== null;
 };
 
@@ -79,7 +86,7 @@ describe("migrate script with a migration that fails", () => {
         assert.equal(await tableExists("half_done_probe"), false, "what the broken migration did before failing was rolled back");
         assert.equal(await tableExists("after_probe"), false, "the migration after the broken one was not run");
 
-        const { rows } = await pool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
+        const { rows } = await ownerPool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
         assert.deepEqual(rows.map((row) => row.version), ["001_init.sql"], "the broken migration was not recorded");
     });
 

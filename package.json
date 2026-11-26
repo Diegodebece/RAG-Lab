@@ -12,6 +12,7 @@
         "build": "tsc",
         "start": "node dist/server.js",
         "migrate": "tsx src/migrate.ts",
+        "create-admin": "tsx src/createAdmin.ts",
         "typecheck": "tsc -p tsconfig.test.json",
         "test": "node --import tsx --import ./test/setup.ts --test --test-concurrency=1 \"test/**/*.test.ts\"",
         "test:file": "node --import tsx --import ./test/setup.ts --test --test-concurrency=1"

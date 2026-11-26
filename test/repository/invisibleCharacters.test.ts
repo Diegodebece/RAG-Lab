@@ -50,7 +50,7 @@ const findInvisibleCharacters = (text: string): Finding[] => {
 const ROOT = path.join(import.meta.dirname, "..", "..");
 
 // folders scanned from top to bottom
-const FOLDERS = ["src", "test", "migrations", "docs", ".claude/skills", ".claude/metrics"];
+const FOLDERS = ["src", "test", "migrations", "scripts", "docs", ".claude/skills", ".claude/metrics"];
 const SKIPPED_FOLDERS = new Set(["node_modules", "dist", ".git"]);
 
 // Every file this check covers, as paths relative to the project root with forward slashes.
@@ -201,6 +201,8 @@ describe("project text files", () => {
         assert.ok(files.includes("test/repository/invisibleCharacters.test.ts"), "it scans the tests");
         assert.ok(files.includes("package.json"), "it scans the root configuration files");
         assert.ok(files.some((file) => file.startsWith(".claude/skills/")), "it scans the skills");
+        // the owner runs this script with the database's superuser rights, so a hidden character in it matters most
+        assert.ok(files.includes("scripts/create-api-role.sql"), "it scans the owner-run scripts");
         assert.ok(files.every((file) => !file.includes("node_modules/") && !file.startsWith(".git/")), "it skips dependencies and git");
     });
 

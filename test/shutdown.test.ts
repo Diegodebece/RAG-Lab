@@ -66,7 +66,10 @@ describe("closeServerGracefully", () => {
     });
 });
 
-const testDatabaseUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
+// The pools under test connect as the API role, like the app. The connections are counted as the owner, who can see
+// every session's application name (a role sees the details of its own sessions only).
+const apiDatabaseUrl = process.env.RAG_LAB_TEST_API_DATABASE_URL;
+const ownerDatabaseUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
 
 // The function is loaded inside the tests, so while it does not exist the tests above still run and only these fail.
 const loadClosePoolGracefully = async (): Promise<(pool: Pool, timeoutMs: number) => Promise<void>> => {
@@ -78,7 +81,7 @@ const loadClosePoolGracefully = async (): Promise<(pool: Pool, timeoutMs: number
 // how many server-side connections carry this application name, seen through a direct connection
 // (not the proxy), so it keeps answering when the proxied connection is frozen
 const countConnections = async (applicationName: string): Promise<number> => {
-    const direct = new pg.Client({ connectionString: testDatabaseUrl });
+    const direct = new pg.Client({ connectionString: ownerDatabaseUrl });
     await direct.connect();
     try {
         const result = await direct.query<{ total: string }>(
@@ -96,8 +99,8 @@ describe("closePoolGracefully", () => {
     const pools: Pool[] = [];
 
     before(async () => {
-        assert.ok(testDatabaseUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
-        const target = new URL(testDatabaseUrl);
+        assert.ok(apiDatabaseUrl && ownerDatabaseUrl, "RAG_LAB_TEST_API_DATABASE_URL and RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        const target = new URL(apiDatabaseUrl);
         proxy = await startPausableProxy({ host: target.hostname, port: Number(target.port || 5432) });
     });
 
@@ -111,7 +114,7 @@ describe("closePoolGracefully", () => {
         const closePoolGracefully = await loadClosePoolGracefully();
         const applicationName = `shutdown_stuck_${process.pid}_${Date.now()}`;
         const pool = new pg.Pool({
-            connectionString: urlThroughProxy(testDatabaseUrl as string, proxy.port),
+            connectionString: urlThroughProxy(apiDatabaseUrl as string, proxy.port),
             application_name: applicationName,
             max: 2
         });
@@ -155,7 +158,7 @@ describe("closePoolGracefully", () => {
 
     it("resolves promptly and ends the pool when no client is stuck", { timeout: 15_000 }, async () => {
         const closePoolGracefully = await loadClosePoolGracefully();
-        const pool = new pg.Pool({ connectionString: testDatabaseUrl, max: 2 });
+        const pool = new pg.Pool({ connectionString: apiDatabaseUrl, max: 2 });
         pools.push(pool);
         await pool.query("SELECT 1");
 

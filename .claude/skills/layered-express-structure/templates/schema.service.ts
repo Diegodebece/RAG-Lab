@@ -1,7 +1,6 @@
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import type { Pool } from "pg";
-import { pool } from "../config/db.config.js";
 import type { MigrationState } from "../types/schema.type.js";
 
 // migrations/ sits next to src/ and dist/, so this path works both with tsx and from the compiled files
@@ -12,8 +11,9 @@ export const MIGRATIONS_DIR = path.join(import.meta.dirname, "..", "..", "..", "
 // unknown: recorded in the database but missing here, which means the database belongs to another checkout or project.
 // A database without the schema_migrations table has had nothing applied; if it already has tables of its own,
 // foreignTables lists them, because it looks like another project's database.
-// The migration script passes its own pool, which has no query timeout.
-export const getMigrationStateService = async (targetPool: Pool = pool): Promise<MigrationState> => {
+// The pool is always passed: the server gives the API's, the migration script its own (no query timeout, and no
+// DATABASE_URL: this file must load without it).
+export const getMigrationStateService = async (targetPool: Pool): Promise<MigrationState> => {
     const files = (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith(".sql")).sort();
 
     const { rows: tables } = await targetPool.query<{ found: string | null }>("SELECT to_regclass('schema_migrations') AS found");
