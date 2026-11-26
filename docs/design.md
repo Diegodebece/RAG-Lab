@@ -161,8 +161,13 @@ Hooks enforce these limits, not prompts.
   - RAG Web's code, tests, docs and skills (`RAG_WEB_DIR`) for planner, test-writer, implementer and docs-keeper;
   - the private data folder (`RAG_LAB_DATA_DIR`) for experiment-runner, lab-reporter and analyst.
 
-  Both paths come from the environment or from `.env`. Worktrees have no `.env`, so set them as user
-  environment variables.
+  Both paths come from the environment or from the main checkout's `.env`. Worktrees have no `.env`, so set
+  them as user environment variables too.
+
+  An agent working in a worktree (`.claude/worktrees/<name>`) has that worktree as its project: the rules above
+  apply inside it, and it cannot reach the main checkout or another worktree. Claude Code sets
+  `CLAUDE_PROJECT_DIR` to the main checkout, so before this rule (fixed 2026-11-26) the worktree counted as a
+  blocked folder and the test-writer and implementer could not write there.
 - Commands are an allowlist per role: test-writer and implementer run only the test, typecheck, build and lint
   scripts, read-only git and `git add`/`git commit` (see section 9); experiment-runner runs only `npm run eval*`; the other roles run nothing.
   Redirections, pipes and separators other than `&&` are refused. Grep and Glob need a folder path, because a
