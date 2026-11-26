@@ -26,6 +26,15 @@ const seed = (overrides: { email?: string; role?: "user" | "admin"; status?: "ac
 
 const storedHash = async (): Promise<string> => (await ownerPool.query<{ hash: string }>("SELECT password_hash AS hash FROM users")).rows[0].hash;
 
+// how long a login takes, in milliseconds, and the middle one of several measurements (one slow request does not decide)
+const timeOf = async (body: object): Promise<number> => {
+    const started = performance.now();
+    await login(body);
+    return performance.now() - started;
+};
+
+const median = (values: number[]): number => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+
 const tokenVersionOf = async (id: string): Promise<number> =>
     (await ownerPool.query<{ version: number }>("SELECT token_version AS version FROM users WHERE id = $1", [id])).rows[0].version;
 
@@ -116,13 +125,8 @@ describe("POST /v1/auth/login", () => {
     // hundred: the difference tells anyone which emails have an account. The route checks a dummy hash instead.
     it("takes about as long for an unknown email as for a wrong password (it checks a dummy hash)", { timeout: 30_000 }, async () => {
         await seed();
-
-        const timeOf = async (body: object): Promise<number> => {
-            const started = performance.now();
-            await login(body);
-            return performance.now() - started;
-        };
-        const median = (values: number[]): number => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+        // the first unknown email also makes the dummy hash: it must not be measured
+        await login({ email: "warm-up@example.com", password: "wrong password" });
 
         const wrong: number[] = [];
         const unknown: number[] = [];
@@ -134,7 +138,52 @@ describe("POST /v1/auth/login", () => {
 
         // the measurement means something only if a wrong password costs a real hash
         assert.ok(median(wrong) > 50, `a wrong password took ${median(wrong).toFixed(0)} ms: no hash was checked`);
-        assert.ok(median(unknown) >= median(wrong) / 2, `an unknown email took ${median(unknown).toFixed(0)} ms against ${median(wrong).toFixed(0)} ms for a wrong password`);
+        // an unknown email must not be much faster (it would be a few milliseconds without the dummy hash), nor much slower
+        // (more work for an unknown email would show the difference the other way). The bounds are generous: medians of
+        // three requests on a machine that may be busy.
+        assert.ok(median(unknown) >= median(wrong) / 2, `an unknown email took ${median(unknown).toFixed(0)} ms against ${median(wrong).toFixed(0)} ms for a wrong password: too fast`);
+        assert.ok(median(unknown) <= median(wrong) * 3, `an unknown email took ${median(unknown).toFixed(0)} ms against ${median(wrong).toFixed(0)} ms for a wrong password: too slow`);
+    });
+
+    // A stored hash made with earlier parameters (p = 1, five times cheaper) or one that cannot be used at all (a value
+    // that is not a hash: verified in no time) would answer a wrong password far faster than an unknown email, and the
+    // difference would show which accounts have such a hash. The login also checks the dummy hash in those cases.
+    for (const [label, makeStoredHash] of [
+        ["an old hash (earlier cost parameters)", () => makePasswordHash(PASSWORD, { N: 16384, r: 8, p: 1 })],
+        ["an unusable hash", async () => "not-a-usable-hash"]
+    ] as const) {
+        it(`takes as long for a wrong password on an account with ${label} as for an unknown email`, { timeout: 60_000 }, async () => {
+            await seed({ email: "odd@example.com", passwordHash: await makeStoredHash() });
+            await login({ email: "warm-up@example.com", password: "wrong password" });
+
+            const unknown: number[] = [];
+            const odd: number[] = [];
+
+            for (let round = 0; round < 3; round++) {
+                unknown.push(await timeOf({ email: `nobody${round}@example.com`, password: "wrong password" }));
+                odd.push(await timeOf({ email: "odd@example.com", password: "wrong password" }));
+            }
+
+            assert.ok(median(unknown) > 50, `an unknown email took ${median(unknown).toFixed(0)} ms: no hash was checked`);
+            assert.ok(median(odd) >= median(unknown) / 2, `a wrong password on ${label} took ${median(odd).toFixed(0)} ms against ${median(unknown).toFixed(0)} ms for an unknown email`);
+        });
+    }
+
+    it("still answers 401 with the same body for a wrong password on an old or an unusable hash, and changes neither hash", { timeout: 30_000 }, async () => {
+        const oldHash = await makePasswordHash(PASSWORD, { N: 16384, r: 8, p: 1 });
+        const old = await seed({ email: "old@example.com", passwordHash: oldHash });
+        const unusable = await seed({ email: "unusable@example.com", passwordHash: "not-a-usable-hash" });
+
+        for (const email of ["old@example.com", "unusable@example.com"]) {
+            const response = await login({ email, password: "wrong password" });
+
+            assert.equal(response.status, 401, email);
+            assert.deepEqual(response.body, { message: "Invalid email or password" }, email);
+        }
+
+        const { rows } = await ownerPool.query<{ id: string; hash: string }>("SELECT id, password_hash AS hash FROM users");
+        assert.equal(rows.find((row) => row.id === old.id)?.hash, oldHash, "a failed login does not upgrade the old hash");
+        assert.equal(rows.find((row) => row.id === unusable.id)?.hash, "not-a-usable-hash");
     });
 
     it("answers 403 for a disabled account with the right password, and the usual 401 with a wrong one", { timeout: 15_000 }, async () => {

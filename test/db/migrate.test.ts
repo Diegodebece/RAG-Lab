@@ -108,6 +108,38 @@ describe("migrate script without MIGRATION_DATABASE_URL", () => {
     }
 });
 
+// The owner runs `npm run migrate` before the API role's URL exists (the role's migration is what gives it rights),
+// and on a machine that has only the owner's URL. The script must not need DATABASE_URL, which is the API's.
+describe("migrate script with only MIGRATION_DATABASE_URL", () => {
+    before(emptyTestDatabase);
+
+    it("applies every migration without DATABASE_URL and without reading any .env file", { timeout: 60_000 }, async () => {
+        const ownerUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
+        assert.ok(ownerUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+
+        let outcome: { stdout: string; stderr: string };
+
+        try {
+            outcome = await execFileAsync(process.execPath, ["--import", "tsx", "src/migrate.ts"], {
+                cwd: ROOT,
+                env: cleanChildEnvironment({
+                    DATABASE_URL: undefined,
+                    MIGRATION_DATABASE_URL: ownerUrl,
+                    DOTENV_CONFIG_PATH: "nonexistent.env",
+                    DOTENV_CONFIG_QUIET: "true"
+                }),
+                timeout: 50_000
+            });
+        } catch (error) {
+            assert.fail(`the script failed without DATABASE_URL: ${isScriptFailure(error) ? error.stderr : String(error)}`);
+        }
+
+        assert.match(outcome.stdout, /Applied 001_init\.sql/);
+        assert.match(outcome.stdout, /Applied 003_users\.sql/);
+        assert.deepEqual(await publicTables(), ["schema_migrations", "users"]);
+    });
+});
+
 describe("migrate script against another project's database", () => {
     // A database with tables of its own and no schema_migrations table: the owner's URL points at the wrong place.
     before(async () => {

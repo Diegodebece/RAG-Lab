@@ -303,6 +303,24 @@ describe("PATCH /v1/users/:id", () => {
         assert.equal((await update(other.auth, admin.id, { role: "user" })).status, 200);
     });
 
+    // a UUID is the same account in any capitalization: writing the admin's own id in capitals must not get past the
+    // rule against changing oneself
+    it("answers 409 when an admin changes themselves writing their own id in upper case, and changes nothing", { timeout: 15_000 }, async () => {
+        const admin = await seedAdmin();
+        await seedAdmin("other.admin@example.com");
+        assert.notEqual(admin.id, admin.id.toUpperCase(), "the id has letters, so the capitalization is different");
+
+        for (const body of [{ role: "user" }, { status: "disabled" }]) {
+            const response = await update(admin.auth, admin.id.toUpperCase(), body);
+
+            assert.equal(response.status, 409, JSON.stringify(body));
+            assert.deepEqual(response.body, { message: "You cannot change your own role or status" }, JSON.stringify(body));
+        }
+
+        const row = await rowOf(admin.id);
+        assert.deepEqual([row.role, row.status, row.token_version], ["admin", "active", 0]);
+    });
+
     it("answers 404 for an id that is malformed or that belongs to nobody", { timeout: 15_000 }, async () => {
         const admin = await seedAdmin();
 
@@ -368,4 +386,44 @@ describe("PATCH /v1/users/:id", () => {
         const row = await rowOf(user.id);
         assert.deepEqual([row.email, row.role, row.status, row.token_version, row.password_hash], ["ana@example.com", "user", "active", 0, hash], "nothing changed");
     });
+});
+
+// Each of two admins is told "you are an admin" before the other one's change is made. If each then changes the other
+// one, both would end up without the right to undo it and the system would have no admin. The change checks the actor
+// again, inside its own transaction, with both rows locked in the same order (so the two cannot deadlock either).
+describe("PATCH /v1/users/:id by two admins who change each other at the same moment", () => {
+    const activeAdmins = async (): Promise<number> =>
+        (await ownerPool.query<{ count: number }>("SELECT count(*)::int AS count FROM users WHERE role = 'admin' AND status = 'active'")).rows[0].count;
+
+    for (const [label, body] of [["demote", { role: "user" }], ["disable", { status: "disabled" }]] as const) {
+        it(`leaves one active admin when each admin tries to ${label} the other, and only one of the two changes is made`, { timeout: 60_000 }, async () => {
+            // the race is run several times: a single run could be one where the requests did not overlap
+            for (let round = 1; round <= 5; round++) {
+                await ownerPool.query("TRUNCATE users CASCADE");
+                const ana = await seedAdmin("ana.admin@example.com");
+                const bob = await seedAdmin("bob.admin@example.com");
+
+                const [fromAna, fromBob] = await Promise.all([update(ana.auth, bob.id, body), update(bob.auth, ana.id, body)]);
+
+                // one change is made, and the other admin is told they may not: no deadlock, no server error
+                const winner = [fromAna, fromBob].filter((response) => response.status === 200);
+                const losers = [fromAna, fromBob].filter((response) => response.status !== 200);
+                assert.equal(winner.length, 1, `round ${round}: one change was made (${fromAna.status} and ${fromBob.status})`);
+                assert.equal(losers.length, 1, `round ${round}: the other one was refused (${fromAna.status} and ${fromBob.status})`);
+                assert.equal(await activeAdmins(), 1, `round ${round}: exactly one active admin is left`);
+
+                // refused by the service (403), or, when the first change was already made by the time the second request
+                // was authenticated, by the token check: a disabled account's token is dead (401)
+                const [loser] = losers;
+                const allowed: [number, object][] = [[403, FORBIDDEN]];
+                if (label === "disable") {
+                    allowed.push([401, INVALID_TOKEN]);
+                }
+                assert.ok(
+                    allowed.some(([status, expectedBody]) => loser.status === status && JSON.stringify(loser.body) === JSON.stringify(expectedBody)),
+                    `round ${round}: the loser got ${loser.status} ${JSON.stringify(loser.body)}`
+                );
+            }
+        });
+    }
 });

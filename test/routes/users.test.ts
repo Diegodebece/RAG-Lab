@@ -266,6 +266,37 @@ describe("PATCH /v1/users/me/password", () => {
         assert.equal(await storedHash(user.id), hash, "a blocked attempt changes nothing");
     });
 
+    // Two requests with the same current password at the same time: both check it against the same stored hash, and
+    // the change is made only while the hash is still the one that was checked, so only one can win.
+    it("lets only one of two simultaneous changes win, and says so to the other", { timeout: 45_000 }, async () => {
+        const user = await seed();
+        const passwords = [`${NEW_PASSWORD} first`, `${NEW_PASSWORD} second`];
+
+        const responses = await Promise.all(passwords.map((newPassword) => changePassword(user.token, { currentPassword: PASSWORD, newPassword })));
+
+        const winners = responses.filter((response) => response.status === 200);
+        const losers = responses.filter((response) => response.status !== 200);
+        assert.equal(winners.length, 1, `exactly one change was made: ${JSON.stringify(responses.map((response) => response.status))}`);
+        assert.equal(losers.length, 1);
+
+        // 409 when the other request had not stored its hash yet at the time of the update; 400 when this one read
+        // the new hash and found that the current password no longer matches it
+        const [loser] = losers;
+        const expected: Record<number, string> = {
+            409: "The password was changed by another request, please try again",
+            400: "Current password is incorrect"
+        };
+        assert.ok(loser.status in expected, `the loser got ${loser.status}`);
+        assert.deepEqual(loser.body, { message: expected[loser.status] });
+
+        const winnerPassword = passwords[responses.indexOf(winners[0])];
+        const loserPassword = passwords[responses.indexOf(loser)];
+        assert.equal(await tokenVersionOf(user.id), 1, "the token version was raised once, not twice");
+        assert.equal((await login("ana@example.com", winnerPassword)).status, 200, "the winner's password works");
+        assert.equal((await login("ana@example.com", loserPassword)).status, 401, "the loser's password was never stored");
+        assert.equal((await login("ana@example.com", PASSWORD)).status, 401, "the old password is gone");
+    });
+
     it("counts the attempts of each user apart", { timeout: 30_000 }, async () => {
         const ana = await seed("ana@example.com");
         const bob = await seed("bob@example.com");

@@ -8,8 +8,12 @@ import { createServer } from "node:net";
 import type { AddressInfo, Server as NetServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import jwt from "jsonwebtoken";
 import { cleanChildEnvironment } from "./childEnvironment.js";
 import { SECRET_KEY_PLACEHOLDER } from "./config/placeholder.js";
+import { startPausableProxy, urlThroughProxy } from "./doubles/pausableProxy.js";
+import type { PausableProxy } from "./doubles/pausableProxy.js";
+import { makePasswordHash } from "./routes/testUsers.js";
 
 // These tests start the real src/server.ts in a child process, as `npm run dev` does, and look at what it prints,
 // how it exits and what it answers.
@@ -156,6 +160,16 @@ describe("server startup: configuration", () => {
         assert.doesNotMatch(server.output().stdout, /Server running/);
     });
 
+    // The migration script runs with MIGRATION_DATABASE_URL alone, but the API is the API role's: without its URL the
+    // server stops at once and says which variable is missing.
+    it("refuses to start without DATABASE_URL, even with MIGRATION_DATABASE_URL set", { timeout: 15_000 }, async () => {
+        const server = await startServer({ DATABASE_URL: undefined, MIGRATION_DATABASE_URL: UNREACHABLE_DATABASE_URL });
+
+        assert.notEqual(await waitForExit(server, 8_000), 0);
+        assert.match(allOutput(server), /DATABASE_URL/, "it names the missing setting");
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+    });
+
     it("does not take its settings from the test process's own environment", { timeout: 15_000 }, async () => {
         // a value that would stop any server at startup, if the child process inherited it
         const previous = process.env.HEALTH_CACHE_SECONDS;
@@ -249,17 +263,22 @@ describe("server startup: database schema", () => {
 // server stops at startup and says which role to use, without printing the URL or the password it was given.
 describe("server startup: the database role", () => {
     const PROBE_ROLE = "rag_lab_probe_role";
+    // a role the probe role is made a member of, in the test that needs it
+    const PARENT_ROLE = "rag_lab_probe_parent_role";
 
     const dropProbeRole = async (): Promise<void> => {
         const { ownerPool } = await loadDatabase();
-        await ownerPool.query(`
-            DO $$ BEGIN
-                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${PROBE_ROLE}') THEN
-                    DROP OWNED BY ${PROBE_ROLE};
-                    DROP ROLE ${PROBE_ROLE};
-                END IF;
-            END $$
-        `);
+
+        for (const role of [PROBE_ROLE, PARENT_ROLE]) {
+            await ownerPool.query(`
+                DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+                        DROP OWNED BY ${role};
+                        DROP ROLE ${role};
+                    END IF;
+                END $$
+            `);
+        }
     };
 
     afterEach(dropProbeRole);
@@ -344,6 +363,63 @@ describe("server startup: the database role", () => {
             "CREATE TABLE owned_by_the_probe_role (id integer)",
             `ALTER TABLE owned_by_the_probe_role OWNER TO ${PROBE_ROLE}`
         ]);
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    // A superuser owns nothing and may hold none of the other attributes: the refusal must still say it is a superuser,
+    // so that dropping the superuser check cannot go unnoticed behind the lines of the other checks (a superuser can
+    // also create in the public schema, which is a line of its own).
+    it("refuses to start when the role is a superuser that owns nothing, and lists the superuser problem", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("SUPERUSER NOCREATEDB NOCREATEROLE");
+        const server = await startServer({ DATABASE_URL: url });
+
+        assert.equal(await waitForExit(server), 1);
+        assert.match(server.output().stderr, /^- .*superuser/im, "one of the problem lines is the superuser one");
+        assert.match(allOutput(server), /rag_lab_api/);
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+        assert.ok(!allOutput(server).includes(new URL(url).password), "it never prints the password");
+    });
+
+    // The checks read what the session is allowed to do, so a session that connects as one role and then acts as another
+    // (the connection option role=..., or SET ROLE) could show the checks a harmless role while the rights of the
+    // session's own login stay behind it.
+    it("refuses to start when the session acts as another role than the one that logged in", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        await createProbeRole("");
+        // the owner may act as the probe role (PostgreSQL 16 and later need the SET option for it)
+        await ownerPool.query(`
+            DO $$ BEGIN
+                IF current_setting('server_version_num')::int >= 160000 THEN
+                    EXECUTE format('GRANT %I TO %I WITH SET TRUE', '${PROBE_ROLE}', current_user);
+                ELSE
+                    EXECUTE format('GRANT %I TO %I', '${PROBE_ROLE}', current_user);
+                END IF;
+            END $$
+        `);
+
+        const ownerUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
+        assert.ok(ownerUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        const url = `${ownerUrl}${ownerUrl.includes("?") ? "&" : "?"}options=-c%20role%3D${PROBE_ROLE}`;
+
+        await expectRefusal(url, [new URL(ownerUrl).password]);
+    });
+
+    it("refuses to start when the role is a member of another role", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("", [`CREATE ROLE ${PARENT_ROLE} NOLOGIN`, `GRANT ${PARENT_ROLE} TO ${PROBE_ROLE}`]);
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    it("refuses to start when the role can create objects in the database", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("", [`DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${PROBE_ROLE}', current_database()); END $$`]);
 
         await expectRefusal(url, [new URL(url).password]);
     });
@@ -456,5 +532,164 @@ describe("server startup: a database that answers with an error", () => {
 
         await waitForOutput(server, "Server running", 15_000);
         assert.match(server.output().stderr + server.output().stdout, /warning/i, "it warns");
+    });
+});
+
+// A server that starts while the database cannot be reached still has to check the role and the migrations once the
+// database answers: it keeps trying in the background, stops with the same message as at a normal startup when
+// something is wrong, and answers 503 on every route that needs the database until the check has passed. The
+// database "comes back" when the test starts a proxy on the port the server was given, a port where nothing listened
+// before. The server's retry interval must be short enough for the waits below (10 seconds at most).
+describe("server startup: a database that cannot be reached at first and comes back", () => {
+    const PASSWORD = "correct horse battery staple";
+    const UNAVAILABLE = { message: "The database is not available, please try again later" };
+    // none of the limits is the subject here, and the tests poll the server
+    const RELAXED = { HEALTH_CACHE_SECONDS: "0", AUTHENTICATED_REQUESTS_PER_MINUTE: "100000", REQUESTS_PER_ADDRESS_PER_MINUTE: "100000", LOGINS_PER_15_MINUTES: "100000" };
+    const proxies: PausableProxy[] = [];
+
+    afterEach(async () => {
+        await Promise.all(proxies.splice(0).map((proxy) => proxy.close()));
+    });
+
+    const databaseTarget = (): { host: string; port: number } => {
+        assert.ok(process.env.RAG_LAB_TEST_DATABASE_URL, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        const url = new URL(process.env.RAG_LAB_TEST_DATABASE_URL);
+
+        return { host: url.hostname, port: Number(url.port || 5432) };
+    };
+
+    // from now on the port reaches the real test database
+    const bringDatabaseBack = async (port: number): Promise<void> => {
+        proxies.push(await startPausableProxy(databaseTarget(), port));
+    };
+
+    const call = async (server: RunningServer, method: string, route: string, options: { token?: string; body?: object } = {}): Promise<{ status: number; body: unknown }> => {
+        const response = await fetch(`http://127.0.0.1:${server.port}${route}`, {
+            method,
+            headers: {
+                ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+                ...(options.body ? { "Content-Type": "application/json" } : {})
+            },
+            body: options.body ? JSON.stringify(options.body) : undefined,
+            signal: AbortSignal.timeout(8000)
+        });
+
+        return { status: response.status, body: await response.json() as unknown };
+    };
+
+    const tokenFor = (userId: string): string =>
+        jwt.sign({ sub: userId, ver: 0, iss: "rag-lab", aud: "rag-lab-api" }, VALID_SECRET, { algorithm: "HS256", expiresIn: "1h" });
+
+    const seedAccount = async (): Promise<string> => {
+        const { ownerPool } = await loadDatabase();
+        const { rows } = await ownerPool.query<{ id: string }>(
+            "INSERT INTO users (email, password_hash) VALUES ('ana@example.com', $1) RETURNING id",
+            [await makePasswordHash(PASSWORD)]
+        );
+
+        return rows[0].id;
+    };
+
+    it("starts, answers 503 on the routes that need the database while it is away, and works once it is back", { timeout: 60_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const token = tokenFor(await seedAccount());
+        const port = await getFreePort();
+        assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+        const server = await startServer({ DATABASE_URL: urlThroughProxy(process.env.RAG_LAB_TEST_API_DATABASE_URL, port), ...RELAXED });
+
+        await waitForOutput(server, "Server running");
+
+        // while the database is away, and for longer than the server takes to try again once
+        await sleep(3000);
+        assert.equal(server.child.exitCode, null, `the server is still running; output: ${JSON.stringify(server.output())}`);
+
+        const login = await call(server, "POST", "/v1/auth/login", { body: { email: "ana@example.com", password: PASSWORD } });
+        assert.equal(login.status, 503, "a login");
+        assert.deepEqual(login.body, UNAVAILABLE);
+
+        for (const [method, route] of [["GET", "/v1/users/me"], ["POST", "/v1/auth/logout"], ["GET", "/v1/nothing-here"]] as const) {
+            const response = await call(server, method, route, { token });
+            assert.equal(response.status, 503, `${method} ${route}`);
+            assert.deepEqual(response.body, UNAVAILABLE, `${method} ${route}`);
+        }
+
+        const health = await getHealth(server);
+        assert.equal(health.status, 200, "the health check keeps answering");
+        assert.equal(health.body.data.database, "down");
+
+        // the database comes back: the check passes, and the routes work
+        await bringDatabaseBack(port);
+        const deadline = Date.now() + 25_000;
+
+        for (;;) {
+            assert.equal(server.child.exitCode, null, `the server is still running; output: ${JSON.stringify(server.output())}`);
+            const response = await call(server, "GET", "/v1/users/me", { token });
+
+            if (response.status === 200) {
+                break;
+            }
+
+            assert.equal(response.status, 503, `until the check passes the answer is 503, not ${JSON.stringify(response)}`);
+            assert.ok(Date.now() < deadline, `the routes did not start working within 25 seconds; output: ${JSON.stringify(server.output())}`);
+            await sleep(300);
+        }
+
+        const loggedIn = await call(server, "POST", "/v1/auth/login", { body: { email: "ana@example.com", password: PASSWORD } });
+        assert.equal(loggedIn.status, 200);
+        assert.equal((await getHealth(server)).body.data.database, "up");
+        assert.equal(server.child.exitCode, null, "the server kept running");
+    });
+
+    // The owner's URL gets the same refusal as at a normal startup, only later: the check was not skipped because the
+    // database happened to be away at that moment.
+    it("stops with the message about rag_lab_api when the database comes back and DATABASE_URL is the owner's", { timeout: 60_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+
+        const ownerUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
+        assert.ok(ownerUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        const ownerPassword = new URL(ownerUrl).password;
+        assert.ok(ownerPassword, "the owner's test URL has a password");
+        const port = await getFreePort();
+        const databaseUrl = urlThroughProxy(ownerUrl, port);
+        const server = await startServer({ DATABASE_URL: databaseUrl, ...RELAXED });
+
+        await waitForOutput(server, "Server running");
+        await bringDatabaseBack(port);
+
+        assert.equal(await waitForExit(server, 20_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(allOutput(server), /rag_lab_api/, "it says which role to use");
+
+        for (const secret of [databaseUrl, ownerUrl, ownerPassword]) {
+            assert.ok(!allOutput(server).includes(secret), "it never prints the URL or the password");
+        }
+    });
+
+    it("stops, naming the migration, when the database comes back with a pending migration", { timeout: 60_000 }, async () => {
+        const { emptyTestDatabase } = await loadDatabase();
+        await emptyTestDatabase();
+        assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+        const port = await getFreePort();
+        const server = await startServer({ DATABASE_URL: urlThroughProxy(process.env.RAG_LAB_TEST_API_DATABASE_URL, port), ...RELAXED });
+
+        await waitForOutput(server, "Server running");
+        await bringDatabaseBack(port);
+
+        assert.equal(await waitForExit(server, 20_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(allOutput(server), /001_init\.sql/, "it names the pending migration");
+        assert.match(allOutput(server), /npm run migrate|DATABASE_URL/, "it says what to do");
+    });
+
+    it("keeps running while the database stays away, however many times it has tried", { timeout: 30_000 }, async () => {
+        const server = await startServer({ DATABASE_URL: UNREACHABLE_DATABASE_URL, ...RELAXED });
+
+        await waitForOutput(server, "Server running");
+        await sleep(12_000);
+
+        assert.equal(server.child.exitCode, null, `the server is still running; output: ${JSON.stringify(server.output())}`);
+        assert.equal((await getHealth(server)).body.data.database, "down");
     });
 });

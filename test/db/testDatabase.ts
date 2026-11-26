@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
+import path from "node:path";
 import { promisify } from "node:util";
 import pg from "pg";
 import { pool } from "../../src/v1/config/db.config.js";
+import { cleanChildEnvironment } from "../childEnvironment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,11 +60,17 @@ const assertTestDatabase = async (): Promise<void> => {
 };
 
 // Runs the real migration script, as `npm run migrate` would, against the test database, with the owner's URL in
-// MIGRATION_DATABASE_URL (the script uses no other variable). It rejects when the script exits with a non-zero
-// code; the error carries stdout, stderr and code.
+// MIGRATION_DATABASE_URL and nothing else about the database: the script uses no other variable, so DATABASE_URL (the
+// API's) is removed and no .env file is read (a missing one is named, so the developer's own cannot fill it in). A
+// script that still needed DATABASE_URL would fail here, and in every test that resets the database.
 export const runMigrateScript = async (): Promise<string> => {
     const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", "src/migrate.ts"], {
-        env: { ...process.env, MIGRATION_DATABASE_URL: ownerUrl },
+        env: cleanChildEnvironment({
+            MIGRATION_DATABASE_URL: ownerUrl,
+            DATABASE_URL: undefined,
+            DOTENV_CONFIG_PATH: path.join(import.meta.dirname, "no-such-file.env"),
+            DOTENV_CONFIG_QUIET: "true"
+        }),
         timeout: 60_000
     });
 

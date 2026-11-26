@@ -50,14 +50,15 @@ interface Outcome {
 
 // Runs the script with the arguments given. The migration URL is removed from its environment: the script is the
 // API's, and must not need the owner's connection.
-const createAdmin = async (...args: string[]): Promise<Outcome> => {
+const runScript = async (args: string[], environment: Record<string, string | undefined> = {}): Promise<Outcome> => {
     try {
         const { stdout, stderr } = await execFileAsync(process.execPath, ["--import", "tsx", SCRIPT, ...args], {
             cwd: ROOT,
             env: cleanChildEnvironment({
                 DOTENV_CONFIG_PATH: emptyEnvFile,
                 DOTENV_CONFIG_QUIET: "true",
-                MIGRATION_DATABASE_URL: undefined
+                MIGRATION_DATABASE_URL: undefined,
+                ...environment
             }),
             timeout: 30_000
         });
@@ -70,6 +71,8 @@ const createAdmin = async (...args: string[]): Promise<Outcome> => {
         return { code: typeof failure.code === "number" ? failure.code : -1, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "" };
     }
 };
+
+const createAdmin = (...args: string[]): Promise<Outcome> => runScript(args);
 
 // The password the script printed: the only word of exactly 24 characters in what it wrote.
 const printedPassword = (outcome: Outcome): string => {
@@ -148,6 +151,17 @@ describe("create-admin", () => {
             assert.match(`${outcome.stdout}${outcome.stderr}`, /email/i, `${email}: it says what is wrong`);
         }
 
+        assert.deepEqual(await accounts(), []);
+    });
+
+    // The migration script needs only MIGRATION_DATABASE_URL; this one is the API's and needs only DATABASE_URL. The
+    // owner's URL being there must not make it run: it would create the admin with the wrong rights.
+    it("refuses to run without DATABASE_URL, even with MIGRATION_DATABASE_URL set, and creates nothing", { timeout: 30_000 }, async () => {
+        const outcome = await runScript(["no.database@example.com"], { DATABASE_URL: undefined, MIGRATION_DATABASE_URL: process.env.RAG_LAB_TEST_DATABASE_URL });
+
+        assert.notEqual(outcome.code, 0);
+        assert.match(`${outcome.stdout}${outcome.stderr}`, /DATABASE_URL/, "it names the missing setting");
+        assert.equal(outcome.stdout.split(/\s+/).filter((word) => word.length === 24).length, 0, "no password was printed");
         assert.deepEqual(await accounts(), []);
     });
 

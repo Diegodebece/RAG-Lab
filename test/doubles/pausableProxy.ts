@@ -15,7 +15,9 @@ export interface PausableProxy {
     close: () => Promise<void>;
 }
 
-export const startPausableProxy = async (target: { host: string; port: number }): Promise<PausableProxy> => {
+// listenPort is the port to listen on (0, the default, lets the system pick a free one). A test that wants a database
+// that "comes back" gives a port it chose before: nothing listens there until the proxy starts.
+export const startPausableProxy = async (target: { host: string; port: number }, listenPort = 0): Promise<PausableProxy> => {
     const sockets = new Set<Socket>();
     let paused = false;
     let held: (() => void)[] = [];
@@ -52,7 +54,10 @@ export const startPausableProxy = async (target: { host: string; port: number })
         upstream.on("close", closeBoth);
     });
 
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(listenPort, "127.0.0.1", resolve);
+    });
 
     return {
         port: (server.address() as AddressInfo).port,
