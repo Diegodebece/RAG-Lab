@@ -107,7 +107,9 @@ describe("renderUsageSection", () => {
         assert.match(text, /Fix confirmed findings/);
         assert.match(text, /API-equivalent/);
         assert.match(text, /2026-11-03/);
-        assert.match(text, /\$0\.07/);
+        // amounts name their currency: the prices are in US dollars
+        assert.match(text, /USD 0\.07/);
+        assert.doesNotMatch(text, /\$\d/);
     });
 
     test("names a loop that never had a pull request apart from one not merged yet", () => {
@@ -195,5 +197,7 @@ describe("renderSummaryTable", () => {
         assert.match(lines[2], /#2 .*feature\/b/);
         assert.match(lines[0], /incomplete/);
         assert.match(lines[1], /25 %/);
+        assert.match(lines[1], /USD 1\.50/);
+        assert.doesNotMatch(text, /\$\d/);
     });
 });

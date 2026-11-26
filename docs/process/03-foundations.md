@@ -50,40 +50,40 @@ Layer 1 of RAG Lab, Foundations, built through the full feature loop on the plan
 
 PR #3, `feature/foundations`: 420 model calls from 2026-11-26 04:18 to 2026-11-26 15:29 UTC, in 2 sessions (b713af1b, d7737c32).
 
-**API-equivalent cost: $24.03**: what these tokens would cost on the Claude API at the prices of 2026-11-03; a subscription plan bills differently.
+**API-equivalent cost: USD 24.03**: what these tokens would cost on the Claude API at the prices of 2026-11-03; a subscription plan bills differently.
 
 | Role | Step | Launches | Calls | Input | Output (thinking) | Cache write | Cache read | Cost | Share |
 |---|---|---|---|---|---|---|---|---|---|
-| orchestrator | orchestration | 0 | 106 | 270 | 107,788 (27,210) | 229,679 | 26,610,821 | $9.32 | 39 % |
-| planner | plan | 1 | 36 | 72 | 118,786 (85,817) | 213,043 | 3,632,616 | $4.17 | 17 % |
-| test-writer | tests | 3 | 127 | 254 | 172,993 (68,956) | 429,059 | 13,164,257 | $4.12 | 17 % |
-| implementer | code | 2 | 58 | 116 | 63,492 (16,289) | 225,960 | 4,192,858 | $1.62 | 7 % |
-| code-auditor | audit | 1 | 24 | 48 | 42,752 (28,435) | 96,623 | 1,007,359 | $1.54 | 6 % |
-| owasp-auditor | audit | 1 | 22 | 44 | 29,992 (15,129) | 79,859 | 962,762 | $1.19 | 5 % |
-| finding-verifier | verification | 1 | 20 | 40 | 25,318 (14,237) | 78,613 | 897,970 | $1.08 | 4 % |
-| docs-keeper | docs | 1 | 27 | 54 | 47,170 (3,265) | 124,369 | 2,103,363 | $0.99 | 4 % |
+| orchestrator | orchestration | 0 | 106 | 270 | 107,788 (27,210) | 229,679 | 26,610,821 | USD 9.32 | 39 % |
+| planner | plan | 1 | 36 | 72 | 118,786 (85,817) | 213,043 | 3,632,616 | USD 4.17 | 17 % |
+| test-writer | tests | 3 | 127 | 254 | 172,993 (68,956) | 429,059 | 13,164,257 | USD 4.12 | 17 % |
+| implementer | code | 2 | 58 | 116 | 63,492 (16,289) | 225,960 | 4,192,858 | USD 1.62 | 7 % |
+| code-auditor | audit | 1 | 24 | 48 | 42,752 (28,435) | 96,623 | 1,007,359 | USD 1.54 | 6 % |
+| owasp-auditor | audit | 1 | 22 | 44 | 29,992 (15,129) | 79,859 | 962,762 | USD 1.19 | 5 % |
+| finding-verifier | verification | 1 | 20 | 40 | 25,318 (14,237) | 78,613 | 897,970 | USD 1.08 | 4 % |
+| docs-keeper | docs | 1 | 27 | 54 | 47,170 (3,265) | 124,369 | 2,103,363 | USD 0.99 | 4 % |
 
 ### By model
 
 | Model | Calls | Output | Cache read | Cost | Share |
 |---|---|---|---|---|---|
-| claude-opus-5-5 | 208 | 324,636 | 33,111,528 | $17.30 | 72 % |
-| claude-sonnet-5-5 | 212 | 283,655 | 19,460,478 | $6.73 | 28 % |
+| claude-opus-5-5 | 208 | 324,636 | 33,111,528 | USD 17.30 | 72 % |
+| claude-sonnet-5-5 | 212 | 283,655 | 19,460,478 | USD 6.73 | 28 % |
 
 ### Agents
 
 | Start (UTC) | Role | Model | Description | Calls | Cost |
 |---|---|---|---|---|---|
-| 2026-11-26 04:26 | planner | claude-opus-5-5 | Plan layers and layer 1 | 36 | $4.17 |
-| 2026-11-26 05:15 | test-writer | claude-sonnet-5-5 | Write layer 1 tests | 40 | $1.56 |
-| 2026-11-26 05:47 | implementer | claude-sonnet-5-5 | Implement layer 1 Foundations | 26 | $0.82 |
-| 2026-11-26 05:52 | owasp-auditor | claude-opus-5-5 | OWASP audit of layer 1 | 22 | $1.19 |
-| 2026-11-26 05:52 | code-auditor | claude-opus-5-5 | Audit layer 1 code | 24 | $1.54 |
-| 2026-11-26 06:00 | finding-verifier | claude-opus-5-5 | Verify layer 1 audit findings | 20 | $1.08 |
-| 2026-11-26 06:06 | test-writer | claude-sonnet-5-5 | Tests for confirmed audit findings | 64 | $2.17 |
-| 2026-11-26 14:59 | test-writer | claude-sonnet-5-5 | Test pool shutdown with stuck client | 23 | $0.39 |
-| 2026-11-26 15:07 | implementer | claude-sonnet-5-5 | Fix confirmed layer 1 findings | 32 | $0.80 |
-| 2026-11-26 15:14 | docs-keeper | claude-sonnet-5-5 | Sync docs for layer 1 | 27 | $0.99 |
+| 2026-11-26 04:26 | planner | claude-opus-5-5 | Plan layers and layer 1 | 36 | USD 4.17 |
+| 2026-11-26 05:15 | test-writer | claude-sonnet-5-5 | Write layer 1 tests | 40 | USD 1.56 |
+| 2026-11-26 05:47 | implementer | claude-sonnet-5-5 | Implement layer 1 Foundations | 26 | USD 0.82 |
+| 2026-11-26 05:52 | owasp-auditor | claude-opus-5-5 | OWASP audit of layer 1 | 22 | USD 1.19 |
+| 2026-11-26 05:52 | code-auditor | claude-opus-5-5 | Audit layer 1 code | 24 | USD 1.54 |
+| 2026-11-26 06:00 | finding-verifier | claude-opus-5-5 | Verify layer 1 audit findings | 20 | USD 1.08 |
+| 2026-11-26 06:06 | test-writer | claude-sonnet-5-5 | Tests for confirmed audit findings | 64 | USD 2.17 |
+| 2026-11-26 14:59 | test-writer | claude-sonnet-5-5 | Test pool shutdown with stuck client | 23 | USD 0.39 |
+| 2026-11-26 15:07 | implementer | claude-sonnet-5-5 | Fix confirmed layer 1 findings | 32 | USD 0.80 |
+| 2026-11-26 15:14 | docs-keeper | claude-sonnet-5-5 | Sync docs for layer 1 | 27 | USD 0.99 |
 
 ### Extra rounds
 
@@ -91,15 +91,15 @@ Launches of a role after its first, such as a second test-writer after the audit
 
 | Role | Launches | Extra | Cost of the extra rounds |
 |---|---|---|---|
-| test-writer | 3 | 2 | $2.56 |
-| implementer | 2 | 1 | $0.80 |
+| test-writer | 3 | 2 | USD 2.56 |
+| implementer | 2 | 1 | USD 0.80 |
 
 ### Check against Claude Code's own estimate
 
 Claude Code writes its own running estimate of a session's cost into the transcript; it can be older than the transcript's last call.
 
-- b713af1b: this report $0.06, Claude Code $0.67 (-91 %). **More than 5 % apart.**
+- b713af1b: this report USD 0.06, Claude Code USD 0.67 (-91 %). **More than 5 % apart.**
 - d7737c32: the session spans several loops, so it is not compared.
 
-Generated by `.claude/metrics/usage-report.mjs` on 2026-11-26 16:21 UTC from the Claude Code transcripts.
+Generated by `.claude/metrics/usage-report.mjs` on 2026-11-26 16:26 UTC from the Claude Code transcripts.
 <!-- usage-report:end -->
