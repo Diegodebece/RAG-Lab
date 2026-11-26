@@ -18,7 +18,8 @@ description: Folder layout, file naming, TypeScript setup and wiring of an Expre
 ├── migrations/                 # NNN_<description>.sql, applied in order by src/migrate.ts
 ├── src/
 │   ├── app.ts                  # builds the Express app (no listen)
-│   ├── server.ts               # imports app and calls listen
+│   ├── server.ts               # checks config and schema, imports app and calls listen, shuts down gracefully
+│   ├── shutdown.ts             # closeServerGracefully and closePoolGracefully
 │   ├── migrate.ts              # applies pending migrations (npm run migrate)
 │   └── v1/
 │       ├── v1.routes.ts        # mounts every router of the version
@@ -31,8 +32,11 @@ description: Folder layout, file naming, TypeScript setup and wiring of an Expre
 │       ├── types/              # <entities>.type.ts + express.d.ts
 │       └── utils/              # <name>.util.ts
 ├── test/
-│   ├── setup.ts                # runs before every test file: points DATABASE_URL at the test database
+│   ├── setup.ts                # runs before every test file: test database, fixed operational settings
+│   ├── operationalSettings.ts  # the app's defaults for the settings a developer's .env may change
 │   ├── db/                     # schema and migration tests
+│   ├── doubles/                # fakes of what the app calls: the model server, a database that freezes
+│   ├── repository/             # checks of the repository itself (invisible characters)
 │   └── <layer>/                # mirrors src/v1 (utils/, services/, ...): <name>.test.ts
 ├── docs/                       # project-guide.md: architecture and design decisions
 └── dist/                       # build output, git-ignored, never edited
@@ -66,18 +70,22 @@ v1.routes.ts → <entities>.routes.ts → middlewares → <entities>.controller.
 
 - [templates/tsconfig.json](templates/tsconfig.json)
 - [templates/app.ts](templates/app.ts)
-- [templates/server.ts](templates/server.ts) — listens, and shuts down gracefully on SIGTERM and SIGINT
-- [templates/shutdown.ts](templates/shutdown.ts) — `closeServerGracefully`, next to `server.ts`
+- [templates/server.ts](templates/server.ts) — refuses unsafe settings and a wrong database, listens, and shuts down gracefully on SIGTERM and SIGINT
+- [templates/shutdown.ts](templates/shutdown.ts) — `closeServerGracefully` and `closePoolGracefully`, next to `server.ts`
 - [templates/server.config.ts](templates/server.config.ts) — `PORT`, `HOST`, `TRUSTED_PROXIES`, `CORS_ORIGINS`
-- [templates/env.config.ts](templates/env.config.ts) — `readIntegerSetting` and `readListSetting`, which validate settings at startup
+- [templates/env.config.ts](templates/env.config.ts) — `getStartupConfigProblems`, `readIntegerSetting` and `readListSetting`, which validate settings at startup
 - [templates/v1.routes.ts](templates/v1.routes.ts)
 - [templates/appError.util.ts](templates/appError.util.ts)
 - [templates/express.d.ts](templates/express.d.ts) — adds `req.decoded` and `req.validatedBody` to Express's `Request`
 - [templates/auth.type.ts](templates/auth.type.ts) — `TokenPayload`, the shape of `req.decoded`
 - [templates/products.type.ts](templates/products.type.ts) — example entity type
-- [templates/db.config.ts](templates/db.config.ts) — PostgreSQL `pool` and `withTransaction`
-- [templates/migrate.ts](templates/migrate.ts) — migration runner
-- [templates/setup.ts](templates/setup.ts) — `test/setup.ts`, points the tests at the test database
+- [templates/db.config.ts](templates/db.config.ts) — PostgreSQL `createPool`, `pool` and `withTransaction`
+- [templates/schema.service.ts](templates/schema.service.ts) — `getMigrationStateService`, compares the migration files with the database; goes in `services/`
+- [templates/schema.type.ts](templates/schema.type.ts) — `MigrationState`
+- [templates/databaseError.util.ts](templates/databaseError.util.ts) — `isDatabaseUnreachableError`; goes in `utils/`
+- [templates/migrate.ts](templates/migrate.ts) — migration runner, with its own pool and the wrong-database refusals
+- [templates/setup.ts](templates/setup.ts) — `test/setup.ts`, points the tests at the test database and fixes the operational settings
+- [templates/operationalSettings.ts](templates/operationalSettings.ts) — `test/operationalSettings.ts`, the defaults `setup.ts` applies
 
 ## 4. Rules
 
@@ -97,16 +105,20 @@ v1.routes.ts → <entities>.routes.ts → middlewares → <entities>.controller.
       "start": "node dist/server.js",
       "migrate": "tsx src/migrate.ts",
       "typecheck": "tsc -p tsconfig.test.json",
-      "test": "node --import tsx --import ./test/setup.ts --test --test-concurrency=1 \"test/**/*.test.ts\""
+      "test": "node --import tsx --import ./test/setup.ts --test --test-concurrency=1 \"test/**/*.test.ts\"",
+      "test:file": "node --import tsx --import ./test/setup.ts --test --test-concurrency=1"
   }
   ```
 
+  `npm run test:file -- test/<layer>/<name>.test.ts` runs one file with the same setup.
+
 ### Database (PostgreSQL with `pg`)
 
-- `config/db.config.ts` exports `pool` (one `pg.Pool` for the whole process, built from `DATABASE_URL`; startup fails if it is missing) and `withTransaction(callback)`. Copy the template.
+- `config/db.config.ts` exports `createPool`, `pool` and `withTransaction(callback, targetPool?)`. `pool` is the one `pg.Pool` of the API, built from `DATABASE_URL` (startup fails if it is missing), with a connection timeout, `keepAlive` and a query timeout (30 s): without one, a connection that is open but no longer answers holds its request forever. `withTransaction` takes an optional pool so the migration script can use its own. Copy the template.
 - A connection taken with `pool.connect()` has no `"error"` listener while it is lent out; if it breaks (PostgreSQL restarting), the unhandled event crashes the process. `withTransaction` listens for that error, releases a broken connection with `release(true)` so the pool drops it, and logs a failed `ROLLBACK` instead of letting it replace the original error. Code that takes a connection by hand does the same.
 - The schema changes only through migrations: `migrations/NNN_<description>.sql`, with a three-digit prefix (files are applied in alphabetical order) and one logical change per file. Never edit a migration that has been applied or merged; add a new one.
-- `src/migrate.ts` applies the pending files, each together with its `schema_migrations` record in one transaction, under an advisory lock. Copy the template.
+- `src/migrate.ts` applies the pending files, each together with its `schema_migrations` record in one transaction, under an advisory lock, on its own pool made with `createPool()` (no query timeout: a migration may be slower than any API query). Copy the template.
+- Wrong-database guard: `getMigrationStateService` (`services/schema.service.ts`) compares the files with `schema_migrations` and returns `applied`, `pending`, `unknown` (recorded but not in this checkout's files) and `foreignTables` (tables in the public schema when there is no `schema_migrations`). `migrate` refuses, and applies nothing, when `unknown` or `foreignTables` is not empty. `server.ts` runs the same comparison at startup: it stops on pending, unknown or foreign state and on a database that answers and refuses (a wrong password), and starts with a warning only when the database cannot be reached (`isDatabaseUnreachableError`), so the health check reports it as down.
 - Ids exposed in URLs are UUIDs generated by the database: `id uuid PRIMARY KEY DEFAULT gen_random_uuid()`. Tables that never appear in URLs may use `bigint GENERATED ALWAYS AS IDENTITY` or a natural key.
 - Column names are snake_case. Fixed value lists are `text` with a `CHECK (... IN (...))` constraint, not `ENUM` types.
 - Index every foreign key column; PostgreSQL does not create those indexes automatically.
@@ -115,9 +127,13 @@ v1.routes.ts → <entities>.routes.ts → middlewares → <entities>.controller.
 ### Tests
 
 - `node:test` and `node:assert/strict`, run with `tsx`; files are `test/<layer>/<name>.test.ts`, mirroring `src/v1`.
-- Database tests use their own database, whose name ends in `_test`, through `TEST_DATABASE_URL`. `test/setup.ts` replaces `DATABASE_URL` with it before any test file loads, and removes `DATABASE_URL` when it is missing so tests can never reach the development database.
+- Database tests use their own database, whose name ends in `_test`, through `<PROJECT>_TEST_DATABASE_URL` (`RAG_LAB_TEST_DATABASE_URL` in RAG Lab). It is set in `.env` and also as a user environment variable, because a worktree has no `.env`. `test/setup.ts` replaces `DATABASE_URL` with it before any test file loads, and removes `DATABASE_URL` when it is missing so tests can never reach the development database. The helper that empties the database refuses one whose name does not end in `_test`, as a second line of defense.
+- `test/setup.ts` also sets every operational setting of the app (`HOST`, `PORT`, `TRUSTED_PROXIES`, `CORS_ORIGINS`, the limits, the token lifetime, `OLLAMA_BASE_URL`) to the app's own default from `test/operationalSettings.ts`, so the developer's `.env` cannot change a test. They are set to values, not deleted, because the app loads `.env` itself and would fill a deleted variable in again. Child processes the tests start get the same values. When a new optional setting is added to `.env.example`, add it to `operationalSettings.ts` too.
+- `OLLAMA_BASE_URL` is a closed port in tests, so a test that forgets its double gets "connection refused" instead of reaching the real models.
 - A database test file resets the schema and runs the real migration script in `before`, empties the tables in `beforeEach`, and closes the pool in `after`. Test files run one at a time (`--test-concurrency=1`) because they share the test database.
 - Unit and route tests never call a real model: they replace the provider's wrapper with a test double. Tests that need a live model are integration tests, skipped unless their environment variable is set.
+- Test doubles live in `test/doubles/`, one file per thing faked, each with its own test. A double for an HTTP service is a real HTTP server on a free port (`fakeOllama.ts`), so the code under test runs its real `fetch`, timeout and redirect logic; tests choose what each path answers (a list of models, a malformed body, a hang, a redirect, a dropped connection). A double for a database that freezes is a TCP proxy that can pause (`pausableProxy.ts`): connections stay open and no byte travels, which a stopped container cannot simulate. Doubles are written in the test folder, never in `src/`.
+- `test/repository/` holds checks of the repository itself, not of the app. One of them scans every project file for invisible characters (zero-width spaces, direction marks, soft hyphen, variation selectors, tag characters, byte order marks, UTF-16 files included) on every `npm test`.
 - Tests that wait for a stream to end always have a timeout (`Promise.race` or `{ timeout }`), so a stream that never ends fails the test instead of hanging the suite.
 - In RAG Lab, the agent hooks have their own tests in `.claude/hooks/tests/` (`node --test .claude/hooks/tests/`), outside `test/` on purpose so the test-writer cannot change them.
 
@@ -131,10 +147,10 @@ v1.routes.ts → <entities>.routes.ts → middlewares → <entities>.controller.
 
 - `app.ts` order: `import "dotenv/config"` first → `app.disable("x-powered-by")` → `app.set("trust proxy", TRUSTED_PROXIES)` → `securityHeadersMiddleware` → `cors` (limited to `CORS_ORIGINS` when set) → `app.use("/v1", v1Router)` → `notFoundMiddleware` → `errorMiddleware` (always last).
 - Behind a proxy or tunnel, every request comes from the proxy: without `trust proxy`, every limit keyed by address becomes one counter for the whole internet. Set it to the proxy's addresses (`TRUSTED_PROXIES`, `loopback` by default), never `true`, which would trust the left-most `X-Forwarded-For` entry, the one the client writes. Test it against the real app's configuration.
-- Settings come from `config/*.config.ts`, read with `readIntegerSetting` and `readListSetting` (`config/env.config.ts`): a value that is not a valid number stops the app at startup instead of breaking it later (`Number(env) || default` accepts negatives).
-- `server.ts` shuts down gracefully on SIGTERM (`docker stop`) and SIGINT: stop background work, `closeServerGracefully` (stop accepting, end long-lived responses, wait for requests in progress up to a few seconds, then close what is left), then `pool.end()`.
+- Settings come from `config/*.config.ts`, read with `readIntegerSetting` and `readListSetting` (`config/env.config.ts`): a value that is not plain decimal digits, or is outside its minimum and maximum, stops the app at startup instead of breaking it later, and is never clamped (`Number(env) || default` accepts negatives; `Number("1e3")` and `Number("0x10")` are numbers). Give a setting a maximum whenever a larger value is a mistake. A setting a URL or a secret must satisfy is checked by `getStartupConfigProblems`, which `server.ts` calls first.
+- `server.ts` shuts down gracefully on SIGTERM (`docker stop`) and SIGINT: stop background work, `closeServerGracefully` (stop accepting, end long-lived responses, wait for requests in progress, then close what is left), then `closePoolGracefully` (`pool.end()`, and after its timeout destroy the connections still lent out, so a request stuck on a frozen database cannot keep the process alive). Both timeouts add up to less than Docker's 10 s grace period (6 s and 2 s in RAG Lab). `closePoolGracefully` reads pg-pool's private client lists in one commented place because the public API cannot list clients lent out before it is called; keep it that way.
 - No global body parser and no `express.urlencoded`: the API only accepts JSON, and each route that takes a body parses it with its own `express.json()` (see `layered-express-route`). A global parser would read the body of requests that authentication or a rate limit is about to reject, and routes that need a larger limit would need path checks in `app.ts`.
-- `app.ts` exports `app`; only `server.ts` calls `listen`, so the app can be reused by Vercel and tests.
+- `app.ts` exports `app`; only `server.ts` calls `listen` (Express 5 passes listen errors to its callback, so "Server running" is printed only when the server really listens), so the app can be reused by Vercel and tests.
 - Database connection setup lives in `config/db.config.ts`.
 - Every new project starts with: `tsconfig.json`, `utils/appError.util.ts`, `types/express.d.ts`, `types/auth.type.ts`, the core middlewares from the `layered-express-middleware` skill (`error`, `notFound`, `validateBody`, `authenticate`, `authorize`, `securityHeaders`) with `config/auth.config.ts` and `utils/token.util.ts`, and `utils/requireUserId.util.ts` from the `layered-express-controller` skill.
 - **Adding a new resource** — create files in this order, loading each layer's skill:

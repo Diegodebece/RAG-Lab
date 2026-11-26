@@ -1,7 +1,8 @@
 # RAG Lab design
 
-Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Nothing is built yet. Every
-session and agent working on RAG Lab reads this file first. Decisions change only with the owner's approval, and
+Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Building follows the order in
+section 13; layer 1 (Foundations) was built on 2026-11-26. Every session and agent working on RAG Lab reads this
+file first. Decisions change only with the owner's approval, and
 each change is recorded here.
 
 ## 1. Goal
@@ -25,7 +26,13 @@ It reuses pieces of two earlier projects on this machine:
 
 Same as RAG Web unless a decision here says otherwise: Node.js ES modules, TypeScript strict, Express 5, Joi,
 JWT, PostgreSQL + pgvector through `pg` with plain SQL and numbered migrations. Its own database container on
-`127.0.0.1:5433` (5432 belongs to RAG Web). Ollama runs on the Windows host.
+`127.0.0.1:25432` (5432 belongs to RAG Web). Ollama runs on the Windows host.
+
+Changed on 2026-11-26: the port was first designed as 5433. On the owner's machine a native PostgreSQL service
+already uses 5433, so the container moved to 25432, which sits below Windows' dynamic port range (49152 and up)
+and so is not taken by another program at random. The databases are `rag_lab` and `rag_lab_test`, owned by the user
+`rag_lab`, in the compose project `rag-lab`; they differ from RAG Web's names on purpose, so a URL copied from RAG
+Web fails loudly.
 
 Hardware: RTX 4070 Laptop (8 GB VRAM, about 1.7 GB used by Windows), 32 GB DDR5, Ryzen 9 7940HS.
 
@@ -164,6 +171,11 @@ Hooks enforce these limits, not prompts.
   Both paths come from the environment or from the main checkout's `.env`. Worktrees have no `.env`, so set
   them as user environment variables too.
 
+  The same goes for the test database (decided 2026-11-26): `RAG_LAB_TEST_DATABASE_URL` is set in `.env` and also
+  as a Windows user environment variable, so the tests run in a worktree. `test/setup.ts` copies it into
+  `DATABASE_URL`, or deletes `DATABASE_URL` when it is missing, so a test can never reach the development
+  database; the tests empty the database, and refuse one whose name does not end in `_test`.
+
   An agent working in a worktree (`.claude/worktrees/<name>`) has that worktree as its project: the rules above
   apply inside it, and it cannot reach the main checkout or another worktree. Claude Code sets
   `CLAUDE_PROJECT_DIR` to the main checkout, so before this rule (fixed 2026-11-26) the worktree counted as a
@@ -269,6 +281,13 @@ so one loop runs at a time and its cost is watched.
 5. `ollama pull gpt-oss:20b` (about 14 GB).
 6. The three Ollama environment variables, then restart Ollama; check both models loaded with `ollama ps`.
 
+Added with layer 1 (2026-11-26), once the code exists; the exact commands are in the README:
+
+7. Create `.env` from `.env.example` with a database password and a `SECRET_KEY` of at least 32 random characters.
+8. `docker compose up -d db`, then create the test database `rag_lab_test` once.
+9. Set `RAG_LAB_TEST_DATABASE_URL` as a Windows user environment variable too (worktrees have no `.env`).
+10. `npm install`, then `npm run migrate`.
+
 Then the orchestrator prepares, for review before the first commit: `.gitignore` (private data first),
 `CLAUDE.md`, the layered-express skills, the agent definitions and their hooks. Prepared on 2026-11-26, pending
 the owner's review.
@@ -292,3 +311,27 @@ data and the hooks.
 - Whether Ollama's prompt cache affects `prompt_eval_count` and how to report it.
 - Playground caps: concrete limits per user.
 - Hosting and domain for RAG Lab (RAG Web uses a Cloudflare tunnel).
+
+## 13. Build order
+
+Approved by the owner on 2026-11-26. Each layer goes through the feature loop (section 8); each experiment (E)
+goes through the experiment loop once the layers before it exist.
+
+| # | Layer | What it holds |
+|---|---|---|
+| 1 | Foundations | App, health check, migrations, middlewares, test setup |
+| 2 | Accounts and authentication | Users, login, tokens |
+| 3 | Configuration as data | Caps, default profile, user profiles, the snapshot of a question's configuration |
+| 4 | Documents and indexes | One index per chunk size; the indexing queue |
+| 5 | Retrieval endpoint | The runs table and the retrieval-only harness |
+| E1 | Retrieval sweeps | Chunk size, chunking, retrieval mode, top_k, neighbors |
+| 6 | Questions | Answers with the small model |
+| 7 | Answer harness | Scorer, LLM judge, paired statistics |
+| E2 | Baseline answers | Judge agreement, Spanish |
+| 8 | Router | Big tier, cascade and rules |
+| E3 | Router thresholds | And the gpt-oss settings |
+| 9 | Fine token accounting | Section 5 |
+| 10 | Playground analytics | And per-user consumption caps |
+| 11 | Live events (SSE) | And the API contract freeze |
+| 12+ | Retrieval improvements | Through the experiment loop |
+| 13 | Deployment and hosting | Docker for the API, tunnel, image and model digests |

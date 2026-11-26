@@ -1,0 +1,22 @@
+name: rag-lab
+
+services:
+    db:
+        image: pgvector/pgvector:pg17
+        environment:
+            POSTGRES_USER: rag_lab
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+            POSTGRES_DB: rag_lab
+        ports:
+            - "127.0.0.1:25432:5432"
+        volumes:
+            - pgdata:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U rag_lab -d rag_lab"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+        restart: unless-stopped
+
+volumes:
+    pgdata:
