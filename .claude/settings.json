@@ -1,0 +1,34 @@
+{
+    "permissions": {
+        "deny": [
+            "Read(./.env)",
+            "Edit(./.env)"
+        ]
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit|mcp__.*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-github.mjs\"",
+                        "timeout": 15,
+                        "onFailure": "block"
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash|PowerShell",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/approval-gates.mjs\"",
+                        "timeout": 10,
+                        "onFailure": "block"
+                    }
+                ]
+            }
+        ]
+    }
+}

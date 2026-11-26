@@ -1,0 +1,50 @@
+# --- Private data first -------------------------------------------------------------
+# Evaluation sets, uploaded documents and run results live outside the repository
+# (RAG_LAB_DATA_DIR in .env). These rules only catch copies made here by mistake.
+/data/
+/results/
+/eval-data/
+evaluation*.json
+*.pdf
+*.epub
+*.docx
+*.txt
+!/docs/**/*.txt
+# RAG1 copy, if one is ever placed here as a reference
+RAG project/
+
+# Database dumps and volumes hold users' documents and questions
+pgdata/
+*.dump
+*.sql.gz
+*.backup
+
+# --- Secrets: only the example file is committed ------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Local notes ---------------------------------------------------------------------
+# Audit reports describe open vulnerabilities step by step; they stay local until the fixes are merged
+audit-report-*.md
+# personal cheat sheets and notes
+*-cheatsheet.txt
+docs/*-cheatsheet.txt
+
+# --- Claude Code -----------------------------------------------------------------------
+.claude/settings.local.json
+.claude/worktrees/
+
+# --- Dependencies and build output ------------------------------------------------------
+node_modules/
+dist/
+coverage/
+
+# --- Logs and OS files -----------------------------------------------------------------
+*.log
+.DS_Store
+Thumbs.db
