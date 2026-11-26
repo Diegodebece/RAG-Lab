@@ -166,7 +166,9 @@ Hooks enforce these limits, not prompts.
 - Commands are an allowlist per role: test-writer and implementer run only the test, typecheck, build and lint
   scripts, read-only git and `git add`/`git commit` (see section 9); experiment-runner runs only `npm run eval*`; the other roles run nothing.
   Redirections, pipes and separators other than `&&` are refused. Grep and Glob need a folder path, because a
-  search of the whole project would read through `.env`.
+  search of the whole project would read through `.env`. In RAG Web, Grep also refuses a folder with a secret
+  file anywhere below it, because it reads contents; Glob only lists names. (Fixed 2026-11-26: searches of RAG
+  Web's top-level folders, such as `src` or `migrations`, were refused.)
 - The lab notebook is append-only in the hook: edits may insert but never remove text, and a rewrite must keep
   the old content as its beginning. `leaderboard.md` is the only file that can be reordered.
 - No agent can edit `.claude/agents/`, `.claude/hooks/`, `.claude/settings*.json`, `CLAUDE.md` or `package.json`.
