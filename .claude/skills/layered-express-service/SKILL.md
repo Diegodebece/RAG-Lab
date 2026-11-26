@@ -62,6 +62,7 @@ The template assumes PostgreSQL with `pg` and the `pool` / `withTransaction` fro
 - Use `RETURNING <columns>` to get the created, updated or deleted row in the same query; an empty result means nothing matched, which is the 404 case.
 - `pg` returns `bigint` (including `count(*)`) and `numeric` as strings. Cast in SQL (`count(*)::int`, `price::float8`) or convert with `Number(...)`.
 - Several writes that must succeed or fail together go inside `withTransaction(async (client) => { ... })`, using `client.query`, not `pool.query`.
+- The API's pool has a query timeout (30 s), so a query on a connection that stopped answering fails instead of holding its request; a probe that must be quicker (the health check's `SELECT 1`, 2 s) passes its own `query_timeout` in the query config. Scripts that may run longer (`migrate`) build their own pool with `createPool()` and pass it as the last argument of `withTransaction(callback, targetPool)` or to the service function that takes one (`getMigrationStateService(targetPool)`).
 - Never keep a transaction open while calling an external service (a model, another API): finish the transaction first, then make the call. A slow call would hold the connection and its row locks.
 - Check uniqueness before inserting, and also translate the database's unique violation (`isUniqueViolation(error)`, code `23505`) into the same `AppError(409)`, since two requests can pass the check at the same time.
 - Compare case-insensitive values (emails, names) as `lower(column) = lower($1)`, matching the unique index on `lower(column)`.
@@ -75,7 +76,10 @@ The template assumes PostgreSQL with `pg` and the `pool` / `withTransaction` fro
 ### Calls to a model
 
 - Every model call goes through the provider's wrapper (`ollama.service.ts`). It takes an `AbortSignal` and a timeout, validates the shape of the response, and returns the answer together with the provider's token counts (`prompt_eval_count`, `eval_count`, the embed endpoint's count), so the caller can store them; callers never read the raw response.
-- A model that cannot be reached throws `ModelUnavailableError` (503); a model that did not answer in time throws a 504 `AppError`.
+- A model that cannot be reached throws `ModelUnavailableError` (503); a model that did not answer in time throws a 504 `AppError`. An error answer, an answer of an unexpected shape or a redirect is a plain `Error`: retrying will not fix it.
+- Calls refuse redirects (`fetch(url, { redirect: "manual" })`): a model server that redirects is misconfigured or taken over, and following it would send the request to an address nobody chose. The base URL comes from `config/ollama.config.ts`, validated at startup as an absolute http or https URL, with a trailing slash stripped.
+- Anything that asks which models exist, such as the health check, reads them through the wrapper (`listInstalledModelsService` in `ollama.service.ts`), never with its own `fetch`. The health service compares the installed names exactly with the required list in `config/ollama.config.ts`.
+- A check that reports a dependency as up or down (the health service) catches its own errors and returns the state, with a timeout on each dependency; and because anyone may call it, it caches its report for a few seconds and lets requests that arrive during a check wait for that same check.
 
 ## 5. Checklist
 

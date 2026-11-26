@@ -1,0 +1,200 @@
+openapi: 3.1.0
+info:
+  title: RAG Lab API
+  version: 0.1.0
+  description: |
+    The API contract of RAG Lab for the frontend. Layer 1 (Foundations) has one endpoint, the health check; every
+    later layer adds its paths here, in the same change that adds them to the code.
+
+    All paths start with `/v1`. Every response is JSON and carries `Cache-Control: no-store`.
+
+    Successful responses look like `{ success: true, message, data }`. Errors look like `{ message }`, with
+    `details` for validation errors (see the `Error` schema).
+
+    Every path under `/v1` except the public ones listed below needs the header `Authorization: Bearer <token>`.
+    The scheme name is case-insensitive; there must be exactly one space and one token, and nothing after it.
+    Before any protected route answers:
+
+    - without a token, or with a malformed `Authorization` header: 401 "Authentication token is missing";
+    - with a forged, expired or otherwise invalid token: 401 "Invalid or expired authentication token";
+    - over the per-user limit (120 requests per minute by default, one counter per user whatever their address):
+      429 "Too many requests, please try again later";
+    - a path that does not exist, with a valid token: 404 "Route not found".
+
+    The check for a token comes before the check for the path, so an unknown path under `/v1` without a token is a
+    401, not a 404. A path outside `/v1` is a 404 without any token. Errors that nobody expected are a 500
+    "Internal server error" with no details.
+
+    Public paths (no token): `GET /v1/health`.
+servers:
+  - url: http://127.0.0.1:3000
+    description: Local development
+tags:
+  - name: Health
+    description: Whether the API and its dependencies work
+paths:
+  /v1/health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Health check
+      description: |
+        Public. Answers 200 whenever the API itself answers; the state of each dependency is in `data`. A request
+        that gets no answer at all, or an error from the tunnel, means the API itself is offline.
+
+        `database` is `up` when a query answers within 2 seconds. `ollama` is `up` when the model server answers
+        within 2 seconds and both required models are installed (`qwen3.5:4b` and `qwen3-embedding:0.6b`, names
+        matched exactly). `status` is `down` when the database is down, `degraded` when only Ollama is down, and
+        `ok` otherwise. The report is reused for 10 seconds by default, so a state change can take that long to
+        show.
+
+        Limited to 30 checks per minute per client address by default.
+      responses:
+        "200":
+          description: The API answers; read `data.status` for the state of its dependencies.
+          headers:
+            RateLimit:
+              $ref: "#/components/headers/RateLimit"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    success: true
+                    message: Health check completed
+                    data:
+                      status: ok
+                      database: up
+                      ollama: up
+                ollamaDown:
+                  value:
+                    success: true
+                    message: Health check completed
+                    data:
+                      status: degraded
+                      database: up
+                      ollama: down
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A token signed with HS256 that carries the user's id and role and expires (1 hour by default, at most one
+        day). No endpoint issues tokens yet: login arrives in layer 2.
+  headers:
+    RateLimit:
+      description: |
+        The state of the limit that applies, in the structured form of the IETF RateLimit header draft
+        (draft 8): `"<policy name>"; r=<requests remaining>; t=<seconds until the window resets>`.
+      schema:
+        type: string
+    RateLimitPolicy:
+      description: |
+        The limit that applies: `"<policy name>"; q=<quota>; w=<window in seconds>; pk=:<partition key>:`.
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds to wait before the limit resets.
+      schema:
+        type: integer
+  schemas:
+    ServiceState:
+      type: string
+      enum: [up, down]
+    HealthReport:
+      type: object
+      required: [status, database, ollama]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+          description: ok = everything works; degraded = Ollama does not answer or lacks a model; down = the database does not answer.
+        database:
+          $ref: "#/components/schemas/ServiceState"
+        ollama:
+          $ref: "#/components/schemas/ServiceState"
+    HealthResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+          const: Health check completed
+        data:
+          $ref: "#/components/schemas/HealthReport"
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: A short English sentence that is safe to show.
+        details:
+          type: array
+          items:
+            type: string
+          description: One entry per problem; present for validation errors only.
+  responses:
+    Unauthorized:
+      description: |
+        The `Authorization` header is missing or malformed ("Authentication token is missing"), or the token is
+        forged or expired ("Invalid or expired authentication token"). Applies to every path under `/v1` except
+        the public ones.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            missing:
+              value:
+                message: Authentication token is missing
+            invalid:
+              value:
+                message: Invalid or expired authentication token
+    NotFound:
+      description: |
+        The path does not exist ("Route not found"). Under `/v1` it needs a valid token first; otherwise the
+        answer is a 401.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Route not found
+    TooManyRequests:
+      description: |
+        Over the limit that applies: per client address for public paths, per user for protected ones.
+      headers:
+        RateLimit:
+          $ref: "#/components/headers/RateLimit"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Too many requests, please try again later
+    InternalServerError:
+      description: An unexpected failure; the cause is in the server's log, never in the response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Internal server error

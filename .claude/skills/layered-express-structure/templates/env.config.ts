@@ -1,6 +1,22 @@
+// Settings the server cannot run safely without. server.ts refuses to start while any problem is listed,
+// instead of failing on the first request or running with a guessable secret.
+// Add one check per required setting: a secret of at least 32 characters that is not the placeholder of
+// .env.example, an absolute http or https URL for each model server, and so on.
+export const getStartupConfigProblems = (env: NodeJS.ProcessEnv): string[] => {
+    const problems: string[] = [];
+
+    if ((env.SECRET_KEY ?? "").length < 32) {
+        problems.push("SECRET_KEY must be a random value of at least 32 characters");
+    }
+
+    return problems;
+};
+
 // Reads an integer setting from .env. A missing value uses the default; anything that is not a whole number
-// from min to max stops the app at startup, instead of running with a setting that breaks it later (a negative
-// timeout, for example, would make every Ollama request fail).
+// from min to max, written with plain decimal digits, stops the app at startup, instead of running with a setting
+// that breaks it later (a negative timeout, for example, would make every Ollama request fail). Number() would
+// also read "0x10", "1e3" or " 5 " as numbers, so the digits are checked first.
+// Give every setting that has a sensible ceiling a max: a value beyond it is a mistake, not a choice.
 export const readIntegerSetting = (name: string, defaultValue: number, min = 1, max = Number.MAX_SAFE_INTEGER): number => {
     const raw = process.env[name];
 
@@ -8,9 +24,9 @@ export const readIntegerSetting = (name: string, defaultValue: number, min = 1, 
         return defaultValue;
     }
 
-    const value = Number(raw);
+    const value = /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
 
-    if (!Number.isInteger(value) || value < min || value > max) {
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
         const range = max === Number.MAX_SAFE_INTEGER ? `at least ${min}` : `from ${min} to ${max}`;
         throw new Error(`${name} must be a whole number ${range}`);
     }
