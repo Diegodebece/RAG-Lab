@@ -1,8 +1,8 @@
 # RAG Lab design
 
 Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Building follows the order in
-section 13; layer 1 (Foundations) was built on 2026-11-26. Every session and agent working on RAG Lab reads this
-file first. Decisions change only with the owner's approval, and
+section 13; layer 1 (Foundations) and layer 2 (Accounts and authentication) were built on 2026-11-26. Every session
+and agent working on RAG Lab reads this file first. Decisions change only with the owner's approval, and
 each change is recorded here.
 
 ## 1. Goal
@@ -33,6 +33,14 @@ already uses 5433, so the container moved to 25432, which sits below Windows' dy
 and so is not taken by another program at random. The databases are `rag_lab` and `rag_lab_test`, owned by the user
 `rag_lab`, in the compose project `rag-lab`; they differ from RAG Web's names on purpose, so a URL copied from RAG
 Web fails loudly.
+
+Changed on 2026-11-26 (layer 2, approved by the owner with its plan): there are two database roles. The owner,
+`rag_lab`, owns the tables and is the only one that changes the schema: `npm run migrate` connects as it, through
+`MIGRATION_DATABASE_URL`, and no longer needs `DATABASE_URL`. The API connects as `rag_lab_api`, through
+`DATABASE_URL`; the role reads and changes rows and nothing else, and the server refuses to start as a role with
+more rights (a PostgreSQL superuser can run commands on the server). The owner creates the role once with
+`scripts/create-api-role.sql` and sets its password; the migrations grant its rights on tables, so every reset
+database gets them again. The tests run the app as the API role.
 
 Hardware: RTX 4070 Laptop (8 GB VRAM, about 1.7 GB used by Windows), 32 GB DDR5, Ryzen 9 7940HS.
 
@@ -173,9 +181,13 @@ Hooks enforce these limits, not prompts.
   them as user environment variables too.
 
   The same goes for the test database (decided 2026-11-26): `RAG_LAB_TEST_DATABASE_URL` is set in `.env` and also
-  as a Windows user environment variable, so the tests run in a worktree. `test/setup.ts` copies it into
-  `DATABASE_URL`, or deletes `DATABASE_URL` when it is missing, so a test can never reach the development
-  database; the tests empty the database, and refuse one whose name does not end in `_test`.
+  as a Windows user environment variable, so the tests run in a worktree. Changed with layer 2 (2026-11-26): there
+  are two test URLs, `RAG_LAB_TEST_API_DATABASE_URL` (the role `rag_lab_api`) and `RAG_LAB_TEST_DATABASE_URL` (the
+  owner), both set in `.env` and as user environment variables. `test/setup.ts` copies the first into
+  `DATABASE_URL` and the second into `MIGRATION_DATABASE_URL`, and deletes the target of a missing one, so a test
+  can never reach the development database; the tests empty the database, and refuse one whose name does not end
+  in `_test`. The tests' own schema work and inspections go through an owner pool, because an inspection through the
+  API role can pass while checking nothing (the role cannot see a table it has no rights on).
 
   An agent working in a worktree (`.claude/worktrees/<name>`) has that worktree as its project: the rules above
   apply inside it, and it cannot reach the main checkout or another worktree. Claude Code sets
@@ -302,6 +314,17 @@ Added with layer 1 (2026-11-26), once the code exists; the exact commands are in
 9. Set `RAG_LAB_TEST_DATABASE_URL` as a Windows user environment variable too (worktrees have no `.env`).
 10. `npm install`, then `npm run migrate`.
 
+Changed with layer 2 (2026-11-26): steps 7 to 10 become steps a to e below; the exact commands are in the README.
+
+- a. Create `.env` from `.env.example` with the owner's password (`POSTGRES_PASSWORD`, `MIGRATION_DATABASE_URL`), a
+  different password for the API role (`DATABASE_URL`) and a `SECRET_KEY` of at least 32 random characters.
+- b. `docker compose up -d db`, then create the test database `rag_lab_test` once.
+- c. Run `scripts/create-api-role.sql` as the owner, once (it names both databases, so after step b), and set the
+  role's password with `\password rag_lab_api`.
+- d. Set `RAG_LAB_TEST_API_DATABASE_URL` and `RAG_LAB_TEST_DATABASE_URL` as Windows user environment variables too.
+- e. `npm install`, then `npm run migrate` (as the owner; migration 002 fails naming the script when the role is
+  missing), then `npm run create-admin -- <email>`, which prints the first admin's generated password once.
+
 Added with the process metrics (2026-11-26):
 
 11. In the owner's `~/.claude/settings.json`, set `cleanupPeriodDays` to 365 (done). Claude Code deletes older
@@ -319,7 +342,11 @@ The skills were copied from RAG Web unchanged, except for these changes:
   a value out of range is a 400 and never clamped silently) and for model calls (one wrapper per provider that
   returns the token counts);
 - the structure skill gained rules for test doubles for models, timeouts on stream tests, and where the hook tests
-  live.
+  live;
+- with layer 2 (2026-11-26) the skills gained the account patterns: a token-only `authenticateMiddleware` and a
+  `currentUserMiddleware` that reads the role from the database, the readiness gate, the per-address floor, two
+  database roles with a startup role guard, passwords only through `password.util`, and revocation by token
+  version.
 
 `CLAUDE.md` is RAG Web's standards with a RAG Lab section on top: the loops, the approval gates, GitHub, private
 data and the hooks.

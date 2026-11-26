@@ -1,46 +1,65 @@
 openapi: 3.1.0
 info:
   title: RAG Lab API
-  version: 0.1.0
+  version: 0.2.0
   description: |
-    The API contract of RAG Lab for the frontend. Layer 1 (Foundations) has one endpoint, the health check; every
-    later layer adds its paths here, in the same change that adds them to the code.
+    The API contract of RAG Lab for the frontend. Layer 1 (Foundations) added the health check; layer 2 (Accounts and
+    authentication) added login, logout and the user endpoints. Every later layer adds its paths here, in the same
+    change that adds them to the code.
 
     All paths start with `/v1`. Every response is JSON and carries `Cache-Control: no-store`.
 
-    Successful responses look like `{ success: true, message, data }`. Errors look like `{ message }`, with
-    `details` for validation errors (see the `Error` schema).
+    Successful responses look like `{ success: true, message, data }` (login and password change also carry a
+    top-level `token`). Errors look like `{ message }`, with `details` for validation errors (see the `Error` schema).
 
-    Every path under `/v1` except the public ones listed below needs the header `Authorization: Bearer <token>`.
-    The scheme name is case-insensitive; there must be exactly one space and one token, and nothing after it.
-    Before any protected route answers:
+    Public paths (no token): `GET /v1/health` and `POST /v1/auth/login`. Every other path under `/v1` needs the
+    header `Authorization: Bearer <token>`, with the token that login returned. The scheme name is case-insensitive;
+    there must be exactly one space and one token, and nothing after it. There is no self-registration: an admin
+    creates the accounts (`POST /v1/users`), and the first admin is made by a script the owner runs.
 
-    - without a token, or with a malformed `Authorization` header: 401 "Authentication token is missing";
-    - with a forged, expired or otherwise invalid token: 401 "Invalid or expired authentication token";
-    - over the per-user limit (120 requests per minute by default, one counter per user whatever their address):
-      429 "Too many requests, please try again later";
-    - a path that does not exist, with a valid token: 404 "Route not found".
+    What every request goes through, in this order, and what each step answers:
+
+    1. Over 300 requests per minute from one client address, to any path (the default; the limit is set by the
+       server's configuration): 429 "Too many requests, please try again later".
+    2. The database cannot be reached, or the server has not finished checking it since it started: 503 "The
+       database is not available, please try again later". It applies to every path under `/v1` except
+       `GET /v1/health`, unknown paths included. The condition passes by itself; try again later.
+    3. Protected paths only. Without a token, or with a malformed `Authorization` header: 401 "Authentication token
+       is missing". With a forged, expired or otherwise invalid token: 401 "Invalid or expired authentication
+       token".
+    4. Protected paths only. Over the per-user limit (120 requests per minute by default, one counter per user and
+       session): 429 "Too many requests, please try again later". It is checked before the database is asked about
+       the account.
+    5. Protected paths only. The account is checked against the database on every request. A token that no longer
+       works because its session ended (logout, a password change, the account was disabled) or the account no
+       longer exists gets the same 401 "Invalid or expired authentication token" as a forged one: the client cannot
+       tell the reasons apart and should send the user to the login screen.
+    6. A path that does not exist, with a valid token: 404 "Route not found".
 
     The check for a token comes before the check for the path, so an unknown path under `/v1` without a token is a
     401, not a 404. A path outside `/v1` is a 404 without any token. Errors that nobody expected are a 500
     "Internal server error" with no details.
-
-    Public paths (no token): `GET /v1/health`.
 servers:
   - url: http://127.0.0.1:3000
     description: Local development
 tags:
   - name: Health
     description: Whether the API and its dependencies work
+  - name: Auth
+    description: Login and logout
+  - name: Users
+    description: The signed-in user's own account, and the accounts an admin manages
 paths:
   /v1/health:
     get:
       tags: [Health]
       operationId: getHealth
       summary: Health check
+      security: []
       description: |
         Public. Answers 200 whenever the API itself answers; the state of each dependency is in `data`. A request
-        that gets no answer at all, or an error from the tunnel, means the API itself is offline.
+        that gets no answer at all, or an error from the tunnel, means the API itself is offline. It answers
+        even while the database is down: it is what reports it.
 
         `database` is `up` when a query answers within 2 seconds. `ollama` is `up` when the model server answers
         within 2 seconds and both required models are installed (`qwen3.5:4b` and `qwen3-embedding:0.6b`, names
@@ -48,7 +67,8 @@ paths:
         `ok` otherwise. The report is reused for 10 seconds by default, so a state change can take that long to
         show.
 
-        Limited to 30 checks per minute per client address by default.
+        Limited to 30 checks per minute per client address by default, and counted in the 300 requests per minute
+        per address.
       responses:
         "200":
           description: The API answers; read `data.status` for the state of its dependencies.
@@ -82,6 +102,347 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginUser
+      summary: Log in
+      security: []
+      description: |
+        Public. Checks the email and password and returns the user and a token (HS256, valid for 1 hour by default).
+        The token goes in `Authorization: Bearer <token>` on every protected request. There is no refresh token: when
+        it expires, or when a request answers 401, the user logs in again. Keep the token in memory rather than in
+        storage that other scripts can read, and clear it on a 401.
+
+        Limits, all counted per 15 minutes: 10 logins per client address (successful ones too, counted before the body
+        is read), and 5 failed logins per email and client address. Over either: 429.
+
+        A wrong password and an email that does not exist give the same 401, so the response does not reveal which
+        accounts exist. A disabled account gets 403 "This account is disabled", but only when the password is
+        correct.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Logged in. `data` is the user; `token` is at the top level.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+              example:
+                success: true
+                message: Logged in successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  email: ana@example.com
+                  role: user
+                  status: active
+                  createdAt: "2026-11-26T12:00:00.000Z"
+                token: <jwt>
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          description: The email or the password is wrong ("Invalid email or password").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: Invalid email or password
+        "403":
+          description: The password is right but the account is disabled ("This account is disabled").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: This account is disabled
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logoutUser
+      summary: Log out
+      security:
+        - bearerAuth: []
+      description: |
+        Ends every session of the account, not only this one: all the tokens it has issued stop working, on every
+        device. No request body. Afterwards the token that made the request gets 401, like any other of the
+        account's tokens.
+      responses:
+        "200":
+          description: Logged out. There is no `data`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+              example:
+                success: true
+                message: Logged out successfully
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/users/me:
+    get:
+      tags: [Users]
+      operationId: getCurrentUser
+      summary: The signed-in user
+      security:
+        - bearerAuth: []
+      description: The account the token belongs to, as the database has it now (role and status included).
+      responses:
+        "200":
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+              example:
+                success: true
+                message: Current user retrieved successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  email: ana@example.com
+                  role: user
+                  status: active
+                  createdAt: "2026-11-26T12:00:00.000Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/users/me/password:
+    patch:
+      tags: [Users]
+      operationId: changePassword
+      summary: Change the signed-in user's password
+      security:
+        - bearerAuth: []
+      description: |
+        Checks the current password and stores the new one. Every session of the account ends, this one included:
+        the answer carries a new `token`, and the client must replace the one it has with it.
+
+        Limited to 5 attempts per user per 15 minutes by default; every attempt counts, the wrong ones too, and the
+        count is made before the body is read.
+
+        New passwords have 8 to 64 characters; spaces are valid and count. The current password has no minimum, so
+        an account made under an older rule can still type its own.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangePasswordRequest"
+      responses:
+        "200":
+          description: Password changed; `token` is the new token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+              example:
+                success: true
+                message: Password changed successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  email: ana@example.com
+                  role: user
+                  status: active
+                  createdAt: "2026-11-26T12:00:00.000Z"
+                token: <jwt>
+        "400":
+          description: |
+            The body is not valid (`message` "Validation error", with `details`), or the current password is wrong
+            (`message` "Current password is incorrect", no `details`). A wrong current password is a 400 and not a
+            401 so that it is not mistaken for an expired session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                validation:
+                  value:
+                    message: Validation error
+                    details:
+                      - New password must have at least 8 characters
+                wrongPassword:
+                  value:
+                    message: Current password is incorrect
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The account no longer exists ("User not found"). Rare: the token check normally answers 401 first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: User not found
+        "409":
+          description: Another request changed the password at the same moment ("The password was changed by another request, please try again"). Nothing was changed; try again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: The password was changed by another request, please try again
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/users:
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create an account (admin)
+      security:
+        - bearerAuth: []
+      description: |
+        Admin only. The new account is active; its role is `user` unless the request says `admin`. The admin gives
+        the user the password, who should change it.
+
+        Limited to 20 attempts per admin per hour by default; every attempt that passes the permission check counts,
+        failed ones too, and the count is made before the body is read. A user who is not an admin gets 403 and uses
+        up nothing.
+
+        The email is trimmed, lowercased and normalized (Unicode NFC) before it is checked and stored, and may have at
+        most 254 characters. One account per email, whatever its capitalization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: The account was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+              example:
+                success: true
+                message: User created successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  email: ana@example.com
+                  role: user
+                  status: active
+                  createdAt: "2026-11-26T12:00:00.000Z"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: There is already an account with that email ("Email is already registered").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: Email is already registered
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/users/{id}:
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      summary: Change another account's role or status (admin)
+      security:
+        - bearerAuth: []
+      description: |
+        Admin only. Changes `role` and/or `status` of another account, nothing else (not the email, not the
+        password). An admin cannot change their own role or status: another admin does it.
+
+        The role is read from the database on every request, so a promotion or a demotion applies on the user's very
+        next request with the same token. Disabling an account ends all its sessions at once, and they stay dead if
+        the account is enabled again.
+
+        The permission is checked again inside the change: if another admin disabled or demoted this one a moment
+        ago, the answer is 403.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The account's id. An id that is not a UUID is the same 404 as one that does not exist.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateUserRequest"
+      responses:
+        "200":
+          description: The account after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+              example:
+                success: true
+                message: User updated successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  email: ana@example.com
+                  role: user
+                  status: disabled
+                  createdAt: "2026-11-26T12:00:00.000Z"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: There is no account with that id ("User not found").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: User not found
+        "409":
+          description: The id is the admin's own ("You cannot change your own role or status").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: You cannot change your own role or status
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -89,8 +450,14 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        A token signed with HS256 that carries the user's id and role and expires (1 hour by default, at most one
-        day). No endpoint issues tokens yet: login arrives in layer 2.
+        The token that `POST /v1/auth/login` (or a password change) returns: a JWT signed with HS256 that expires
+        (1 hour by default, at most one day). Its claims are `sub` (the user's id), `ver` (the version of the user's
+        sessions), `iss` ("rag-lab"), `aud` ("rag-lab-api"), `iat` and `exp`. It carries no role: the role and the
+        status are read from the database on every request, so a change applies at once. The client does not need to
+        read the token; it only sends it.
+
+        A token stops working before it expires when the user logs out (every session ends), changes the password,
+        or is disabled, and when the account is deleted. All of those are the same 401. There is no refresh token.
   headers:
     RateLimit:
       description: |
@@ -135,6 +502,117 @@ components:
           const: Health check completed
         data:
           $ref: "#/components/schemas/HealthReport"
+    UserRole:
+      type: string
+      enum: [user, admin]
+    UserStatus:
+      type: string
+      enum: [active, disabled]
+      description: A disabled account cannot log in, and its tokens stop working.
+    User:
+      type: object
+      description: An account. The password and the session version are never returned.
+      required: [id, email, role, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          description: Lowercase.
+        role:
+          $ref: "#/components/schemas/UserRole"
+        status:
+          $ref: "#/components/schemas/UserStatus"
+        createdAt:
+          type: string
+          format: date-time
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          maxLength: 254
+          description: Trimmed, lowercased and normalized (Unicode NFC) before it is used.
+        password:
+          type: string
+          maxLength: 64
+          description: Not trimmed. Login has no minimum length.
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          maxLength: 64
+        newPassword:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: Not trimmed; spaces count.
+    CreateUserRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          maxLength: 254
+          description: A valid address, trimmed, lowercased and normalized (Unicode NFC) before it is stored.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: Not trimmed; spaces count.
+        role:
+          $ref: "#/components/schemas/UserRole"
+          description: "`user` when missing."
+    UpdateUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        role:
+          $ref: "#/components/schemas/UserRole"
+        status:
+          $ref: "#/components/schemas/UserStatus"
+    AuthResponse:
+      type: object
+      required: [success, message, data, token]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/User"
+        token:
+          type: string
+          description: A token for the `Authorization: Bearer` header. Replaces any earlier token of this user.
+    UserResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/User"
+    MessageResponse:
+      type: object
+      required: [success, message]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
     Error:
       type: object
       required: [message]
@@ -151,8 +629,9 @@ components:
     Unauthorized:
       description: |
         The `Authorization` header is missing or malformed ("Authentication token is missing"), or the token is
-        forged or expired ("Invalid or expired authentication token"). Applies to every path under `/v1` except
-        the public ones.
+        forged, expired, or no longer works because its session ended, its account was disabled or the account no
+        longer exists ("Invalid or expired authentication token"). Applies to every path under `/v1` except the
+        public ones.
       content:
         application/json:
           schema:
@@ -164,6 +643,26 @@ components:
             invalid:
               value:
                 message: Invalid or expired authentication token
+    ValidationError:
+      description: |
+        The body does not pass validation ("Validation error"). `details` has one sentence per problem. Unknown
+        fields are refused. A body that is not valid JSON is also a 400, with a `message` and no `details`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Validation error
+            details:
+              - Email must be a valid email address
+    Forbidden:
+      description: The signed-in user is not an admin ("You do not have permission to perform this action"). Decided from the role the database has now.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: You do not have permission to perform this action
     NotFound:
       description: |
         The path does not exist ("Route not found"). Under `/v1` it needs a valid token first; otherwise the
@@ -176,7 +675,9 @@ components:
             message: Route not found
     TooManyRequests:
       description: |
-        Over the limit that applies: per client address for public paths, per user for protected ones.
+        Over a limit. The same body whichever one it is: the per-address floor (300 requests per minute per client
+        address, any path), the limit of the route (health checks, logins, failed logins, password changes, account
+        creations) or the per-user limit of protected paths (120 per minute). Wait `Retry-After` seconds.
       headers:
         RateLimit:
           $ref: "#/components/headers/RateLimit"
@@ -198,3 +699,14 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             message: Internal server error
+    ServiceUnavailable:
+      description: |
+        The database cannot be reached right now (it is restarting, or the server started before it was up and has
+        not finished checking it). It applies to every path under `/v1` except `GET /v1/health`, whatever the
+        request. Nothing about the connection is revealed. Try again later.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: The database is not available, please try again later

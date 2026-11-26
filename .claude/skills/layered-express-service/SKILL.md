@@ -22,8 +22,9 @@ description: How to write the service (business logic) layer of an Express API. 
 - [templates/dbErrors.util.ts](templates/dbErrors.util.ts) — `isUniqueViolation`, goes in `utils/`
 - [templates/uuid.util.ts](templates/uuid.util.ts) — `isUuid`, goes in `utils/`
 - [templates/modelUnavailableError.util.ts](templates/modelUnavailableError.util.ts) — example of an `AppError` subclass that callers recognize by type, goes in `utils/`
+- [templates/password.util.ts](templates/password.util.ts) — `hashPassword`, `verifyPassword`, `needsRehash`, `isUsableHash` (scrypt from `node:crypto`), goes in `utils/`
 
-The template assumes PostgreSQL with `pg` and the `pool` / `withTransaction` from `config/db.config.ts` (see `layered-express-structure`). A project with another data layer keeps the same rules and swaps the queries.
+The template assumes PostgreSQL with `pg` and the `pool` / `withTransaction` from `config/db.config.ts`, which connect as the low-privilege API role (see `layered-express-structure`): a service can read and change rows and nothing else, so a query that needs a new table or column waits for its migration. A project with another data layer keeps the same rules and swaps the queries.
 
 ## 4. Rules
 
@@ -62,10 +63,22 @@ The template assumes PostgreSQL with `pg` and the `pool` / `withTransaction` fro
 - Use `RETURNING <columns>` to get the created, updated or deleted row in the same query; an empty result means nothing matched, which is the 404 case.
 - `pg` returns `bigint` (including `count(*)`) and `numeric` as strings. Cast in SQL (`count(*)::int`, `price::float8`) or convert with `Number(...)`.
 - Several writes that must succeed or fail together go inside `withTransaction(async (client) => { ... })`, using `client.query`, not `pool.query`.
-- The API's pool has a query timeout (30 s), so a query on a connection that stopped answering fails instead of holding its request; a probe that must be quicker (the health check's `SELECT 1`, 2 s) passes its own `query_timeout` in the query config. Scripts that may run longer (`migrate`) build their own pool with `createPool()` and pass it as the last argument of `withTransaction(callback, targetPool)` or to the service function that takes one (`getMigrationStateService(targetPool)`).
+- The API's pool has a query timeout (30 s), so a query on a connection that stopped answering fails instead of holding its request; a probe that must be quicker (the health check's `SELECT 1`, 2 s) passes its own `query_timeout` in the query config. Scripts that may run longer (`migrate`) build their own pool with `createPool({ connectionString })` from `config/pool.config.ts`, with the owner's `MIGRATION_DATABASE_URL`, and pass it to `runInTransaction(pool, callback)` or to the service function that takes one (`getMigrationStateService(targetPool)`).
 - Never keep a transaction open while calling an external service (a model, another API): finish the transaction first, then make the call. A slow call would hold the connection and its row locks.
 - Check uniqueness before inserting, and also translate the database's unique violation (`isUniqueViolation(error)`, code `23505`) into the same `AppError(409)`, since two requests can pass the check at the same time.
 - Compare case-insensitive values (emails, names) as `lower(column) = lower($1)`, matching the unique index on `lower(column)`.
+
+- A statement that must apply only if the row is still as it was read (a password change, a rehash at login) carries that as a condition (`WHERE id = $1 AND password_hash = $3`). When it matches no row because another request got there first, throw a 409 with a message that says to try again; never overwrite what the other request wrote.
+- A change that depends on the state of more than one row (an admin changes another account, and the actor must still be an admin) runs in one `withTransaction`: lock the rows involved with `SELECT ... FOR UPDATE ... ORDER BY id` (the same order in every call, so two calls cannot wait for each other), re-check the actor's right on the locked row, then make the change. A check made earlier by a middleware can be out of date by the time the change runs.
+- A database that cannot be reached is not an `AppError` the service throws: let the driver's error bubble up, and `errorMiddleware` answers 503 (`isDatabaseUnreachableError`).
+
+### Accounts and passwords
+
+- Passwords go through `utils/password.util.ts` only (`hashPassword`, `verifyPassword`, `needsRehash`, `isUsableHash`): scrypt from `node:crypto`, the cost parameters stored with each hash, NFKC normalization before hashing, `timingSafeEqual` to compare. No other hash and no hash code in a service. Hash parameters read from the database outside fixed ranges, or a value of another shape, are a password that does not match, never an error or a huge allocation.
+- A hash is never returned, logged or put in a type the API returns: the entity type (`User`) has no hash and no token version, and the row type that has them (`UserRecord`) is used only inside the auth service.
+- Login checks an unknown email against a dummy hash (computed on first use, cached), so it takes as long as a wrong password, and runs the dummy hash after a failure against an old or unusable stored hash too, so the response time does not show which accounts have one. The unknown email and the wrong password give the same 401 message. A disabled account is a 403 only after a correct password, so the answer does not reveal which accounts exist or are disabled. A wrong current password in a password change is a 400, not a 401, which a client would take for an expired session. A hash made with other cost parameters is replaced at the next successful login (a rehash).
+- Sessions are revoked with a counter on the account (`token_version`), compared with the token's `ver` on every request by `getActiveUserService` (one query: role, status and version; anything wrong is the same 401 as a forged token). Logout, a password change and disabling the account raise it (`token_version = token_version + 1`, in the same statement that makes the change); a password change returns a new token made with the new version. A role change does not raise it, because the role is read from the database on every request.
+- A user cannot change their own role or status through the admin route (409); another admin does it. Unique emails are checked first and also translated from the database's unique violation, as above.
 
 ### Settings chosen by users
 

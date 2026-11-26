@@ -6,7 +6,7 @@ How RAG Lab is built and why. [design.md](design.md) is the source of truth for 
 
 RAG Lab is a RAG API built by a team of Claude Code agents: two local models and a router answer questions about uploaded documents, every question is measured (accuracy, latency, tokens), and each signed-in user changes the configuration in a playground to see how precision and token use respond. It reuses the architecture and the evaluated settings of RAG Web (the deployed RAG API) and the evaluation harness of RAG1 (the original command-line app); see design section 1.
 
-The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. There are no accounts, documents or questions yet.
+The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. Layer 2, Accounts and authentication, is built on top of it (section 6): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There are no documents or questions yet.
 
 ## 2. Stack
 
@@ -15,11 +15,12 @@ The work goes in layers, in the order of [design section 13](design.md#13-build-
 | Runtime | Node.js 22.18 or later, ES modules |
 | Language | TypeScript, `strict`, `NodeNext`; `tsc` compiles `src/` to `dist/`, `tsx` runs the sources in development |
 | Web | Express 5, Joi for validation, `jsonwebtoken` (HS256) for tokens, `cors`, `express-rate-limit` |
+| Passwords | scrypt from `node:crypto`; no dependency was added for accounts (section 6) |
 | Data | PostgreSQL 17 with pgvector through `pg`; plain parameterized SQL, numbered migrations, no ORM |
 | Models | Ollama on the host, always through `ollama.service.ts` |
 | Tests | `node:test` with `tsx`, `supertest` for routes |
 
-The database is the `db` service of `docker-compose.yml` (image `pgvector/pgvector:pg17`, project `rag-lab`), published on `127.0.0.1:25432` only. Its data lives in the `pgdata` volume.
+The database is the `db` service of `docker-compose.yml` (image `pgvector/pgvector:pg17`, project `rag-lab`), published on `127.0.0.1:25432` only. Its data lives in the `pgdata` volume. It has two roles: the owner `rag_lab` and the API's `rag_lab_api` (section 5, "Database roles").
 
 ## 3. Repository and workflow
 
@@ -41,13 +42,13 @@ The standards are in `CLAUDE.md` and the `layered-express-*` skills. In short: e
 Invisible characters are checked by a test, `test/repository/invisibleCharacters.test.ts`, which runs on every `npm test` and fails when a file of the project holds one.
 
 > [!NOTE]
-> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/`, `.claude/metrics/` (added 2026-11-26 with the process metrics, section 8) and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
+> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/`, `.claude/metrics/` (added 2026-11-26 with the process metrics, section 9) and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
 
 ## 5. Foundations (layer 1)
 
 ### Container and database
 
-`docker-compose.yml` defines one service, `db`, with user `rag_lab`, database `rag_lab`, a health check with `pg_isready`, and `POSTGRES_PASSWORD` taken from `.env` (the compose file refuses to start without it). The development database is `rag_lab`; the test database `rag_lab_test` is created once by hand.
+`docker-compose.yml` defines one service, `db`, with user `rag_lab` (the owner), database `rag_lab`, a health check with `pg_isready`, and `POSTGRES_PASSWORD` (the owner's) taken from `.env` (the compose file refuses to start without it). The development database is `rag_lab`; the test database `rag_lab_test` is created once by hand.
 
 > [!NOTE]
 > **Decision:** the databases are `rag_lab` and `rag_lab_test`, the user is `rag_lab`, and the compose project is `rag-lab` (2026-11-26). RAG Web uses other names for all of them, so a database URL copied from RAG Web fails loudly (wrong user, wrong database) instead of silently reaching the other project's data.
@@ -57,9 +58,9 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 ### Migrations and the wrong-database guard
 
-`migrations/` holds numbered SQL files (`001_init.sql` creates the pgvector extension; layer 1 creates no tables). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It uses its own pool, without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate.
+`migrations/` holds numbered SQL files: `001_init.sql` creates the pgvector extension, `002_api_role.sql` gives the API's role its rights and `003_users.sql` creates the `users` table (see "Database roles" below and section 6). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It connects as the owner with `MIGRATION_DATABASE_URL`, with its own pool (made by `createPool` in `pool.config.ts`), without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate. It never imports `db.config.ts`, so it does not need `DATABASE_URL`, and neither URL is a fallback for the other.
 
-`getMigrationStateService` (`schema.service.ts`) compares the files with the `schema_migrations` table and returns four lists: `applied`, `pending` (only in the files), `unknown` (recorded in the database but missing from the files) and `foreignTables` (tables of the public schema when there is no `schema_migrations` table at all). Two of those mean the DATABASE_URL points at the wrong database:
+`getMigrationStateService(targetPool)` (`schema.service.ts`) compares the files with the `schema_migrations` table and returns four lists: `applied`, `pending` (only in the files), `unknown` (recorded in the database but missing from the files) and `foreignTables` (tables of the public schema when there is no `schema_migrations` table at all). The pool is always passed: the server gives the API's, the migration script its own. Two of those mean the URL points at the wrong database:
 
 - `unknown` is not empty: the database was made by another checkout or project.
 - `foreignTables` is not empty: there are tables but this project's migrations never ran, so they are "another project's".
@@ -68,17 +69,41 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 | What the server finds | What it does |
 |---|---|
-| The database cannot be reached (connection refused, timeout, host unknown, PostgreSQL still starting) | Starts with a warning; `GET /v1/health` reports `down` until it recovers |
-| The database answers and refuses (wrong password, missing database) | Stops with the reason; it will not get better by itself |
+| The database cannot be reached (connection refused, timeout, host unknown, PostgreSQL still starting or restarting) | Starts with a warning and listens; `GET /v1/health` reports `down`, every other `/v1` route answers 503, and the full check (role and migrations) is repeated every 3 s in the background until it passes |
+| The database answers and refuses (wrong password, missing database) | Stops with the reason (exit 1); it will not get better by itself |
+| The role of `DATABASE_URL` has more rights than the API needs (see "Database roles") | Stops and lists what the role can do; never prints the URL |
 | Pending migrations, unknown migrations or foreign tables | Stops and says to run `npm run migrate` or to check `DATABASE_URL` |
 | Settings that are missing or unsafe (see Configuration) | Stops and lists every problem |
 
 > [!NOTE]
 > **Decision:** a wrong-database guard (2026-11-26). `migrate` refuses a database that has migrations this checkout does not have, or that has tables but no `schema_migrations` ("another project's"). The server refuses to start on pending, unknown or foreign state, and starts with a warning only when the database cannot be reached (health then reports `down`); any other database error, such as a wrong password, stops it. Pointing the API at the wrong database is the most expensive configuration mistake (migrations would mix two schemas), while a database that is merely starting is expected and recovers by itself.
 
+> [!NOTE]
+> **Decision:** layer 2 changes the startup behavior when the database is down (2026-11-26, decided by the orchestrator after the audit, without asking the owner; the owner can reverse it). The server still starts and still reports health as `down`, but it now also repeats the whole check (role and migrations) every 3 s, exits 1 on any problem it finds, and until the check passes every `/v1` route except health answers 503 (`databaseReady.middleware.ts`, `databaseReadiness.service.ts`). Before, a database that came up later was never checked against the role or the migrations, so the first requests would have run against a schema or a role nobody had verified. Unreachable also counts SQLSTATE 57P01, 57P02, 08000, 08003 and 08006 (a PostgreSQL that restarts ends the connection), so a restart is a reason to try again and not to stop.
+
 ### The connection: `pg`
 
-`db.config.ts` exports `createPool`, `pool` and `withTransaction`. `DATABASE_URL` is required; the module throws at import without it. The API's pool has a 5 s connection timeout, TCP keepAlive and a 30 s query timeout; an idle connection that breaks is logged, not fatal. `withTransaction(callback, targetPool?)` runs the callback on one connection in one transaction (the optional pool is how `migrate` uses its own), and a connection that breaks or fails its `ROLLBACK` is discarded instead of going back to the pool.
+`pool.config.ts` exports `createPool({ connectionString, queryTimeoutMs? })` and `runInTransaction(pool, callback)`; it reads no environment variable, so the migration script can use it without `DATABASE_URL`. `db.config.ts` builds the API's `pool` from `DATABASE_URL` (the module throws at import without it) and exports `withTransaction(callback, targetPool?)`. The API's pool has a 5 s connection timeout, TCP keepAlive and a 30 s query timeout; an idle connection that breaks is logged, not fatal. `withTransaction` runs the callback on one connection in one transaction, and a connection that breaks or fails its `ROLLBACK` is discarded instead of going back to the pool.
+
+### Database roles
+
+The API connects as `rag_lab_api`; the owner `rag_lab` creates the schema. The owner creates the role once with `scripts/create-api-role.sql` (`CREATE ROLE ... LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, `REVOKE ALL ON DATABASE` from `PUBLIC`, `GRANT CONNECT`) and sets its password by hand with `\password rag_lab_api`; nothing in the repository holds that password. `migrations/002_api_role.sql` fails naming the script when the role is missing, then revokes `CREATE` on `public` from `PUBLIC`, grants `USAGE` on the schema and `SELECT` on `schema_migrations`, and sets default privileges so the tables and sequences the owner creates afterwards (`users`, and the tables of the next layers) are usable by the API without a new grant. The API role can read and change rows and nothing else: it cannot create, alter, drop or truncate anything, and it cannot change `schema_migrations`.
+
+Before it serves anything, the server asks the database what the role it connected as can do (`databaseRole.service.ts`, by capability and not by name) and stops if the role is a superuser, can create roles or databases, can create objects in the database or in `public`, owns relations in `public`, is a member of another role, or acts as another role than the one that logged in (the `role` connection option, or `SET ROLE`, would hide a login with more rights behind a harmless-looking current role).
+
+> [!NOTE]
+> **Decision:** the API runs as a low-privilege role, `rag_lab_api`, and the server stops when `DATABASE_URL` connects as anything with more rights (2026-11-26, the owner's decision, layer 2). A PostgreSQL superuser can run commands on the server, and an owner can drop the tables, so a flaw in any route that reaches the database would reach all of it. The check is by capability, not by name, so it also catches a role someone later gives a right it should not have.
+
+> [!NOTE]
+> **Decision:** the role script lives in `scripts/` and was written by the orchestrator (2026-11-26, the owner's decision). No agent role may write `scripts/`, and the auditors do not read it: the orchestrator pastes it into their prompts. Widening their read set is for layer 13 (deployment), when more of the repository is operational files.
+
+> [!NOTE]
+> **Decision:** the rights live in migration 002, not in the script (2026-11-26, the owner's decision), so the test and development databases get them again after every reset, and the script only holds what is outside any database (the role itself and its right to connect).
+
+> [!NOTE]
+> **Decision:** `npm run migrate` no longer needs `DATABASE_URL` (2026-11-26, decided by the orchestrator after the audit, without asking the owner; the owner can reverse it). The pool code was split into `pool.config.ts` (by the implementer, instead of making the API pool lazy, because the tests import the pool directly) so the migration script uses `MIGRATION_DATABASE_URL` alone and never imports `db.config.ts`, which throws at import without `DATABASE_URL`. Before the split, a shell or a CI job that set only the owner's URL crashed with "DATABASE_URL is not set" instead of migrating; the tests did not show it, because their helper passed the whole environment to the script.
+
+Operational note for layer 13: `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role.
 
 > [!NOTE]
 > **Decision:** timeouts after the audit (2026-11-26). The API pool has a 30 s query timeout and keepAlive; the health probe has a 2 s timeout; `migrate` uses its own pool with no query timeout; shutdown waits at most 6 s for HTTP and 2 s for the pool (`closePoolGracefully`), under Docker's 10 s grace period. Without a query timeout, a connection that is open but no longer answers (a frozen PostgreSQL, a network dropping packets) holds its request forever. `closePoolGracefully` reads pg-pool's private client lists in one commented place (`getCheckedOutClients` in `shutdown.ts`), because the public API cannot list the clients lent out before it is called, and a stuck request is exactly one of those; if those fields ever disappear, it destroys nothing and gives up after one more second, so the process still exits.
@@ -99,22 +124,27 @@ On SIGTERM (`docker stop`) or SIGINT the server stops accepting connections, clo
 
 ### Middlewares
 
-Layer 1 carries the whole starting set of the skills' middlewares, so later layers only mount routes:
+Layer 1 carried the whole starting set of the skills' middlewares, and layer 2 completed it with the account check:
 
 | Middleware | What it does |
 |---|---|
 | `securityHeadersMiddleware` | First in `app.ts`: `Cache-Control: no-store`, `nosniff`, a closed `Content-Security-Policy`, `no-referrer`, `X-Frame-Options: DENY` on every response, errors included |
-| `authenticateMiddleware` | `Authorization: Bearer <token>`; verifies the HS256 token through `verifyToken` and sets `req.decoded`; 401 when missing or invalid, 500 when `SECRET_KEY` is missing |
-| `authorizeMiddleware(roles)` | 401 without `req.decoded`, 403 when the role is not listed |
+| per-address floor | In `app.ts`, after `cors` and before everything else: 300 requests per minute per client address, to any path (`REQUESTS_PER_ADDRESS_PER_MINUTE`). `OPTIONS` preflights end in `cors` and are not counted |
+| `databaseReadyMiddleware` | In `v1.routes.ts`, after the health router and before everything else: 503 "The database is not available, please try again later" until the startup check has passed (see "Migrations"); health works without the database, because it is what reports it |
+| `authenticateMiddleware` | `Authorization: Bearer <token>`; verifies the HS256 token through `verifyToken` (signature, algorithm, `iss`, `aud`, expiry, claim shapes) and sets `req.decoded` (`id`, `tokenVersion`, `expiresAt`); 401 when missing or invalid, 500 when `SECRET_KEY` is missing. Token only: it asks the database nothing |
 | `rateLimitMiddleware` | Limits keyed by address (`ip`), email and address (`emailAndIp`) or user (`user`); `RateLimit` headers in the draft-8 form; a 429 goes through `errorMiddleware` |
-| per-user limit | In `v1.routes.ts`, right after authentication: one counter per user for every protected route (120 per minute by default), on top of each route's own limits |
+| per-user limit | In `v1.routes.ts`, right after authentication and before the database is asked: one counter per user and token version for every protected route (120 per minute by default), on top of each route's own limits |
+| `currentUserMiddleware` | After the per-user limit: one query per request reads the account's role, status and token version; 401 "Invalid or expired authentication token" when the account does not exist, is disabled, or the token's version is not the current one; sets `req.user` (`id`, `role`, `expiresAt`) |
+| `authorizeMiddleware(roles)` | 401 without `req.user`, 403 when `req.user.role` is not listed. The role is the database's, from this request |
 | `validateBodyMiddleware` | Joi validation of `req.body`; 400 with `details` |
-| `notFoundMiddleware`, `errorMiddleware` | Last in `app.ts`; the only place that writes error responses |
+| `notFoundMiddleware`, `errorMiddleware` | Last in `app.ts`; the only place that writes error responses. `errorMiddleware` also answers 503 (and not 500) for a database that cannot be reached during a request |
 
-`app.ts` sets `trust proxy` from `TRUSTED_PROXIES` (never `true`), applies `cors` (limited to `CORS_ORIGINS` when set) and has no global body parser: each route that takes a body parses it itself after authentication and the per-user limit, so rejected requests never get their body read.
+`app.ts` sets `trust proxy` from `TRUSTED_PROXIES` (never `true`), applies `cors` (limited to `CORS_ORIGINS` when set), the per-address floor, and has no global body parser: each route that takes a body parses it itself after authentication and the per-user limit, so rejected requests never get their body read.
+
+The order in `v1.routes.ts` is: health (public, no database needed) → readiness gate → public routes (login) → `authenticateMiddleware` → per-user limit → `currentUserMiddleware` → protected routes.
 
 > [!NOTE]
-> **Decision:** layer 1 includes the skills' whole starting set of middlewares (authenticate, authorize, the rate limits and the per-user limit) (2026-11-26), even though no route needs authorization yet. They are tested now against test tokens, so layer 2 adds accounts on top of code that is already proven, and the order of `v1.routes.ts` (public routes, authentication, per-user limit, protected routes) is fixed from the start.
+> **Decision:** layer 1 included the skills' whole starting set of middlewares (authenticate, authorize, the rate limits and the per-user limit) (2026-11-26), even though no route needed authorization yet. They were tested against test tokens, so layer 2 adds accounts on top of code that was already proven, and the order of `v1.routes.ts` (public routes, authentication, per-user limit, protected routes) was fixed from the start. Layer 2 added two steps to it, the readiness gate and `currentUserMiddleware`, without changing that order.
 
 ### Health
 
@@ -131,40 +161,160 @@ Layer 1 carries the whole starting set of the skills' middlewares, so later laye
 
 `npm test` runs `node:test` through `tsx`, one file at a time against the test database; `npm run test:file -- <file>` runs one file.
 
-- **The test database.** `test/setup.ts` runs before every file. It copies `RAG_LAB_TEST_DATABASE_URL` into `DATABASE_URL`, or deletes `DATABASE_URL` when it is missing (the app then fails with "DATABASE_URL is not set" instead of touching the development database). `test/db/testDatabase.ts` adds a second line of defense: it refuses to empty a database whose name does not end in `_test`.
-- **Fixed operational settings.** `test/operationalSettings.ts` sets `HOST`, `PORT`, `TRUSTED_PROXIES`, `CORS_ORIGINS`, the limits, the token lifetime and `OLLAMA_BASE_URL` to the app's defaults before any module loads, and the child processes the tests start get the same values (`test/childEnvironment.ts`). They are set to values, not deleted, because the app loads `.env` itself and would fill a deleted variable in again.
+- **The test database.** `test/setup.ts` runs before every file. It copies `RAG_LAB_TEST_API_DATABASE_URL` (the role `rag_lab_api`) into `DATABASE_URL` and `RAG_LAB_TEST_DATABASE_URL` (the owner `rag_lab`) into `MIGRATION_DATABASE_URL`, and deletes the target when its source is missing (the app then fails with "DATABASE_URL is not set" instead of touching the development database). `test/db/testDatabase.ts` adds a second line of defense: it refuses to empty a database whose name does not end in `_test`.
+- **The owner-pool rule.** The app runs as the API role in the tests, as in production. Everything that changes or inspects the schema goes through an owner pool (`ownerPool` in `testDatabase.ts`): resetting the database, running the migration script, reading `pg_tables` or `to_regclass`. An inspection through the API pool can pass while checking nothing, because the role cannot see a table it has no rights on.
+- **Fixed operational settings.** `test/operationalSettings.ts` sets `HOST`, `PORT`, `TRUSTED_PROXIES`, `CORS_ORIGINS`, the limits (the five of layer 2 included), the token lifetime and `OLLAMA_BASE_URL` to the app's defaults before any module loads, and the child processes the tests start get the same values (`test/childEnvironment.ts`). They are set to values, not deleted, because the app loads `.env` itself and would fill a deleted variable in again.
 - **Test doubles** live in `test/doubles/`. `fakeOllama.ts` is a real HTTP server on a free port; `OLLAMA_BASE_URL` points at a closed port (`http://127.0.0.1:1`) in every test, so a test that forgets to start it gets "connection refused" and never reaches the real models. `pausableProxy.ts` is a TCP proxy that can go silent (connections stay open, no byte travels), which simulates a frozen database.
 - **Repository checks** live in `test/repository/` (the invisible-character test).
 - **The `SECRET_KEY` placeholder** is repeated in `test/config/placeholder.ts` and must equal the value in `.env.example`; the app refuses that exact value by name, because it is longer than 32 characters and the length rule would not catch it.
 
 > [!NOTE]
-> **Decision:** the test database comes from `RAG_LAB_TEST_DATABASE_URL`, set in `.env` and also as a Windows user environment variable, because worktrees have no `.env` (2026-11-26). `test/setup.ts` copies it into `DATABASE_URL`, or deletes `DATABASE_URL` when it is missing. The tests also get fixed operational settings, so the developer's `.env` cannot change them: a test that passes on one computer because of its `.env` and fails on another proves nothing.
+> **Decision:** the test database comes from `RAG_LAB_TEST_DATABASE_URL`, set in `.env` and also as a Windows user environment variable, because worktrees have no `.env` (2026-11-26). `test/setup.ts` copies it into `DATABASE_URL`, or deletes `DATABASE_URL` when it is missing. The tests also get fixed operational settings, so the developer's `.env` cannot change them: a test that passes on one computer because of its `.env` and fails on another proves nothing. Layer 2 changed the mapping (next decision).
+
+> [!NOTE]
+> **Decision:** the test suite runs the app as the API role (2026-11-26, the owner's decision, layer 2). `RAG_LAB_TEST_API_DATABASE_URL` goes into `DATABASE_URL` and `RAG_LAB_TEST_DATABASE_URL` (the owner) into `MIGRATION_DATABASE_URL`; both are set in `.env` and as Windows user environment variables. Tests that ran as the owner would pass with rights the API does not have in production (a missing grant would show up only there), so the app is exercised with the rights it really has, and the schema work goes through an owner pool.
 
 > [!NOTE]
 > **Decision:** Ollama is replaced in tests by a shared fake HTTP server (`test/doubles/fakeOllama.ts`), and `OLLAMA_BASE_URL` points at a closed port in tests (2026-11-26). A pausable TCP proxy (`test/doubles/pausableProxy.ts`) simulates a frozen database. A real HTTP server lets the code under test run its real `fetch`, timeout and redirect logic, and the test suite never depends on the models installed on the developer's machine.
 
-## 6. Contract for the frontend
+## 6. Accounts and authentication (layer 2)
 
-The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml), explained in [api/README.md](api/README.md). It holds `GET /v1/health` and the shared answers every other `/v1` path gets (401, 404, 429).
+Accounts, login, logout, tokens that can be revoked, and the limits that protect them. The routes follow the layered pattern (`auth.routes.ts`, `users.routes.ts`, their controllers, `auth.service.ts` and `users.service.ts`, `auth.validator.ts` and `users.validator.ts`); the exact bodies, messages and status codes are in the [API contract](api/openapi.yaml).
+
+### Endpoints
+
+| Method and path | Access | What it does |
+|---|---|---|
+| `POST /v1/auth/login` | Public | Checks email and password; returns the user and a token |
+| `POST /v1/auth/logout` | Token | Ends every session of the account |
+| `GET /v1/users/me` | Token | The signed-in user |
+| `PATCH /v1/users/me/password` | Token | Changes the password; returns a new token |
+| `POST /v1/users` | Admin | Creates an account (role `user` unless the request says `admin`) |
+| `PATCH /v1/users/:id` | Admin | Changes another account's role or status |
+
+### Accounts
+
+The `users` table (migration `003_users.sql`) holds `id` (UUID), `email`, `password_hash`, `role` (`user` or `admin`), `status` (`active` or `disabled`), `token_version` and `created_at`. There is a unique index on `lower(email)`, so an email is one account whatever its capitalization, and a `CHECK` keeps it within 254 characters. Emails are trimmed, lowercased and normalized to Unicode NFC by the validator before they are checked and stored, and the same rule (`emailRule`) is used by login, by account creation and by `create-admin`. The API never returns the hash or the token version (`User` type: `id`, `email`, `role`, `status`, `createdAt`).
+
+There is no self-registration. The first admin comes from `npm run create-admin -- <email>` (`src/createAdmin.ts`): it connects with `DATABASE_URL` like the server, creates an `admin` account with a random 24-character password (18 random bytes in base64url, 144 bits) and prints it once; only its hash is stored. An existing email stops it without printing a password. The admin then creates the other accounts with `POST /v1/users`, and changes their role or status with `PATCH /v1/users/:id`.
+
+`updateUserService` locks the actor's and the target's rows in id order in one transaction (`SELECT ... FOR UPDATE`) and checks again that the actor is still an active admin, before making the change. The route's permission check ran earlier, and two admins who change each other at the same moment would both pass it and could leave no admin at all; the second call now waits for the first one's commit and sees the actor as it is. An admin cannot change their own role or status (409, compared case-insensitively), and a role change needs no token bump because the role is read from the database on every request. Disabling an account raises its token version, so the old tokens stay dead if the account is enabled again.
+
+### Tokens and revocation
+
+Tokens are HS256 JWTs (`token.util.ts`, the only place that signs or verifies them) with the claims `sub` (the user's id), `ver` (the account's `token_version`), `iss` (`rag-lab`), `aud` (`rag-lab-api`), `iat` and `exp` (3600 s by default, at most 86400). There is no role in the token and no refresh token. `verifyToken` pins the algorithm, the issuer and the audience, and rejects a correctly signed token whose claims have another shape, so a token of RAG Web (same algorithm, no issuer or audience) or of the earlier design is a 401.
+
+Revocation works by `token_version`. A token is good only while its `ver` equals the account's current `token_version`:
+
+- logout raises it, so every token of the account stops working, on every device (a sessions table can come later, if one device's logout must not end the others);
+- a password change raises it and returns a new token for the session that asked;
+- disabling the account raises it.
+
+The check is in `currentUserMiddleware` (`getActiveUserService`), one query per request that reads `role`, `status` and `token_version` and answers 401 "Invalid or expired authentication token" for a missing account, a disabled one or a version that is not current. It is the same message as for a forged token, so the client cannot tell the reasons apart. The same query gives the role, so a promotion, a demotion or a disabled account applies on the next request with the same token. Measured cost of that lookup: median 1.45 ms, p95 1.9 ms (500 calls against the Docker test database over loopback, one at a time; a floor, not a prediction under load).
+
+`authenticateMiddleware` is token-only (`req.decoded`: `id`, `tokenVersion`, `expiresAt`); `currentUserMiddleware` sets `req.user` (`id`, `role`, `expiresAt`); `authorizeMiddleware` and `requireUserId` read `req.user`, so a request that was only authenticated and not checked against the account never counts as a signed-in user.
+
+### Passwords
+
+Passwords are hashed with scrypt from `node:crypto` (`password.util.ts`): N = 16384, r = 8, p = 5, 16 MiB per hash, a random 16-byte salt and a 64-byte key, stored as `scrypt$N$r$p$salt$hash`. The password is normalized to Unicode NFKC before hashing, so the same visible password typed on different keyboards is one password. Comparison uses `timingSafeEqual`. The parameters are stored with each hash, so raising them later keeps old passwords valid, and a successful login replaces a hash made with other parameters (a rehash).
+
+New passwords have 8 to 64 characters and are not trimmed (spaces count). Login and the current password of a change have no minimum, only the maximum of 64, so an account made under an older rule can still log in. Hash parameters read from the database outside fixed ranges, hex that is not hex, or a value of another shape are a password that does not match, never an error or a huge allocation.
+
+Login takes about as long whether or not the email exists: an unknown email, and a failure against an old or unusable stored hash, also run a dummy hash (computed on first use and cached). A wrong password and an unknown email give the same 401 "Invalid email or password". A disabled account gets 403 "This account is disabled" only after a correct password, so the answer does not reveal which accounts exist or are disabled. A wrong current password in a password change is a 400, not a 401, which the client would mistake for an expired session. A password change and a login rehash apply only while the stored hash is still the one that was checked: if another request changed it in between, the answer is 409 "The password was changed by another request, please try again" and nothing is overwritten.
+
+### Limits
+
+All counters are in memory (they reset when the API restarts, which is fine for one process). Defaults are in `limits.config.ts`; each can be changed in `.env` (see `.env.example`).
+
+| Limit | Default | Key | What counts | Where |
+|---|---|---|---|---|
+| Every request | 300 per minute | address | every request to any path, forged tokens and unknown paths included; `OPTIONS` preflights are not counted | `app.ts`, before authentication (`REQUESTS_PER_ADDRESS_PER_MINUTE`) |
+| Logins | 10 per 15 minutes | address | every login, successful ones too (each costs a hash); counted before the body is read | login route (`LOGINS_PER_15_MINUTES`) |
+| Failed logins | 5 per 15 minutes | email and address | only responses with an error (`FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES`) | login route, after the body is parsed |
+| Protected requests | 120 per minute | user and token version | every protected request | `v1.routes.ts`, before the database is asked (`AUTHENTICATED_REQUESTS_PER_MINUTE`) |
+| Password changes | 5 per 15 minutes | user and token version | every attempt, the wrong ones too, before the body is read | `PASSWORD_CHANGES_PER_15_MINUTES` |
+| Account creations | 20 per hour | admin and token version | every attempt after the permission check, failed ones too, before the body is read | `USER_CREATIONS_PER_HOUR` |
+
+The failed-login key is `email:<email>|<address>`, so guessing one account from one address is stopped without letting someone else lock the owner out from another address; the email is normalized like the validator does (NFC, trimmed, lowercased). An email longer than 254 characters, or a value that is not text, is not part of the key: the address alone counts it, so a flood of huge emails cannot fill the counters. The per-user key is `user:<id>:v<version>`: a revoked token still reaches that limit (the account is only checked afterwards), and with the version in the key whoever holds an old token cannot use up the counter of the account's current session.
+
+### Decisions
+
+> [!NOTE]
+> **Decision:** accounts are created only by an admin; there is no self-registration (2026-11-26, the owner's decision). The hosting is undecided and consumption caps arrive in layer 10, so open sign-up would let anyone use the models.
+
+> [!NOTE]
+> **Decision:** the first admin comes from a script the owner runs, `npm run create-admin -- <email>`, with a generated password printed once (2026-11-26, the owner's decision). "The first account that registers becomes the admin" was ruled out: whoever reaches an empty database first would own it.
+
+> [!NOTE]
+> **Decision:** the admin endpoints are: create an account, and change the role or status of other accounts, never their own (2026-11-26, the owner's decision). An admin who locks themselves out or demotes themselves by mistake could not undo it; another admin can.
+
+> [!NOTE]
+> **Decision:** tokens are revoked by `token_version`, and logout ends every session of the account (2026-11-26, the owner's decision). It needs one counter in the `users` row and no new table; a sessions table, with one row per login, can come later if a device's logout must not end the others.
+
+> [!NOTE]
+> **Decision:** the order of a protected request is: token (no database) → per-user limit → database check (2026-11-26, the owner's decision). A flood from one valid token is limited before it reaches the database, and a user over the limit costs the database nothing.
+
+> [!NOTE]
+> **Decision:** a disabled account gets 403 only after a correct password, and a wrong current password in a password change is a 400 (2026-11-26, the owner's decision). The 403 would otherwise tell anyone which emails exist and are disabled; a 401 for a wrong current password would look like an expired session and send the user to the login screen.
+
+> [!NOTE]
+> **Decision:** one limit per address of 300 requests per minute sits in front of every request, in `app.ts` (2026-11-26, the owner's decision: fine as long as there are no hardware problems). Forged tokens, unknown paths and login attempts from one address are answered with a 429 before the token is checked or the database is asked.
+
+> [!NOTE]
+> **Decision:** the other limits take RAG Web's defaults (2026-11-26, the owner's decision): 10 logins per address and 5 failed logins per email and address per 15 minutes, 5 password changes per user per 15 minutes, and 20 account creations per admin per hour. There is no global cap on logins for now.
+
+> [!NOTE]
+> **Decision:** passwords have 8 to 64 characters (2026-11-26, the owner's decision). The owner chose 8, as in RAG Web, over the 15 that NIST SP 800-63B-4 asks for single-factor passwords; the maximum of 64 keeps a request from making scrypt hash a huge string.
+
+> [!NOTE]
+> **Decision:** passwords are hashed with scrypt from `node:crypto`, with no new dependency (2026-11-26, the owner's decision). bcrypt silently cuts passwords at 72 bytes, and argon2 would be a native dependency to build on every machine and in the container.
+
+> [!NOTE]
+> **Decision:** the token carries `sub` and `ver`, with `iss` and `aud` as constants, lasts 3600 s, has no refresh token and has no role (2026-11-26, the owner's decision). The role is read from the database on every request, so a promotion or a demotion applies at once, and a leaked token cannot keep an admin's rights after a demotion.
+
+> [!NOTE]
+> **Decision:** logout is `POST /v1/auth/logout` (2026-11-26, the owner's decision), a protected route mounted after `currentUserMiddleware`, so a token that was already revoked is a 401 and does not raise the version again.
+
+> [!NOTE]
+> **Decision:** a database that cannot be reached is a 503 on every route (2026-11-26, the owner's decision), during a request as well as at startup (SQLSTATE 57P01, 57P02 and 08xxx included, such as a PostgreSQL restart). The client is told to try again later and nothing about the connection leaves the server.
+
+> [!NOTE]
+> **Decision:** the audit of layer 2 led to these changes, decided by the orchestrator and the implementer without asking the owner; the owner can reverse any of them (2026-11-26). After the audit: the readiness gate and the background retry when the database is down at startup (see "Migrations"); the per-user limit keyed per token version; account creations counted on every attempt after authorization and not only on successes; `updateUserService` locks and re-checks the actor; `migrate` no longer needs `DATABASE_URL`; 57P01, 57P02, 08000, 08003 and 08006 count as unreachable; the role check also refuses a session that acts as another role, a role that is a member of another role and `CREATE` on the database; and the dummy hash also runs after failures against old or unusable stored hashes. In the first implementation round: a password change or a rehash applies only if the stored hash is still the one that was checked (a concurrent change gets 409); stored hash parameters outside fixed ranges are refused without throwing; and the dummy hash is computed on first use and cached. The worktree's `node_modules` is a junction to the main checkout's (the orchestrator, local only).
+
+## 7. Contract for the frontend
+
+The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml) (version 0.2.0), explained in [api/README.md](api/README.md). It holds `GET /v1/health`, the six account endpoints of section 6, the schemas they use, and the shared answers every other `/v1` path gets (401, 403, 404, 429, 503).
 
 > [!NOTE]
 > **Decision:** the API contract is OpenAPI 3.1 YAML in `docs/api/` (2026-11-26). A machine-readable contract lets the frontend be built (and its client generated or checked) without reading the backend code, and it is frozen in layer 11.
 
-## 7. Findings deferred to later layers
+## 8. Findings deferred to later layers
 
-The audits of layer 1 found these; none is exploitable with the layer-1 code, because there are no accounts or documents yet. They are listed so they are not lost.
+The audits of layer 1 found these; none was exploitable with the layer-1 code, because there were no accounts or documents yet. They are listed so they are not lost. The three that belonged to layer 2 are done.
 
 > [!NOTE]
 > **Decision:** these findings wait for the layer that makes them matter (2026-11-26):
 >
-> - A separate low-privilege database role for the API (layer 2, before users exist). It needs a script that the owner runs; the migrations keep using the owner role.
-> - Token revocation, `aud` and `iss` claims, and reading a fresh role from the database instead of trusting the one inside the token (layer 2).
-> - A per-address limit before authentication, and a length cap on the email used in rate-limit keys (layer 2).
+> - ~~A separate low-privilege database role for the API (layer 2, before users exist).~~ Done in layer 2 (section 5, "Database roles").
+> - ~~Token revocation, `aud` and `iss` claims, and reading a fresh role from the database instead of trusting the one inside the token (layer 2).~~ Done in layer 2 (section 6, "Tokens and revocation").
+> - ~~A per-address limit before authentication, and a length cap on the email used in rate-limit keys (layer 2).~~ Done in layer 2 (section 6, "Limits").
 > - Requiring `CORS_ORIGINS` and `TRUSTED_PROXIES` to be set when the API is exposed (layers 11 and 13).
 > - A size cap on model responses (layer 6, when answers are read).
 > - Image and model digests (layers 5 and 13).
 
-## 8. Process metrics
+The audits of layer 2 found these, which wait too:
+
+> [!NOTE]
+> **Decision:** these findings from the audit of layer 2 wait for the layer that makes them matter (2026-11-26):
+>
+> - A limit per account on failed logins across addresses (a slowdown or an alert, not a lockout, which would let anyone lock the owner out), and a cap on scrypt jobs running at once (layer 10 or 13).
+> - A check of new passwords against a list of breached passwords. It needs a list download, so it needs the owner's approval.
+> - `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role (an operations note, layer 13).
+> - Rate-limit counters are in memory and reset when the API restarts; fine for one process (revisit if the API ever runs as several).
+> - The frontend keeps the token in memory and clears it on a 401 (layer 11, in the contract notes; already written in `docs/api/`).
+> - `TRUSTED_PROXIES` must match the tunnel, or every user shares one address and one counter (layers 11 and 13, already deferred above).
+
+## 9. Process metrics
 
 How much the agent team uses and costs is measured per loop (a feature or an experiment, from its start to the merge of its pull request), so loops can be compared and the owner can see where the usage goes. It measures the development agents, not the application's token accounting ([design section 14](design.md#14-process-metrics); the application's is [section 5](design.md#5-token-accounting-as-fine-as-possible)).
 
