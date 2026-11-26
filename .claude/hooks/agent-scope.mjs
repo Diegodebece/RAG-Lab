@@ -9,7 +9,9 @@
 // - code:      only src/, test/, migrations/, node_modules/ and a few config files (the independent auditors and
 //              the verifier, so they judge the code and not the author's notes);
 // - reference: RAG Web's code, tests, skills and docs (RAG_WEB_DIR), for porting; never its .env or RAG1's data;
-// - data:      the private data folder outside the repository (RAG_LAB_DATA_DIR): evaluation sets and results.
+// - data:      the private data folder outside the repository (RAG_LAB_DATA_DIR): evaluation sets and results;
+//              never its usage/ folder, which holds the process metrics (every agent's calls and copies of whole
+//              conversations), and never a Grep or Glob of the whole folder, which would reach usage/ and .env.
 // RAG_WEB_DIR and RAG_LAB_DATA_DIR come from the environment or from the main checkout's .env.
 //
 // GitHub: subagents never push, fetch or use gh, whatever their role; test-writer and implementer may commit in
@@ -61,7 +63,9 @@ const ROLES = {
     "docs-keeper": {
         read: ["project", "reference"],
         write: [["docs"], ["readme.md"], [".env.example"], [".claude", "skills"]],
-        writeExcluded: [["docs", "experiments"]]
+        // the lab notebook is the lab-reporter's; the process reports measure the agents' own work, so the
+        // orchestrator writes them
+        writeExcluded: [["docs", "experiments"], ["docs", "process"]]
     }
 };
 
@@ -108,6 +112,9 @@ const readSetting = (projectDir, key) => {
 };
 
 // The lower-case path components of `target` below `root`, [] for the root itself, or null when outside it.
+// Windows reads "usage.", "usage " and "usage::$INDEX_ALLOCATION" (or ".env::$DATA") as the same folder or file
+// without the suffix, so trailing dots and spaces are dropped before comparing, and a component with a colon (an
+// alternate data stream) counts as outside every place, which denies it.
 const partsBelow = (root, target) => {
     if (!root) {
         return null;
@@ -119,7 +126,8 @@ const partsBelow = (root, target) => {
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
         return null;
     }
-    return relative.split(path.sep).map((part) => part.toLowerCase());
+    const parts = relative.split(path.sep).map((part) => part.toLowerCase().replace(/[. ]+$/, ""));
+    return parts.some((part) => part === "" || part.includes(":")) ? null : parts;
 };
 
 const startsWith = (parts, prefix) => prefix.every((part, index) => parts[index] === part);
@@ -145,6 +153,17 @@ const isReadableProjectPath = (parts) => {
         return false;
     }
     return true;
+};
+
+// Top-level folders of the data folder no agent reads: the process metrics.
+const DATA_BLOCKED_TOP = new Set(["usage"]);
+
+const isReadableDataPath = (parts, search) => {
+    if (parts.some(isSecretName) || (parts.length > 0 && DATA_BLOCKED_TOP.has(parts[0]))) {
+        return false;
+    }
+    // a search of the whole data folder would read through the blocked files (Grep) or list them (Glob)
+    return !(search && parts.length === 0);
 };
 
 const isCodePath = (parts) =>
@@ -174,9 +193,9 @@ const hasSecretBelow = (folder) => {
 };
 
 // Where `target` is and whether the role may read it. `search` is "Grep" or "Glob" for search paths, null for
-// Read: a search of a whole root would read through the blocked files too, except in the data folder, which is
-// readable entirely. In RAG Web, Grep reads file contents, so it may not search a folder that holds a secret
-// file (for example a cheatsheet in docs/); Glob only lists names.
+// Read: a search of a whole root would read through the blocked files too, so neither Grep nor Glob may search
+// the project root or the data folder's root. In RAG Web, Grep reads file contents, so it may not search a folder that
+// holds a secret file (for example a cheatsheet in docs/); Glob only lists names.
 const canRead = (policy, places, target, search) => {
     const projectParts = partsBelow(places.project, target);
     const dataParts = partsBelow(places.data, target);
@@ -184,7 +203,7 @@ const canRead = (policy, places, target, search) => {
 
     // the data folder may sit inside the project or next to it; check it first
     if (dataParts !== null && policy.read.includes("data")) {
-        return !dataParts.some(isSecretName);
+        return isReadableDataPath(dataParts, search);
     }
     if (projectParts !== null) {
         if (policy.read.includes("code")) {

@@ -94,6 +94,24 @@ All commands are for PowerShell, run from the project folder.
 
 The hooks that limit the agents have their own tests: `node --test .claude/hooks/tests/`.
 
+## Process metrics
+
+`.claude/metrics/usage-report.mjs` measures the usage and the API-equivalent cost of each loop (pull request) from Claude Code's transcripts. It has no dependencies and is run by the orchestrator, from the main checkout or a worktree. It needs `RAG_LAB_DATA_DIR` (from the environment or `.env`).
+
+```powershell
+node .claude/metrics/usage-report.mjs begin feature/<name>
+```
+
+| Command | What it does |
+|---|---|
+| `begin <branch>` | Marks the start of a loop (run it once, in the loop's own session) |
+| `collect` | Reads the transcripts and stores the new calls and a gzip copy of the transcripts |
+| `windows` | Shows each loop's span and the calls that are ambiguous or unattributed |
+| `report <branch> [--write <file>]` | The usage part of a loop's report, for example `--write docs/process/NN-<name>.md` |
+| `summary [--write <file>]` | The table of all loops |
+
+The records go to `RAG_LAB_DATA_DIR\usage\`, never into the repository. Its tests: `node --test .claude/metrics/tests/`. How the numbers are made, and the reports so far: [docs/process/README.md](docs/process/README.md).
+
 ## Endpoints
 
 All paths start with `/v1`. Protected endpoints will need the header `Authorization: Bearer <token>`, and each user can make 120 requests per minute to them. The full contract is in [docs/api/openapi.yaml](docs/api/openapi.yaml).
@@ -121,8 +139,8 @@ Every variable is in [.env.example](.env.example), with its default and range. A
 │   ├── migrate.ts         # the migration runner
 │   └── v1/                # config, routes, controllers, services, middlewares, types, utils
 ├── test/                  # mirrors src/; doubles/ holds the fake Ollama and the pausable proxy
-├── docs/                  # design.md, project-guide.md, api/, experiments/
-└── .claude/               # agents, hooks and skills
+├── docs/                  # design.md, project-guide.md, api/, experiments/, process/
+└── .claude/               # agents, hooks, skills and the usage-report script (metrics/)
 ```
 
 Evaluation sets, documents and run results are private: they live outside the repository, in `RAG_LAB_DATA_DIR`.

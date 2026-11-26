@@ -4,7 +4,7 @@ A RAG API built by a team of Claude Code agents. Read `docs/design.md` before an
 
 ## Working rules
 
-- The main session is the orchestrator: it splits the work, delegates to the agents in `.claude/agents/`, collects their results, and is the only one who asks the owner. One loop (feature or experiment) runs at a time.
+- The main session is the orchestrator: it splits the work, delegates to the agents in `.claude/agents/`, collects their results, and is the only one who asks the owner. One loop (feature or experiment) runs at a time, so costs do not run away, and each loop gets a fresh orchestrator session.
 - Feature loop: planner → owner approves the plan → test-writer → implementer → code-auditor and owasp-auditor → finding-verifier → implementer → docs-keeper → owner reviews the pull request and merges.
 - Experiment loop: experiment-runner → lab-reporter → analyst → owner approves → implementer → experiment-runner confirms → lab-reporter.
 - Approval gates, always asked before acting: each layer's plan, new dependencies, migrations, changes to evaluated values (chunk size, models, prompts, thresholds), any download (models, images), Docker, and merges. Once a plan is approved, implement it without asking again.
@@ -12,6 +12,13 @@ A RAG API built by a team of Claude Code agents. Read `docs/design.md` before an
 - Each change keeps `docs/`, `README.md`, `.env.example` and the `layered-express-*` skills in sync. Each decision goes in the guide in a `> [!NOTE]` box starting with **Decision:**.
 - The owner writes the Docker configuration and runs Docker; give exact PowerShell commands, one per block. Never run `docker model` commands (`docker model ls` can start a download).
 - Say plainly when something goes wrong and what was done about it.
+
+## Process metrics
+
+Every pull request carries a process report in `docs/process/NN-<name>.md` and in its body: decisions the AI took without asking, plan against what was done, findings funnel, test quality, rework, and the usage and API-equivalent cost that `.claude/metrics/usage-report.mjs` generates from the Claude Code transcripts. The orchestrator runs it:
+
+- At the start of a loop, in its fresh session: `node .claude/metrics/usage-report.mjs begin <branch>`.
+- Before pushing the pull request: `collect`, then `report <branch> --write docs/process/NN-<name>.md` and `summary --write docs/process/README.md`. `windows` shows how the calls were attributed; resolve ambiguous ones in `RAG_LAB_DATA_DIR\usage\overrides.json`.
 
 ## GitHub
 
@@ -29,6 +36,7 @@ Three levels:
 ## Private data
 
 - Evaluation sets, documents and run results live outside the repository, in `RAG_LAB_DATA_DIR`. Never copy them into the repository, a test, a commit message, a pull request or the lab notebook; refer to questions by id.
+- The usage records and the copies of the transcripts live in `RAG_LAB_DATA_DIR\usage\`; no agent reads them. Reports show numbers, roles and agent descriptions only: never message text, paths or session titles.
 - Secrets live only in `.env` (git-ignored); `.env.example` lists every variable with placeholder values.
 - The repository will become public: never commit anything you would not publish.
 
@@ -36,6 +44,7 @@ Three levels:
 
 - `.claude/hooks/agent-scope.mjs` limits what each agent reads, writes and runs; `guard-github.mjs` and `approval-gates.mjs` apply to every session. They are the enforcement, not the prompts.
 - Their tests: `node --test .claude/hooks/tests/`. Changing a hook needs the owner's approval and a test that fails without the change.
+- The metrics script `.claude/metrics/` is out of the agents' reach like the hooks (no role writes it), and docs-keeper does not write `docs/process/`. Its tests: `node --test .claude/metrics/tests/`.
 
 # Node.js / Express standards (layered-express)
 

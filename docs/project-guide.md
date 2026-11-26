@@ -41,7 +41,7 @@ The standards are in `CLAUDE.md` and the `layered-express-*` skills. In short: e
 Invisible characters are checked by a test, `test/repository/invisibleCharacters.test.ts`, which runs on every `npm test` and fails when a file of the project holds one.
 
 > [!NOTE]
-> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/` and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
+> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/`, `.claude/metrics/` (added 2026-11-26 with the process metrics, section 8) and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
 
 ## 5. Foundations (layer 1)
 
@@ -163,3 +163,54 @@ The audits of layer 1 found these; none is exploitable with the layer-1 code, be
 > - Requiring `CORS_ORIGINS` and `TRUSTED_PROXIES` to be set when the API is exposed (layers 11 and 13).
 > - A size cap on model responses (layer 6, when answers are read).
 > - Image and model digests (layers 5 and 13).
+
+## 8. Process metrics
+
+How much the agent team uses and costs is measured per loop (a feature or an experiment, from its start to the merge of its pull request), so loops can be compared and the owner can see where the usage goes. It measures the development agents, not the application's token accounting ([design section 14](design.md#14-process-metrics); the application's is [section 5](design.md#5-token-accounting-as-fine-as-possible)).
+
+The tool is `.claude/metrics/usage-report.mjs`, a Node script with no dependencies and its own tests (`node --test .claude/metrics/tests/`), run by the orchestrator. It reads the Claude Code transcripts of this project and keeps only numbers and names: model, token counts, time, session, agent type and description, and the working folder relative to the repository.
+
+| Command | What it does |
+|---|---|
+| `begin <branch>` | Records that a loop starts now, and which session runs it |
+| `collect` | Reads the transcripts, adds the new calls to `calls.jsonl` and copies the transcripts (gzip) |
+| `windows` | Shows each loop's time span, how many calls fall in it, overlaps, and the calls that are ambiguous or unattributed |
+| `report <branch>` | Prints the usage part of a loop's report; `--write <file>` puts it between the `usage-report` markers of that file |
+| `summary` | The table of all loops; `--write <file>` puts it between the `usage-summary` markers |
+
+Everything it stores goes to `RAG_LAB_DATA_DIR\usage\`: `calls.jsonl` (one record per call), the begin markers, `overrides.json` (manual attribution), Claude Code's own cost estimates and `transcripts\` (the gzip copies). The script refuses a data folder inside the repository, and `.gitignore` ignores `*.jsonl` and `*.jsonl.gz`. The reports are in `docs/process/`, one per pull request, described in `docs/process/README.md`; they never show message text, paths, user folders, session titles or full session ids, and an agent description that names a path is hidden whole.
+
+> [!NOTE]
+> **Decision:** the source of the numbers is the Claude Code transcripts, not the totals in the agents' completion notifications (2026-11-26). The notifications' totals do not match the transcripts, and the transcripts hold every call with its model and token counts.
+
+> [!NOTE]
+> **Decision:** each model call counts once, deduplicated by message id (2026-11-26). Claude Code writes one row per content block of an answer, and side or resumed sessions copy their parent's history, so counting rows would count the same call two or more times.
+
+> [!NOTE]
+> **Decision:** records, markers, overrides and transcript copies live in `RAG_LAB_DATA_DIR\usage\`, never in the repository (2026-11-26). They describe the owner's sessions and work, and the repository will become public. Claude Code deletes old transcripts after `cleanupPeriodDays`; the owner's user setting was raised to 365 days, and the copies keep the data anyway.
+
+> [!NOTE]
+> **Decision:** a loop runs from `begin <branch>` to the merge of its branch, and a call is attributed to a loop by rule (2026-11-26). The session that ran `begin` belongs to that loop; an agent belongs to the loop its first call fell in; when two loops overlap the worktree decides, and otherwise the call is "ambiguous" and is resolved by hand in `overrides.json`. Nothing is forced into a loop, because a wrong guess would corrupt the comparison without showing. Merges are read from `main` and `origin/main`, because the owner merges on GitHub and the local `main` may not be pulled yet. Each loop gets a fresh orchestrator session, so one session's cost is not split across loops.
+
+> [!NOTE]
+> **Decision:** layer 1, pull requests #1 and #2 and the setup committed straight to `main` were attributed by hand (2026-11-26), from the orchestrator's tool calls and the merge commits, because the script did not exist then. The owner confirmed the windows.
+
+> [!NOTE]
+> **Decision:** one loop runs at a time (2026-11-26, confirmed by the owner), so that costs do not run away. In layer 1 it did not hold (pull requests #1 and #2 overlapped it), which is why the attribution handles overlaps instead of assuming there are none.
+
+> [!NOTE]
+> **Decision:** cost is the "API-equivalent cost": what the tokens would cost on the Claude API, from `.claude/metrics/prices.json` (taken from the `claude-api` skill, prices of 2026-11-03) (2026-11-26). A subscription plan bills differently, so it is a measure for comparing loops, not a bill. Thinking tokens are inside the output and are not charged twice. A price that cannot be computed (an unknown model, a missing rate, web searches) is never guessed: the report says the cost is incomplete and why. Claude Code's own running estimate is shown for comparison only, and a gap between the two is reported, not corrected.
+
+> [!NOTE]
+> **Decision:** each pull request gets a process report, in `docs/process/NN-<name>.md` and in the pull request body (2026-11-26): decisions the AI took without asking, plan against what was done, findings funnel, test quality, rework, and the generated usage part. The orchestrator writes it, because it measures the agents' own work, and the docs-keeper may not write `docs/process/`.
+
+> [!NOTE]
+> **Decision:** `.claude/metrics/` is out of the agents' reach, like the hooks, and the invisible-character test scans it (2026-11-26). No role writes the script, and the experiment-runner, lab-reporter and analyst no longer read `RAG_LAB_DATA_DIR\usage\`, so the numbers cannot be changed by the agents they measure.
+
+> [!NOTE]
+> **Decision:** no role may Grep or Glob the root of the data folder (2026-11-26). A Grep there also read the data folder's `.env`, a gap found while testing, and a Glob there lists the names of the transcript copies in `usage\`. The Glob part was added by the orchestrator after the independent review, without asking the owner.
+
+> [!NOTE]
+> **Decision:** path components lose trailing dots and spaces before the hook compares them, and a component with a colon is denied (2026-11-26). This was decided by the orchestrator after the independent review, without asking the owner; the owner can reverse it. Windows reads `name.`, `name ` and `name::$INDEX_ALLOCATION` as the same folder as `name`, and a component such as `.env::$DATA` is an alternate data stream of `.env`, so the old comparison could be bypassed. It also tightens the older rules (`.env`, the lab notebook).
+
+Planned, not built: a chart of usage across loops, once two or three layers have data; and Stryker mutation testing later, which is a new dependency and needs the owner's approval.
