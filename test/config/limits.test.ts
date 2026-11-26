@@ -32,7 +32,8 @@ interface Loaded {
     stderr: string;
 }
 
-const loadLimits = async (setting: Record<string, string>): Promise<Loaded> => {
+// a value of undefined removes the variable, so the app's own default applies
+const loadLimits = async (setting: Record<string, string | undefined>): Promise<Loaded> => {
     const env = cleanChildEnvironment({ DOTENV_CONFIG_PATH: emptyEnvFile, DOTENV_CONFIG_QUIET: "true", ...setting });
 
     try {
@@ -72,6 +73,55 @@ describe("TOKEN_LIFETIME_SECONDS", () => {
             assert.match(loaded.stderr, /TOKEN_LIFETIME_SECONDS must be a whole number/, value);
         }
     });
+});
+
+// The five limits of the account routes: the default, a custom value, and a value that stops the app at startup
+// (0 would switch the limit off, and a malformed one would be read as something else). Each is its own setting.
+const ACCOUNT_LIMITS: [name: string, defaultValue: number][] = [
+    ["REQUESTS_PER_ADDRESS_PER_MINUTE", 300],
+    ["LOGINS_PER_15_MINUTES", 10],
+    ["FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES", 5],
+    ["PASSWORD_CHANGES_PER_15_MINUTES", 5],
+    ["USER_CREATIONS_PER_HOUR", 20]
+];
+
+describe("the limits of the account routes", () => {
+    it("have the agreed defaults when the settings are not set", { timeout: 30_000 }, async () => {
+        const loaded = await loadLimits(Object.fromEntries(ACCOUNT_LIMITS.map(([name]) => [name, undefined])));
+
+        assert.equal(loaded.code, 0, loaded.stderr);
+        assert.deepEqual(
+            Object.fromEntries(ACCOUNT_LIMITS.map(([name]) => [name, JSON.parse(loaded.stdout)[name]])),
+            Object.fromEntries(ACCOUNT_LIMITS)
+        );
+    });
+
+    for (const [name] of ACCOUNT_LIMITS) {
+        it(`${name} takes a custom value, and only that setting changes`, { timeout: 30_000 }, async () => {
+            const loaded = await loadLimits({
+                ...Object.fromEntries(ACCOUNT_LIMITS.map(([other]) => [other, undefined])),
+                [name]: "7"
+            });
+
+            assert.equal(loaded.code, 0, loaded.stderr);
+
+            const printed = JSON.parse(loaded.stdout);
+
+            for (const [other, defaultValue] of ACCOUNT_LIMITS) {
+                assert.equal(printed[other], other === name ? 7 : defaultValue, other);
+            }
+        });
+
+        it(`${name} stops the app at startup on zero or a malformed value, instead of switching the limit off`, { timeout: 60_000 }, async () => {
+            for (const value of ["0", "-1", "1e3", "0x10", "5.5", "ten"]) {
+                const loaded = await loadLimits({ [name]: value });
+
+                assert.notEqual(loaded.code, 0, `${value}: it loaded`);
+                assert.match(loaded.stderr, new RegExp(`${name} must be a whole number`), value);
+                assert.equal(loaded.stdout, "", `${value}: nothing was used`);
+            }
+        });
+    }
 });
 
 describe("HEALTH_CACHE_SECONDS", () => {

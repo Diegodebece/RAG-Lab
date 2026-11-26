@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import type { AddressInfo, Server as NetServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { Pool } from "pg";
 import { cleanChildEnvironment } from "./childEnvironment.js";
 import { SECRET_KEY_PLACEHOLDER } from "./config/placeholder.js";
 
@@ -29,7 +29,7 @@ interface RunningServer {
 const running: RunningServer[] = [];
 let emptyEnvDirectory = "";
 let emptyEnvFile = "";
-let openedPool: Pool | undefined;
+let closeDatabasePools: (() => Promise<void>) | undefined;
 
 before(async () => {
     // an empty .env, so the child process does not read the real one
@@ -46,16 +46,17 @@ afterEach(() => {
 });
 
 after(async () => {
-    await openedPool?.end();
+    await closeDatabasePools?.();
     await rm(emptyEnvDirectory, { recursive: true, force: true });
 });
 
 // The database helpers import db.config, which needs DATABASE_URL: load them only in the tests that use the database.
+// Everything the tests do to the schema goes through the owner's pool (ownerPool); the servers they start connect
+// as the API role, because DATABASE_URL is the API's URL in the test process too.
 const loadDatabase = async () => {
     const helpers = await import("./db/testDatabase.js");
-    const { pool } = await import("../src/v1/config/db.config.js");
-    openedPool = pool;
-    return { ...helpers, pool };
+    closeDatabasePools = helpers.closeTestPools;
+    return helpers;
 };
 
 const getFreePort = (): Promise<number> => new Promise((resolve, reject) => {
@@ -209,9 +210,9 @@ describe("server startup: database schema", () => {
     });
 
     it("refuses to start when the database has a migration this checkout does not have", { timeout: 15_000 }, async () => {
-        const { resetTestDatabase, pool } = await loadDatabase();
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
         await resetTestDatabase();
-        await pool.query("INSERT INTO schema_migrations (version) VALUES ('002_upload_usage.sql')");
+        await ownerPool.query("INSERT INTO schema_migrations (version) VALUES ('002_upload_usage.sql')");
         const server = await startServer();
 
         assert.equal(await waitForExit(server), 1);
@@ -243,13 +244,133 @@ describe("server startup: database schema", () => {
     });
 });
 
+// The API must run with the least rights it needs: a server whose connection could change the schema, create roles
+// or databases, or take over the tables would turn any flaw in a route into a flaw in the whole database. The
+// server stops at startup and says which role to use, without printing the URL or the password it was given.
+describe("server startup: the database role", () => {
+    const PROBE_ROLE = "rag_lab_probe_role";
+
+    const dropProbeRole = async (): Promise<void> => {
+        const { ownerPool } = await loadDatabase();
+        await ownerPool.query(`
+            DO $$ BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${PROBE_ROLE}') THEN
+                    DROP OWNED BY ${PROBE_ROLE};
+                    DROP ROLE ${PROBE_ROLE};
+                END IF;
+            END $$
+        `);
+    };
+
+    afterEach(dropProbeRole);
+
+    // a role that can log in to the test database and use its schema, like the API role, plus what the test adds
+    const createProbeRole = async (attributes: string, extraStatements: string[] = []): Promise<string> => {
+        const { ownerPool } = await loadDatabase();
+        const password = randomBytes(12).toString("hex");
+
+        await dropProbeRole();
+        await ownerPool.query(`CREATE ROLE ${PROBE_ROLE} LOGIN PASSWORD '${password}' ${attributes}`);
+        await ownerPool.query(`DO $$ BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO ${PROBE_ROLE}', current_database()); END $$`);
+        await ownerPool.query(`GRANT USAGE ON SCHEMA public TO ${PROBE_ROLE}`);
+        await ownerPool.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${PROBE_ROLE}`);
+
+        for (const statement of extraStatements) {
+            await ownerPool.query(statement);
+        }
+
+        assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+        const url = new URL(process.env.RAG_LAB_TEST_API_DATABASE_URL);
+        url.username = PROBE_ROLE;
+        url.password = password;
+
+        return url.toString();
+    };
+
+    // every one of these starts as the API role does: on a fully migrated database, so the only thing wrong is the role
+    const expectRefusal = async (databaseUrl: string, secrets: string[]): Promise<void> => {
+        const server = await startServer({ DATABASE_URL: databaseUrl });
+
+        assert.equal(await waitForExit(server), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(allOutput(server), /rag_lab_api/, "it says which role to use");
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+
+        for (const secret of [databaseUrl, ...secrets]) {
+            assert.ok(!allOutput(server).includes(secret), "it never prints the URL or the password");
+        }
+    };
+
+    it("refuses to start when DATABASE_URL connects as the database owner, and says to use rag_lab_api", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+
+        const ownerUrl = process.env.RAG_LAB_TEST_DATABASE_URL;
+        assert.ok(ownerUrl, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
+        const ownerPassword = new URL(ownerUrl).password;
+        assert.ok(ownerPassword, "the owner's test URL has a password");
+
+        await expectRefusal(ownerUrl, [ownerPassword]);
+    });
+
+    it("refuses to start when the role can create databases", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("CREATEDB");
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    it("refuses to start when the role can create roles", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("CREATEROLE");
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    it("refuses to start when the role can create objects in the public schema", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("", [`GRANT CREATE ON SCHEMA public TO ${PROBE_ROLE}`]);
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    it("refuses to start when the role owns tables in the public schema", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("", [
+            "CREATE TABLE owned_by_the_probe_role (id integer)",
+            `ALTER TABLE owned_by_the_probe_role OWNER TO ${PROBE_ROLE}`
+        ]);
+
+        await expectRefusal(url, [new URL(url).password]);
+    });
+
+    // The control for the refusals above: a role with none of those rights is accepted, so they are refused for what
+    // they can do and not because they are not called rag_lab_api.
+    it("starts as a role without any of those rights, whatever its name", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const url = await createProbeRole("");
+        const server = await startServer({ DATABASE_URL: url });
+
+        await waitForOutput(server, "Server running");
+
+        // the role is dropped right after this test: end the server's connections to it first
+        server.child.kill();
+        await Promise.race([server.exited, sleep(5000)]);
+    });
+});
+
 // Only a database that cannot be reached is a reason to start anyway (the API reports it as down and recovers
 // when it comes back). A database that answers and says no, such as a wrong password or a missing database,
 // will not get better by itself: the server must stop and say what is wrong.
 describe("server startup: a database that answers with an error", () => {
     const testDatabaseUrl = (): URL => {
-        assert.ok(process.env.RAG_LAB_TEST_DATABASE_URL, "RAG_LAB_TEST_DATABASE_URL must be set to run the database tests");
-        return new URL(process.env.RAG_LAB_TEST_DATABASE_URL);
+        assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+        return new URL(process.env.RAG_LAB_TEST_API_DATABASE_URL);
     };
 
     const openSockets = new Set<Socket>();
