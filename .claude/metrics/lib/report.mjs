@@ -114,7 +114,8 @@ export const summarizeBucket = ({ calls, attributions, bucket, prices, costState
 };
 
 const number = (value) => value.toLocaleString("en-US");
-const money = (value) => `$${value.toFixed(2)}`;
+// prices.json is in US dollars; the currency is written out, so "$" is never read as another dollar or peso
+const money = (value) => `USD ${value.toFixed(2)}`;
 const percent = (value) => `${Math.round(value * 100)} %`;
 const shortId = (id) => String(id).slice(0, 8);
 const minute = (timestamp) => (timestamp ? timestamp.slice(0, 16).replace("T", " ") : "");

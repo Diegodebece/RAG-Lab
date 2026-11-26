@@ -17,7 +17,7 @@ The orchestrator writes the reports; the docs-keeper does not, because they meas
 - **Each call counts once.** Claude Code writes one row per content block of an answer, and some transcripts are copied into a second session (side questions, resumed sessions); calls are deduplicated by message id.
 - **Agent type:** from the agent's meta file, else from the agent's rows, else from the `Agent` call in the parent transcript.
 - **Loop:** a loop runs from `begin <branch>` to the merge of its branch. An agent belongs to the loop its first call fell in. The session that ran `begin` belongs to that loop. When two loops were open at once, the worktree the call ran in decides; otherwise the call is reported as ambiguous and is resolved by hand in `overrides.json`. Nothing is forced into a loop. The loops before the script existed were attributed by hand, from the orchestrator's tool calls and the merge commits.
-- **API-equivalent cost:** what the same tokens would cost on the Claude API, at the prices in `.claude/metrics/prices.json` (taken from the `claude-api` skill, prices of 2026-11-03). A subscription plan bills differently, so this is a measure for comparing loops, not a bill. Thinking tokens are part of the output and are not charged twice. A call the table cannot price (an unknown model, a rate that is missing, web searches) is never guessed: the report says the cost is incomplete and why.
+- **API-equivalent cost:** in US dollars (USD), what the same tokens would cost on the Claude API, at the prices in `.claude/metrics/prices.json` (taken from the `claude-api` skill, prices of 2026-11-03). A subscription plan bills differently, so this is a measure for comparing loops, not a bill. Thinking tokens are part of the output and are not charged twice. A call the table cannot price (an unknown model, a rate that is missing, web searches) is never guessed: the report says the cost is incomplete and why.
 - **Claude Code's own estimate:** Claude Code writes a running cost estimate into each session's transcript. The report compares it with its own figure for sessions that lie entirely inside the loop. The estimate can be older than the transcript's last call, and calls Claude Code makes for itself may appear in one and not the other, so a gap is reported, not corrected.
 - **Extra rounds** are launches of a role after its first in the same loop (for example the test-writer and the implementer after the audit).
 
@@ -28,9 +28,10 @@ The per-call records (`calls.jsonl`) and gzip copies of the transcripts are kept
 <!-- usage-summary:start -->
 | Loop | Started (UTC) | Calls | Output | Cache read | API-equivalent cost | Orchestrator share |
 |---|---|---|---|---|---|---|
-| `setup` | 2026-11-26 02:46 | 121 | 162,651 | 28,728,075 | $11.69 | 100 % |
-| #3 `feature/foundations` | 2026-11-26 04:18 | 420 | 608,291 | 52,572,006 | $24.03 | 39 % |
-| #1 `feature/hook-reference-folders` | 2026-11-26 04:52 | 29 | 22,353 | 4,821,896 | $1.75 | 100 % |
-| #2 `feature/hook-worktree-root` | 2026-11-26 05:04 | 15 | 12,126 | 2,317,831 | $0.87 | 90 % |
-| `feature/token-metrics` | 2026-11-26 15:31 | 133 | 224,926 | 31,498,322 | $14.68 | 83 % |
+| `setup` | 2026-11-26 02:46 | 121 | 162,651 | 28,728,075 | USD 11.69 | 100 % |
+| #3 `feature/foundations` | 2026-11-26 04:18 | 420 | 608,291 | 52,572,006 | USD 24.03 | 39 % |
+| #1 `feature/hook-reference-folders` | 2026-11-26 04:52 | 29 | 22,353 | 4,821,896 | USD 1.75 | 100 % |
+| #2 `feature/hook-worktree-root` | 2026-11-26 05:04 | 15 | 12,126 | 2,317,831 | USD 0.87 | 90 % |
+| #4 `feature/token-metrics` | 2026-11-26 15:31 | 150 | 236,838 | 38,744,062 | USD 16.57 | 85 % |
+| `feature/report-currency` | 2026-11-26 16:26 | 11 | 9,966 | 4,937,637 | USD 1.29 | 100 % |
 <!-- usage-summary:end -->
