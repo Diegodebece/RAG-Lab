@@ -145,14 +145,28 @@ const isReferencePath = (parts) => {
         return false;
     }
     if (parts.length === 1) {
-        return REFERENCE_FILES.has(parts[0]);
+        return REFERENCE_FILES.has(parts[0]) || REFERENCE_DIRECTORIES.has(parts[0]);
     }
     return REFERENCE_DIRECTORIES.has(parts[0]) || (parts[0] === ".claude" && REFERENCE_CLAUDE_DIRECTORIES.has(parts[1]));
 };
 
-// Where `target` is and whether the role may read it. `forSearch` is true for Grep and Glob paths: a search of
-// a whole root would read through the blocked files too, except in the data folder, which is readable entirely.
-const canRead = (policy, places, target, forSearch) => {
+// Whether a file with a secret name sits anywhere below `folder` (symbolic links are not followed, as in Grep).
+const hasSecretBelow = (folder) => {
+    let entries;
+    try {
+        entries = fs.readdirSync(folder, { withFileTypes: true });
+    } catch {
+        return false;
+    }
+    return entries.some((entry) => isSecretName(entry.name.toLowerCase())
+        || (entry.isDirectory() && hasSecretBelow(path.join(folder, entry.name))));
+};
+
+// Where `target` is and whether the role may read it. `search` is "Grep" or "Glob" for search paths, null for
+// Read: a search of a whole root would read through the blocked files too, except in the data folder, which is
+// readable entirely. In RAG Web, Grep reads file contents, so it may not search a folder that holds a secret
+// file (for example a cheatsheet in docs/); Glob only lists names.
+const canRead = (policy, places, target, search) => {
     const projectParts = partsBelow(places.project, target);
     const dataParts = partsBelow(places.data, target);
     const referenceParts = partsBelow(places.reference, target);
@@ -165,13 +179,13 @@ const canRead = (policy, places, target, forSearch) => {
         if (policy.read.includes("code")) {
             return isCodePath(projectParts);
         }
-        if (forSearch && projectParts.length === 0) {
+        if (search && projectParts.length === 0) {
             return false;
         }
         return policy.read.includes("project") && isReadableProjectPath(projectParts);
     }
     if (referenceParts !== null && policy.read.includes("reference")) {
-        return isReferencePath(referenceParts);
+        return isReferencePath(referenceParts) && !(search === "Grep" && hasSecretBelow(target));
     }
     return false;
 };
@@ -299,7 +313,7 @@ await runHook(async (input) => {
 
     if (toolName === "Read") {
         const filePath = String(toolInput.file_path ?? "");
-        if (!filePath || !canRead(policy, places, path.resolve(places.cwd, filePath), false)) {
+        if (!filePath || !canRead(policy, places, path.resolve(places.cwd, filePath), null)) {
             deny(`${prefix} Reading ${filePath || "that file"} is outside this agent's scope.`);
         }
         return;
@@ -308,8 +322,8 @@ await runHook(async (input) => {
     if (toolName === "Grep" || toolName === "Glob") {
         const searchPath = path.resolve(places.cwd, String(toolInput.path ?? "") || ".");
         const pattern = String((toolName === "Glob" ? toolInput.pattern : toolInput.glob) ?? "");
-        if (hasEscapingPattern(pattern) || !canRead(policy, places, searchPath, true)) {
-            deny(`${prefix} ${toolName} needs a "path" to a folder this agent may read (for example "src" or "docs"), and a pattern that stays inside it.`);
+        if (hasEscapingPattern(pattern) || !canRead(policy, places, searchPath, toolName)) {
+            deny(`${prefix} ${toolName} needs a "path" to a folder this agent may read (for example "src" or "docs"), with no private files below it for Grep, and a pattern that stays inside it.`);
         }
         return;
     }

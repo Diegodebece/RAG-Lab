@@ -32,6 +32,10 @@ before(() => {
     writeFiles(data, { "evaluation-100.json": "[]", ".env": "" });
     writeFiles(reference, {
         "src/v1/services/questions.service.ts": "",
+        "test/routes/auth.test.ts": "",
+        "migrations/001_init.sql": "",
+        "scripts/create-app-role.sql": "",
+        "docs/guides/setup.md": "",
         ".claude/skills/layered-express-service/SKILL.md": "",
         "CLAUDE.md": "",
         ".env": "SECRET=1",
@@ -128,6 +132,25 @@ describe("agent-scope: read-only roles", () => {
         assert.equal(read("planner", path.join(reference, "docs/git-cheatsheet.txt")), "deny");
         assert.equal(read("planner", path.join(reference, "audit-report-2026-10-17.md")), "deny");
         assert.equal(read("planner", path.join(data, "evaluation-100.json")), "deny");
+    });
+
+    test("planner searches RAG Web's top-level code folders, but never through its private files", () => {
+        const search = (role, toolName, folder) =>
+            call(role, toolName, { pattern: toolName === "Glob" ? "**/*" : "x", path: path.join(reference, folder) });
+        for (const folder of ["src", "test", "migrations", "scripts"]) {
+            assert.equal(search("planner", "Grep", folder), "allow", `Grep ${folder}`);
+            assert.equal(search("planner", "Glob", folder), "allow", `Glob ${folder}`);
+        }
+        // docs/ holds git-cheatsheet.txt: listing its names is fine, reading through its contents is not
+        assert.equal(search("planner", "Glob", "docs"), "allow");
+        assert.equal(search("planner", "Grep", "docs"), "deny");
+        assert.equal(search("planner", "Grep", "docs/guides"), "allow");
+        assert.equal(search("planner", "Grep", ".claude/skills"), "allow");
+        assert.equal(search("planner", "Grep", "."), "deny");
+        assert.equal(search("planner", "Glob", "."), "deny");
+        assert.equal(search("planner", "Glob", "RAG project"), "deny");
+        assert.equal(search("planner", "Glob", ".claude"), "deny");
+        assert.equal(search("analyst", "Grep", "src"), "deny");
     });
 
     test("analyst reads the private data folder", () => {
