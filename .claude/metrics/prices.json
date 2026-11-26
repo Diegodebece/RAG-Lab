@@ -1,0 +1,19 @@
+{
+    "unit": "USD per million tokens",
+    "source": "Claude API first-party prices, from Claude Code's claude-api skill (its model table and migration guide). Fast mode is listed only as input and output; its cache rates are not published there, so a fast call with cache tokens is marked incomplete.",
+    "pricesAsOf": "2026-11-03",
+    "checkedOn": "2026-11-26",
+    "models": {
+        "claude-opus-5-5": {
+            "standard": { "input": 4, "output": 20, "cacheWrite5m": 5, "cacheWrite1h": 8, "cacheRead": 0.2 },
+            "fast": { "input": 8, "output": 40 }
+        },
+        "claude-sonnet-5-5": {
+            "standard": { "input": 2, "output": 10, "cacheWrite5m": 2.5, "cacheWrite1h": 4, "cacheRead": 0.1 }
+        },
+        "claude-haiku-5-5": {
+            "standard": { "input": 0.1, "output": 0.5, "cacheWrite5m": 0.125, "cacheWrite1h": 0.2, "cacheRead": 0.01 },
+            "longPrompt": { "above": 100000, "input": 0.5, "output": 2.5, "cacheWrite5m": 0.625, "cacheWrite1h": 1, "cacheRead": 0.05 }
+        }
+    }
+}

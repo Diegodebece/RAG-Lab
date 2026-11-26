@@ -166,7 +166,8 @@ Hooks enforce these limits, not prompts.
   - only the code (`src/`, `test/`, `migrations/`, `node_modules/`, root config files) for the two auditors and the
     finding-verifier, so they judge the code and not the author's notes;
   - RAG Web's code, tests, docs and skills (`RAG_WEB_DIR`) for planner, test-writer, implementer and docs-keeper;
-  - the private data folder (`RAG_LAB_DATA_DIR`) for experiment-runner, lab-reporter and analyst.
+  - the private data folder (`RAG_LAB_DATA_DIR`) for experiment-runner, lab-reporter and analyst, except its
+    `usage\` subfolder (changed 2026-11-26: the process-metrics records, section 14, are the orchestrator's).
 
   Both paths come from the environment or from the main checkout's `.env`. Worktrees have no `.env`, so set
   them as user environment variables too.
@@ -189,6 +190,17 @@ Hooks enforce these limits, not prompts.
 - The lab notebook is append-only in the hook: edits may insert but never remove text, and a rewrite must keep
   the old content as its beginning. `leaderboard.md` is the only file that can be reordered.
 - No agent can edit `.claude/agents/`, `.claude/hooks/`, `.claude/settings*.json`, `CLAUDE.md` or `package.json`.
+- Process metrics (2026-11-26, approved by the owner): `.claude/metrics/` (the usage script, its tests and its price
+  table, section 14) is out of the agents' reach like the hooks; no role writes it. The docs-keeper may not write
+  `docs/process/` (the orchestrator writes those reports). No role may Grep the root of the data folder (a Grep
+  there also read the data folder's `.env`, a gap found while testing), nor Glob it, because a Glob there lists the
+  names of the transcript copies (Glob added by the orchestrator after the independent review, without asking the
+  owner).
+- Path components (decided 2026-11-26 by the orchestrator after the independent review, without asking the owner;
+  the owner can reverse it): Windows reads `name.`, `name ` and `name::$INDEX_ALLOCATION` as the same folder as
+  `name`, so the hook strips trailing dots and spaces from each path component before comparing, and denies a
+  component with a colon (an alternate data stream, such as `.env::$DATA`). This also tightens the older rules
+  (`.env`, the lab notebook).
 - Two project-wide hooks (`.claude/settings.json`) apply to every session and agent:
   - `guard-github.mjs` blocks pushes to `main`/`master` (also a plain `git push` while on main or tracking main),
     force-pushes, remote branch deletion, `gh pr merge`, repository edits, git and gh aliases, config that
@@ -215,7 +227,9 @@ docs-keeper → 🔒 owner reviews the PR and merges.
 models, prompts, thresholds), any download (models, images), Docker, and merges.
 
 Constraints: one GPU, so experiments run one at a time in the background; orchestration uses a lot of plan usage,
-so one loop runs at a time and its cost is watched.
+so one loop runs at a time so that costs do not run away (confirmed by the owner 2026-11-26), and its cost is
+measured (section 14). Each loop gets a fresh orchestrator session. In layer 1 the rule did not hold (pull requests
+#1 and #2 overlapped it), which is why the attribution of usage handles overlaps.
 
 ## 9. GitHub
 
@@ -288,6 +302,11 @@ Added with layer 1 (2026-11-26), once the code exists; the exact commands are in
 9. Set `RAG_LAB_TEST_DATABASE_URL` as a Windows user environment variable too (worktrees have no `.env`).
 10. `npm install`, then `npm run migrate`.
 
+Added with the process metrics (2026-11-26):
+
+11. In the owner's `~/.claude/settings.json`, set `cleanupPeriodDays` to 365 (done). Claude Code deletes older
+    transcripts, which are the source of the usage numbers; the script also keeps gzip copies (section 14).
+
 Then the orchestrator prepares, for review before the first commit: `.gitignore` (private data first),
 `CLAUDE.md`, the layered-express skills, the agent definitions and their hooks. Prepared on 2026-11-26, pending
 the owner's review.
@@ -335,3 +354,37 @@ goes through the experiment loop once the layers before it exist.
 | 11 | Live events (SSE) | And the API contract freeze |
 | 12+ | Retrieval improvements | Through the experiment loop |
 | 13 | Deployment and hosting | Docker for the API, tunnel, image and model digests |
+
+## 14. Process metrics
+
+Added 2026-11-26, approved by the owner. How much the AI team uses and costs, per loop (pull request), so loops can
+be compared and the owner can see where the usage goes. This measures the development agents, not the application's
+token accounting (section 5).
+
+- **Tool:** `.claude/metrics/usage-report.mjs`, with no dependencies and with tests (`node --test
+  .claude/metrics/tests/`). Commands: `begin`, `collect`, `windows`, `report`, `summary`. The orchestrator runs it;
+  no role writes it or reads its records. The invisible-character test scans `.claude/metrics/` too.
+- **Source:** the Claude Code transcripts of this project (sessions and their agents). The totals in an agent's
+  completion notification do not match the transcripts, so the transcripts are the source. Only numbers and names
+  are read: model, token counts, time, session, agent type and description, working folder.
+- **Deduplication:** each model call counts once, by message id. One answer is written as one row per content
+  block, and side or resumed sessions copy their parent's history.
+- **Attribution:** a loop runs from `begin <branch>` to the merge of its branch (merges read from `main` and
+  `origin/main`). The session that ran `begin` belongs to that loop; an agent belongs to the loop its first call fell
+  in. When two loops overlap, the worktree decides; otherwise the call is "ambiguous" and is resolved by hand in
+  `overrides.json`. Nothing is forced. Layer 1, pull requests #1 and #2 and the setup committed straight to `main`
+  were attributed by hand from the orchestrator's tool calls and the merge commits (the owner confirmed the windows).
+- **Cost:** "API-equivalent cost", what the tokens would cost on the Claude API, from `.claude/metrics/prices.json`
+  (taken from the `claude-api` skill, prices of 2026-11-03). A subscription plan bills differently, so it is a
+  measure for comparing loops, not a bill. Thinking tokens are inside the output and are not charged twice. A price
+  that cannot be computed is never guessed; the report says it is incomplete. Claude Code's own running estimate is
+  shown for comparison only.
+- **Storage:** per-call records, begin markers, manual overrides, Claude Code's estimates and gzip copies of the
+  transcripts live in `RAG_LAB_DATA_DIR\usage\`, never in the repository (`.gitignore` ignores `*.jsonl` and
+  `*.jsonl.gz`). The copies keep the data after Claude Code cleans old transcripts.
+- **Reports:** one per pull request in `docs/process/NN-<name>.md` and in the pull request body: decisions the AI took
+  without asking, plan against what was done, findings funnel, test quality, rework, and the generated usage part.
+  Reports never show message text, paths, user folders, session titles or full session ids; an agent description that
+  names a path is hidden whole. How the numbers are made: `docs/process/README.md`.
+- **Planned, not built:** a chart of usage across loops once two or three layers have data; Stryker mutation testing
+  later (a new dependency, so it needs the owner's approval).

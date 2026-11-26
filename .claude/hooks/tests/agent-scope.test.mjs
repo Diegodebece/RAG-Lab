@@ -36,7 +36,14 @@ before(() => {
         ".claude/worktrees/feature-a/.env.local": "SECRET=1",
         ".claude/worktrees/feature-b/test/app.test.ts": ""
     });
-    writeFiles(data, { "evaluation-100.json": "[]", ".env": "" });
+    writeFiles(data, {
+        "evaluation-100.json": "[]",
+        ".env": "",
+        "results/run-1.json": "{}",
+        // the process metrics: calls of every agent and copies of whole conversations
+        "usage/calls.jsonl": "",
+        "usage/transcripts/s1.jsonl.gz": ""
+    });
     writeFiles(reference, {
         "src/v1/services/questions.service.ts": "",
         "test/routes/auth.test.ts": "",
@@ -166,6 +173,38 @@ describe("agent-scope: read-only roles", () => {
         assert.equal(read("analyst", path.join(reference, "CLAUDE.md")), "deny");
     });
 
+    for (const role of ["experiment-runner", "lab-reporter", "analyst"]) {
+        test(`${role} never reads the process metrics in the data folder`, () => {
+            const search = (toolName, folder) =>
+                call(role, toolName, { pattern: toolName === "Glob" ? "**/*" : "x", path: path.join(data, folder) });
+            assert.equal(read(role, path.join(data, "usage", "calls.jsonl")), "deny");
+            assert.equal(read(role, path.join(data, "Usage", "transcripts", "s1.jsonl.gz")), "deny");
+            assert.equal(read(role, path.join(data, "results", "run-1.json")), "allow");
+            assert.equal(search("Grep", "usage"), "deny");
+            assert.equal(search("Glob", "usage"), "deny");
+            // a search of the whole data folder would read through usage/ (Grep) or list its files (Glob)
+            assert.equal(search("Grep", "."), "deny");
+            assert.equal(search("Glob", "."), "deny");
+            assert.equal(search("Grep", "results"), "allow");
+            assert.equal(search("Glob", "results"), "allow");
+        });
+    }
+
+    test("Windows' other names for a folder do not get around the rules", () => {
+        // Windows reads "usage.", "usage " and "usage::$INDEX_ALLOCATION" as the folder usage
+        for (const folder of ["usage.", "usage ", "usage::$INDEX_ALLOCATION"]) {
+            assert.equal(read("analyst", path.join(data, folder, "calls.jsonl")), "deny", folder);
+            assert.equal(call("analyst", "Grep", { pattern: "x", path: path.join(data, folder) }), "deny", folder);
+        }
+        for (const folder of ["process.", "process ", "process::$INDEX_ALLOCATION"]) {
+            assert.equal(write("docs-keeper", `docs/${folder}/README.md`), "deny", folder);
+        }
+        // the older rules hold too: an alternate data stream of .env, and the lab notebook
+        assert.equal(read("planner", ".env::$DATA"), "deny");
+        assert.equal(write("docs-keeper", "docs/experiments./leaderboard.md"), "deny");
+        assert.equal(read("analyst", path.join(data, "results", "run-1.json")), "allow");
+    });
+
     test("an environment variable takes precedence over .env", () => {
         const other = path.join(base, "other-data");
         assert.equal(call("analyst", "Read", { file_path: path.join(other, "a.json") }, { RAG_LAB_DATA_DIR: other }), "allow");
@@ -199,7 +238,10 @@ describe("agent-scope: searches", () => {
         assert.equal(call("planner", "Grep", { pattern: "x", path: "." }), "deny");
         assert.equal(call("planner", "Glob", { pattern: "../**", path: "src" }), "deny");
         assert.equal(call("planner", "Grep", { pattern: "x", path: "src", glob: "../../**" }), "deny");
-        assert.equal(call("analyst", "Grep", { pattern: "x", path: data }), "allow");
+        // a search of the whole data folder would read through usage/ and its .env, or list usage/'s files
+        assert.equal(call("analyst", "Grep", { pattern: "x", path: data }), "deny");
+        assert.equal(call("analyst", "Glob", { pattern: "**/*", path: data }), "deny");
+        assert.equal(call("analyst", "Grep", { pattern: "x", path: path.join(data, "results") }), "allow");
     });
 });
 
@@ -374,6 +416,13 @@ describe("agent-scope: docs-keeper", () => {
         assert.equal(write("docs-keeper", "README.md"), "allow");
         assert.equal(write("docs-keeper", ".env.example"), "allow");
         assert.equal(write("docs-keeper", ".claude/skills/layered-express-service/SKILL.md"), "allow");
+    });
+
+    test("does not touch the process reports, which measure the agents' own work", () => {
+        assert.equal(write("docs-keeper", "docs/process/03-foundations.md"), "deny");
+        assert.equal(write("docs-keeper", "docs/Process/README.md"), "deny");
+        assert.equal(edit("docs-keeper", "docs/process/README.md", "a", "b"), "deny");
+        assert.equal(read("docs-keeper", "docs/process/README.md"), "allow");
     });
 
     test("does not touch the lab notebook, code or tests", () => {

@@ -10,6 +10,10 @@ evaluation*.json
 *.docx
 *.txt
 !/docs/**/*.txt
+# Claude Code transcripts and the usage records made from them (RAG_LAB_DATA_DIR/usage); the metrics tests
+# build theirs in a temporary folder
+*.jsonl
+*.jsonl.gz
 # RAG1 copy, if one is ever placed here as a reference
 RAG project/
 

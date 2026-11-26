@@ -50,7 +50,7 @@ const findInvisibleCharacters = (text: string): Finding[] => {
 const ROOT = path.join(import.meta.dirname, "..", "..");
 
 // folders scanned from top to bottom
-const FOLDERS = ["src", "test", "migrations", "docs", ".claude/skills"];
+const FOLDERS = ["src", "test", "migrations", "docs", ".claude/skills", ".claude/metrics"];
 const SKIPPED_FOLDERS = new Set(["node_modules", "dist", ".git"]);
 
 // Every file this check covers, as paths relative to the project root with forward slashes.
