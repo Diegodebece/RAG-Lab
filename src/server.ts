@@ -3,6 +3,7 @@ import { closePoolGracefully, closeServerGracefully } from "./shutdown.js";
 import { pool } from "./v1/config/db.config.js";
 import { getStartupConfigProblems } from "./v1/config/env.config.js";
 import { HOST, PORT } from "./v1/config/server.config.js";
+import { getDatabaseRoleProblemsService } from "./v1/services/databaseRole.service.js";
 import { getMigrationStateService } from "./v1/services/schema.service.js";
 import { isDatabaseUnreachableError } from "./v1/utils/databaseError.util.js";
 
@@ -36,6 +37,19 @@ const checkDatabaseSchema = async (): Promise<void> => {
 
         console.warn("Warning: the database cannot be reached; the API starts and GET /v1/health reports it as down");
         return;
+    }
+
+    // The API runs with the least rights it needs: the role rag_lab_api. A connection that can change the schema, create
+    // roles or databases, or own the tables is the owner's, and it must not be the API's. The message names the role
+    // to use and never the URL, which has the password in it.
+    const roleProblems = await getDatabaseRoleProblemsService();
+
+    if (roleProblems.length > 0) {
+        console.error(
+            `Cannot start the server: DATABASE_URL must connect as the role rag_lab_api, which has no rights beyond reading and changing rows:\n- ${roleProblems.join("\n- ")}\n`
+            + "Create the role with scripts/create-api-role.sql and apply the migrations (see the README)."
+        );
+        process.exit(1);
     }
 
     const { pending, unknown, foreignTables } = await getMigrationStateService();

@@ -1,17 +1,14 @@
 import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import type { Pool } from "pg";
 import { createPool, withTransaction } from "./v1/config/db.config.js";
 import { getMigrationStateService, MIGRATIONS_DIR } from "./v1/services/schema.service.js";
-
-// This script has its own pool, without the API's query timeout (db.config.ts): a migration can take longer than
-// any query the API runs, and waiting for the advisory lock below lasts as long as another process takes to migrate.
-const migrationPool = createPool();
 
 // Any number works; it only has to be the same for every process that runs migrations.
 const MIGRATIONS_LOCK_ID = 72617001;
 
-const applyPendingMigrations = async (): Promise<void> => {
+const applyPendingMigrations = async (migrationPool: Pool): Promise<void> => {
     const { pending, unknown, foreignTables } = await getMigrationStateService(migrationPool);
 
     // Tables but no schema_migrations: this project's migrations never ran here, so the tables belong to something
@@ -22,7 +19,7 @@ const applyPendingMigrations = async (): Promise<void> => {
 
         throw new Error(
             `The database looks like another project's: it has tables (${shown}${more}) but no schema_migrations table. `
-            + "Nothing was applied. Check that DATABASE_URL points at the right database."
+            + "Nothing was applied. Check that MIGRATION_DATABASE_URL points at the right database."
         );
     }
 
@@ -31,7 +28,7 @@ const applyPendingMigrations = async (): Promise<void> => {
     if (unknown.length > 0) {
         throw new Error(
             `The database has applied migrations this checkout does not have: ${unknown.join(", ")}. `
-            + "Nothing was applied. Check that DATABASE_URL points at the right database."
+            + "Nothing was applied. Check that MIGRATION_DATABASE_URL points at the right database."
         );
     }
 
@@ -65,14 +62,14 @@ const applyPendingMigrations = async (): Promise<void> => {
 };
 
 // A session-level advisory lock: a second process that runs migrations at the same time waits here.
-const migrate = async (): Promise<void> => {
+const migrate = async (migrationPool: Pool): Promise<void> => {
     const lockClient = await migrationPool.connect();
 
     try {
         await lockClient.query("SELECT pg_advisory_lock($1)", [MIGRATIONS_LOCK_ID]);
 
         try {
-            await applyPendingMigrations();
+            await applyPendingMigrations(migrationPool);
         } finally {
             await lockClient.query("SELECT pg_advisory_unlock($1)", [MIGRATIONS_LOCK_ID]);
         }
@@ -81,11 +78,25 @@ const migrate = async (): Promise<void> => {
     }
 };
 
-try {
-    await migrate();
-} catch (error) {
-    console.error(error);
+// The schema is changed as the database's owner, with a connection of its own: MIGRATION_DATABASE_URL. DATABASE_URL
+// is the API's, a role that cannot change the schema, and it is never used as a fallback: that would run the
+// migrations with the wrong rights or, with a URL copied from another setup, against the wrong database.
+const migrationUrl = process.env.MIGRATION_DATABASE_URL;
+
+if (!migrationUrl) {
+    console.error("MIGRATION_DATABASE_URL is not set: it is the owner's connection to the database, used only to apply migrations (see .env.example). Nothing was applied.");
     process.exitCode = 1;
-} finally {
-    await migrationPool.end();
+} else {
+    // This script has its own pool, without the API's query timeout (db.config.ts): a migration can take longer than
+    // any query the API runs, and waiting for the advisory lock below lasts as long as another process takes to migrate.
+    const migrationPool = createPool({ connectionString: migrationUrl });
+
+    try {
+        await migrate(migrationPool);
+    } catch (error) {
+        console.error(error);
+        process.exitCode = 1;
+    } finally {
+        await migrationPool.end();
+    }
 }

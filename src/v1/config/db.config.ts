@@ -1,10 +1,12 @@
 import pg from "pg";
 import type { Pool, PoolClient } from "pg";
 
-const connectionString = process.env.DATABASE_URL;
+// The API's own connection, made with the rag_lab_api role: it reads and changes rows and nothing else (see
+// migrations/002_api_role.sql). The migration script connects with MIGRATION_DATABASE_URL instead, as the owner.
+const apiConnectionString = process.env.DATABASE_URL;
 
 // fail at startup instead of on the first request
-if (!connectionString) {
+if (!apiConnectionString) {
     throw new Error("DATABASE_URL is not set");
 }
 
@@ -14,6 +16,8 @@ if (!connectionString) {
 const API_QUERY_TIMEOUT_MS = 30_000;
 
 interface PoolOptions {
+    // the database to connect to; the API's DATABASE_URL when missing
+    connectionString?: string;
     // gives up on a query that takes longer than this (milliseconds); no limit when missing
     queryTimeoutMs?: number;
 }
@@ -21,7 +25,7 @@ interface PoolOptions {
 // A pool keeps a few connections open and lends one to each query.
 // Without a connection timeout, a query waits forever when PostgreSQL is down instead of failing.
 // keepAlive makes the operating system probe an idle connection, so a connection that died silently is noticed.
-export const createPool = ({ queryTimeoutMs }: PoolOptions = {}): Pool => {
+export const createPool = ({ connectionString = apiConnectionString, queryTimeoutMs }: PoolOptions = {}): Pool => {
     const newPool = new pg.Pool({
         connectionString,
         connectionTimeoutMillis: 5000,
@@ -39,7 +43,8 @@ export const createPool = ({ queryTimeoutMs }: PoolOptions = {}): Pool => {
     return newPool;
 };
 
-// One pool for the whole process (the migration script makes its own, without the query timeout).
+// One pool for the whole process, as the API role (the migration script makes its own, as the owner and without the
+// query timeout).
 export const pool = createPool({ queryTimeoutMs: API_QUERY_TIMEOUT_MS });
 
 // Runs every query of the callback on one connection, inside one transaction:

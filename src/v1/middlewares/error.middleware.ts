@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from "express";
 import { AppError } from "../utils/appError.util.js";
+import { isDatabaseUnreachableError } from "../utils/databaseError.util.js";
 
 // Errors raised by libraries for bad client input carry a 4xx status: malformed JSON from body-parser, or a path
 // parameter the router cannot decode (a URIError). The status is the answer; the message is shown only when the
@@ -33,5 +34,12 @@ export const errorMiddleware = (err: unknown, req: Request, res: Response, next:
     }
 
     console.error(err);
+
+    // A database that cannot be reached is the server's problem and may pass: the client is told to try again, and
+    // nothing about the connection (the address, the driver's message) leaves the server.
+    if (isDatabaseUnreachableError(err)) {
+        return res.status(503).json({ message: "The database is not available, please try again later" });
+    }
+
     return res.status(500).json({ message: "Internal server error" });
 };
