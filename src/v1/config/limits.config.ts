@@ -48,6 +48,37 @@ export const USER_CREATION_WINDOW_MS = HOUR_MS;
 // at both ends
 export const MAX_PROFILES_PER_USER = readIntegerSetting("MAX_PROFILES_PER_USER", 20, 1, 1000);
 
+// Documents and indexes (layer 4). Each setting has a top as well as a bottom: it caps what one user, or the whole server,
+// may consume, and a cap of a billion would be no cap at all.
+
+// documents one user may keep; none is deleted automatically, the user deletes one to upload another
+export const MAX_DOCUMENTS_PER_USER = readIntegerSetting("MAX_DOCUMENTS_PER_USER", 3, 1, 1000);
+
+// the longest text of one document, in characters (UTF-16 code units, the length of a JavaScript string)
+export const MAX_DOCUMENT_CHARACTERS = readIntegerSetting("MAX_DOCUMENT_CHARACTERS", 1_000_000, 1, 5_000_000);
+
+// document uploads per user per minute
+export const UPLOAD_REQUESTS_PER_MINUTE = readIntegerSetting("UPLOAD_REQUESTS_PER_MINUTE", 5, 1, 1000);
+
+export const UPLOAD_WINDOW_MS = MINUTE_MS;
+
+// index builds one user may have waiting or running at once
+export const MAX_ACTIVE_INDEX_BUILDS_PER_USER = readIntegerSetting("MAX_ACTIVE_INDEX_BUILDS_PER_USER", 1, 1, 100);
+
+// index builds waiting in the queue, every user together; over it the API answers 503
+export const MAX_QUEUED_INDEX_BUILDS = readIntegerSetting("MAX_QUEUED_INDEX_BUILDS", 20, 1, 1000);
+
+// index builds one user may have accepted in the last 24 hours (a deleted document does not give its builds back)
+export const MAX_INDEX_BUILDS_PER_DAY = readIntegerSetting("MAX_INDEX_BUILDS_PER_DAY", 6, 1, 1000);
+
+// index builds accepted from every user together in the last 24 hours
+export const MAX_INDEX_BUILDS_PER_DAY_TOTAL = readIntegerSetting("MAX_INDEX_BUILDS_PER_DAY_TOTAL", 100, 1, 10_000);
+
+// The body limit of the upload route, in bytes: a text of the longest length takes up to 3 bytes a character in UTF-8 (the
+// emoji, which takes 4 bytes, is two characters of the count), and the body also holds the filename and the JSON around
+// the text: 16 kB is the room for those. It follows MAX_DOCUMENT_CHARACTERS and is not a setting of its own.
+export const DOCUMENT_BODY_LIMIT = 3 * MAX_DOCUMENT_CHARACTERS + 16 * 1024;
+
 // health checks per client address per minute; the endpoint is public
 export const HEALTH_CHECKS_PER_MINUTE = readIntegerSetting("HEALTH_CHECKS_PER_MINUTE", 30);
 

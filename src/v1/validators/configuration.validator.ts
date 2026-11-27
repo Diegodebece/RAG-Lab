@@ -17,7 +17,7 @@ export interface ResolveConfigurationInput {
 // rounded to 0.31. A value is never rounded or clamped by the API (it is refused instead); JSON numbers beyond double
 // precision are already rounded by JSON.parse before they get here, which no schema can see. Every message names the
 // setting by its label and never repeats the value it was given; only an unknown key is repeated, cut to 64 characters.
-const ruleFor = (key: SettingKey) => {
+export const settingRuleFor = (key: SettingKey) => {
     const cap = SETTING_CAPS[key];
     const label = cap.label;
 
@@ -109,12 +109,12 @@ const objectMessages = {
 // each (including __proto__, constructor and prototype). convert is on for the object itself, so the check above runs;
 // the rules of each setting turn it off for their own value, so nothing else is converted.
 export const settingsSchema = SettingsJoi.object<SettingsInput>(
-    Object.fromEntries(SETTING_KEYS.map((key) => [key, ruleFor(key)]))
+    Object.fromEntries(SETTING_KEYS.map((key) => [key, settingRuleFor(key)]))
 ).prefs({ convert: true }).messages(objectMessages).error(describeUnknownKeys);
 
 // the settings of a resolved configuration: all eleven
 export const completeSettingsSchema = SettingsJoi.object<ConfigurationSettings>(
-    Object.fromEntries(SETTING_KEYS.map((key) => [key, ruleFor(key).required().messages({ "any.required": `${SETTING_CAPS[key].label} is required` })]))
+    Object.fromEntries(SETTING_KEYS.map((key) => [key, settingRuleFor(key).required().messages({ "any.required": `${SETTING_CAPS[key].label} is required` })]))
 ).prefs({ convert: true }).messages(objectMessages).error(describeUnknownKeys);
 
 // the plain hyphenated UUID of any version and case: the rule of isUuid, so the id is never valid to this schema and

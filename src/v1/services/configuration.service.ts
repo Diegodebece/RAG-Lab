@@ -1,7 +1,15 @@
 import type { Pool } from "pg";
 import { pool } from "../config/db.config.js";
 import { CONFIGURATION_VERSION, PROFILE_NAME_MAX_LENGTH, SETTING_CAPS, SETTING_KEYS } from "../config/configuration.config.js";
-import { MAX_PROFILES_PER_USER } from "../config/limits.config.js";
+import { FILENAME_MAX_LENGTH } from "../config/indexing.config.js";
+import {
+    MAX_ACTIVE_INDEX_BUILDS_PER_USER,
+    MAX_DOCUMENT_CHARACTERS,
+    MAX_DOCUMENTS_PER_USER,
+    MAX_INDEX_BUILDS_PER_DAY,
+    MAX_INDEX_BUILDS_PER_DAY_TOTAL,
+    MAX_PROFILES_PER_USER
+} from "../config/limits.config.js";
 import type { ConfigurationSettings, ConfigurationView, ResolvedConfiguration, SettingDefinition } from "../types/configuration.type.js";
 import { AppError } from "../utils/appError.util.js";
 import { freezeSnapshot, hashSnapshotText, toCanonicalJson } from "../utils/configurationSnapshot.util.js";
@@ -66,7 +74,13 @@ export const getConfigurationService = async (): Promise<ConfigurationView> => {
         version: CONFIGURATION_VERSION,
         defaults: defaults.settings,
         settings,
-        profiles: { maxPerUser: MAX_PROFILES_PER_USER, maxNameLength: PROFILE_NAME_MAX_LENGTH }
+        profiles: { maxPerUser: MAX_PROFILES_PER_USER, maxNameLength: PROFILE_NAME_MAX_LENGTH },
+        documents: { maxPerUser: MAX_DOCUMENTS_PER_USER, maxCharacters: MAX_DOCUMENT_CHARACTERS, maxFilenameLength: FILENAME_MAX_LENGTH },
+        indexes: {
+            maxActivePerUser: MAX_ACTIVE_INDEX_BUILDS_PER_USER,
+            maxBuildsPerDay: MAX_INDEX_BUILDS_PER_DAY,
+            maxBuildsPerDayTotal: MAX_INDEX_BUILDS_PER_DAY_TOTAL
+        }
     };
 };
 

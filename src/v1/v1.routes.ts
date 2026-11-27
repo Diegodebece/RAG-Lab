@@ -6,6 +6,7 @@ import { databaseReadyMiddleware } from "./middlewares/databaseReady.middleware.
 import { rateLimitMiddleware } from "./middlewares/rateLimit.middleware.js";
 import { authProtectedRouter, authRouter } from "./routes/auth.routes.js";
 import { configurationRouter } from "./routes/configuration.routes.js";
+import { documentsRouter } from "./routes/documents.routes.js";
 import { healthRouter } from "./routes/health.routes.js";
 import { profilesRouter } from "./routes/profiles.routes.js";
 import { usersRouter } from "./routes/users.routes.js";
@@ -38,3 +39,4 @@ v1Router.use("/auth", authProtectedRouter);
 v1Router.use("/users", usersRouter);
 v1Router.use("/configuration", configurationRouter);
 v1Router.use("/profiles", profilesRouter);
+v1Router.use("/documents", documentsRouter);
