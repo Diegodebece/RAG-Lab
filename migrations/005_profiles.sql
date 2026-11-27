@@ -11,6 +11,11 @@ CREATE TABLE profiles (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- the default privileges of 002 grant UPDATE on every column; the API must never change the owner of a profile, its id or
+-- its creation time, so it may update only the columns the service changes
+REVOKE UPDATE ON profiles FROM rag_lab_api;
+GRANT UPDATE (name, settings, version, updated_at) ON profiles TO rag_lab_api;
+
 -- one name per user, whatever its capitalization; the index also serves the lookups by user (the foreign key's column
 -- is its first one)
 CREATE UNIQUE INDEX profiles_user_id_name_unique ON profiles (user_id, lower(name));

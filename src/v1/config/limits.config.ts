@@ -44,8 +44,9 @@ export const USER_CREATIONS_PER_HOUR = readIntegerSetting("USER_CREATIONS_PER_HO
 
 export const USER_CREATION_WINDOW_MS = HOUR_MS;
 
-// profiles one user may keep: each one is a row the user can fill with settings, so the number is capped
-export const MAX_PROFILES_PER_USER = readIntegerSetting("MAX_PROFILES_PER_USER", 20);
+// profiles one user may keep, from 1 to 1000: each one is a row the user can fill with settings, so the number is capped
+// at both ends
+export const MAX_PROFILES_PER_USER = readIntegerSetting("MAX_PROFILES_PER_USER", 20, 1, 1000);
 
 // health checks per client address per minute; the endpoint is public
 export const HEALTH_CHECKS_PER_MINUTE = readIntegerSetting("HEALTH_CHECKS_PER_MINUTE", 30);

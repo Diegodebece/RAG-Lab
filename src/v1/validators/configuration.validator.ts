@@ -1,6 +1,8 @@
 import Joi from "joi";
 import { SETTING_CAPS, SETTING_KEYS } from "../config/configuration.config.js";
 import type { ConfigurationSettings, SettingKey } from "../types/configuration.type.js";
+import { unknownSettingMessage } from "../utils/unknownSetting.util.js";
+import { UUID_PATTERN } from "../utils/uuid.util.js";
 
 // settings a user chose: any of the eleven, none required
 export type SettingsInput = Partial<ConfigurationSettings>;
@@ -11,8 +13,10 @@ export interface ResolveConfigurationInput {
 }
 
 // One definition of each setting's rule, built from its cap, so the caps are written once (configuration.config.ts) and
-// every schema agrees with them. Nothing is converted (a number written as text is refused, 0.305 is refused and not
-// rounded to 0.31), and every message names the setting by its label and never repeats the value it was given.
+// every schema agrees with them. Nothing is converted: a number written as text is refused, and 0.305 is refused and not
+// rounded to 0.31. A value is never rounded or clamped by the API (it is refused instead); JSON numbers beyond double
+// precision are already rounded by JSON.parse before they get here, which no schema can see. Every message names the
+// setting by its label and never repeats the value it was given; only an unknown key is repeated, cut to 64 characters.
 const ruleFor = (key: SettingKey) => {
     const cap = SETTING_CAPS[key];
     const label = cap.label;
@@ -47,8 +51,13 @@ const ruleFor = (key: SettingKey) => {
 
 // Joi copies an object before it validates it, and the copy cannot hold an own key called "__proto__": it is dropped
 // without a trace, so the schema would accept it. This object type looks at the object as it arrived, before Joi copies
-// it, and refuses that key like any other key that is not a setting. It also refuses a value that is not an object
-// here, so the text of an object ("{}") is never parsed into one (Joi's object type does that when it converts).
+// it, and gives that key another name (a stand-in that is not a setting), so Joi refuses it like any other unknown key
+// and still validates the rest of the object: the problems of one object are all reported, none hides another. The
+// error function below puts the real name back. It also refuses a value that is not an object here, so the text of an
+// object ("{}") is never parsed into one (Joi's object type does that when it converts).
+const PROTO_KEY = "__proto__";
+const PROTO_KEY_STAND_IN = "\u0000renamed-__proto__";
+
 const SettingsJoi: Joi.Root = Joi.extend((joi: Joi.Root) => ({
     type: "object",
     base: joi.object(),
@@ -61,19 +70,39 @@ const SettingsJoi: Joi.Root = Joi.extend((joi: Joi.Root) => ({
             return { value, errors: helpers.error("object.base") };
         }
 
-        if (Object.hasOwn(value, "__proto__")) {
-            // localize puts the key in the error's path, as Joi does for the other unknown keys
-            const state = helpers.state.localize?.([...(helpers.state.path ?? []), "__proto__"], []);
-            return { value, errors: helpers.error("object.unknown", { child: "__proto__" }, state) };
+        if (Object.hasOwn(value, PROTO_KEY)) {
+            // fromEntries defines each key as an own property, so the stand-in is a key like any other
+            const renamed: Record<string, unknown> = Object.fromEntries(
+                Object.entries(value).map(([key, item]) => [key === PROTO_KEY ? PROTO_KEY_STAND_IN : key, item])
+            );
+            return { value: renamed };
         }
 
         return undefined;
     }
 }));
 
+// the one message of an unknown key, with the key cut to 64 characters and the real name of the renamed __proto__
+const describeUnknownKeys: Joi.ValidationErrorFunction = (errors) => {
+    for (const report of errors) {
+        if (report.code !== "object.unknown") {
+            continue;
+        }
+
+        const child: unknown = report.local.child;
+
+        if (typeof child === "string") {
+            const key = child === PROTO_KEY_STAND_IN ? PROTO_KEY : child;
+            report.path = [...report.path.slice(0, -1), key];
+            report.message = unknownSettingMessage(key);
+        }
+    }
+
+    return errors;
+};
+
 const objectMessages = {
-    "object.base": "Settings must be an object",
-    "object.unknown": "Unknown setting: {#child}"
+    "object.base": "Settings must be an object"
 };
 
 // the settings a user may give: each one optional; a key that is not a setting of this version is refused, one detail
@@ -81,17 +110,19 @@ const objectMessages = {
 // the rules of each setting turn it off for their own value, so nothing else is converted.
 export const settingsSchema = SettingsJoi.object<SettingsInput>(
     Object.fromEntries(SETTING_KEYS.map((key) => [key, ruleFor(key)]))
-).prefs({ convert: true }).messages(objectMessages);
+).prefs({ convert: true }).messages(objectMessages).error(describeUnknownKeys);
 
 // the settings of a resolved configuration: all eleven
 export const completeSettingsSchema = SettingsJoi.object<ConfigurationSettings>(
     Object.fromEntries(SETTING_KEYS.map((key) => [key, ruleFor(key).required().messages({ "any.required": `${SETTING_CAPS[key].label} is required` })]))
-).prefs({ convert: true }).messages(objectMessages);
+).prefs({ convert: true }).messages(objectMessages).error(describeUnknownKeys);
 
-const profileIdRule = Joi.string().guid({ version: "uuidv4" }).messages({
+// the plain hyphenated UUID of any version and case: the rule of isUuid, so the id is never valid to this schema and
+// unknown to the lookup that follows
+const profileIdRule = Joi.string().pattern(UUID_PATTERN).messages({
     "string.base": "Profile id must be a valid UUID",
     "string.empty": "Profile id must be a valid UUID",
-    "string.guid": "Profile id must be a valid UUID"
+    "string.pattern.base": "Profile id must be a valid UUID"
 });
 
 // the body of POST /v1/configuration/resolve: which profile to start from, and settings that win over it
