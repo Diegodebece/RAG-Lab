@@ -1,7 +1,8 @@
 # RAG Lab design
 
 Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Building follows the order in
-section 13; layer 1 (Foundations) and layer 2 (Accounts and authentication) were built on 2026-11-26. Every session
+section 13; layer 1 (Foundations) and layer 2 (Accounts and authentication) were built on 2026-11-26, and layer 3
+(Configuration as data) on 2026-11-27. Every session
 and agent working on RAG Lab reads this file first. Decisions change only with the owner's approval, and
 each change is recorded here.
 
@@ -84,6 +85,60 @@ user-chosen settings are an unbounded-consumption risk (OWASP LLM Top 10).
 Every question stores a snapshot of the configuration it used next to its metrics. The harness and the playground
 run the same pipeline and write to the same runs table, so experiment results and playground charts are the same
 data.
+
+Built in layer 3 (decided by the owner on 2026-11-27, with the plan):
+
+**Version 1 of the settings.** Version 1 holds only the settings whose shape and default are known. Keys are flat
+camelCase; the kind (index or question) is metadata, not part of the key. `chunkSize` is measured in characters (RAG
+Web's `CHUNK_MAX_CHARS`). Defaults come from RAG Web (`rag.config.ts`, `ollama.config.ts`, `fragments.util.ts`,
+`prompts.util.ts`).
+
+| Setting | Kind | Default | Cap (what may run) |
+|---|---|---|---|
+| `chunkSize` | index | 1000 | 300, 500, 750, 1000, 2000 or 5000 |
+| `embeddingModel` | index | `qwen3-embedding:0.6b` | that model only |
+| `retrievalMode` | question | `vector` | `vector` only |
+| `topK` | question | 3 | 1 to 30 |
+| `minScore` | question | 0.3 | 0 to 1, 2 decimals |
+| `neighborWindow` | question | 1 | 1 or 2 |
+| `smallModel` | question | `qwen3.5:4b` | that model only |
+| `temperature` | question | 0 | 0 to 1, 2 decimals |
+| `maxTokens` | question | 1024 | 1 to 1024 |
+| `answerLanguage` | question | `en` | `en` or `es` |
+| `answerMode` | question | `baseline` | `baseline` or `structured` |
+
+- `answerMode` is a setting (baseline 75/100, structured 72/100 in RAG1's 100-question run). `answerLanguage` `es`
+  is allowed, but the Spanish prompts were never evaluated (experiment E2).
+- The default chunk size is 1000 (RAG Web's value; RAG1's 100-question run scored 75/100). 500 scored better in one
+  RAG1 run, but E1 decides. Changing any default is an approval gate and goes through the experiment loop.
+- `maxTokens` 1024 is RAG Web's guard against runaway answers, not a value RAG1 evaluated.
+- A setting of a known enumeration widens in code without a new version (`retrievalMode` will gain
+  `vector_query_instruction` and `hybrid`). A setting of unknown shape arrives with its layer and a version bump:
+  the big model, the router policy and thresholds, the gpt-oss thinking level, reranking, the hybrid weights, the
+  chunking strategy and contextual headers. A setting is never accepted and ignored.
+- Not settings: `num_ctx` 8192, `seed` 42, `think: false`, the prompt texts, `format: "json"` and the 1024 embedding
+  dimensions.
+
+**The default profile.** It is one row of the `default_profile` table, seeded by migration 004. The API role may only
+read it; a new migration is the only way to change it, and there is no admin endpoint. A user's profile is sparse: it
+holds only the keys the user set, plus the configuration version it was written for; a missing key takes the default.
+The consequence is that an approved change to the default reaches every profile that did not set that key; snapshots
+keep history exact. Upgrades: adding a key bumps the version, and a migration adds the key to the default row and
+moves the versions; widening a cap is code only; renaming or removing a key, or changing its type or unit, bumps the
+version and needs a data migration.
+
+**Value caps against consumption caps.** Caps on what may run (the values above) are constants in the code. Caps on
+how much (profiles per user, request limits) are in `limits.config.ts` and `.env`. A stored profile outside today's
+caps is refused when used (400) and shown with its problems; it is never clamped or silently replaced. A user may keep
+at most 20 profiles by default (`MAX_PROFILES_PER_USER`, 1 to 1000); admins have no powers over other users'
+profiles.
+
+**The snapshot and its hash.** Resolving a configuration gives `{ version, settings }` with all eleven settings. Its
+hash is the SHA-256 (hex) of its canonical JSON: keys sorted at every level, no spaces, UTF-8. The profile id and the
+dates are outside, so identical settings from two profiles or two users are one configuration. The hash is an
+identifier, not a security control. Layer 5's runs table stores `configuration jsonb`, `configuration_hash text`
+(indexed) and `profile_id` (nullable, `ON DELETE SET NULL`); layer 3 has no snapshot table. Layer 6 adds a `fixed`
+section (`num_ctx`, `seed`, `think`, the prompt id) with a version bump; layers 5 and 13 add the model digests.
 
 ## 5. Token accounting (as fine as possible)
 
@@ -346,7 +401,11 @@ The skills were copied from RAG Web unchanged, except for these changes:
 - with layer 2 (2026-11-26) the skills gained the account patterns: a token-only `authenticateMiddleware` and a
   `currentUserMiddleware` that reads the role from the database, the readiness gate, the per-address floor, two
   database roles with a startup role guard, passwords only through `password.util`, and revocation by token
-  version.
+  version;
+- with layer 3 (2026-11-27) the skills gained the configuration patterns: a read-only default table changed only by
+  migrations, settings merged by known keys, strict validation of settings with no conversion or rounding, canonical
+  JSON snapshots with a hash, a startup check of configuration data, column grants in a migration, and a small body
+  limit for small bodies.
 
 `CLAUDE.md` is RAG Web's standards with a RAG Lab section on top: the loops, the approval gates, GitHub, private
 data and the hooks.
@@ -355,7 +414,12 @@ data and the hooks.
 
 - Exact tokenizer libraries for Qwen and gpt-oss in Node.
 - Whether Ollama's prompt cache affects `prompt_eval_count` and how to report it.
-- Playground caps: concrete limits per user.
+- Playground caps: concrete limits per user. Partly decided on 2026-11-27 (layer 3). Decided: the value caps are in
+  code (section 4). Interim request caps arrive with the first layer that calls a model (layer 5 for question
+  embeddings, layer 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per
+  user, 60 s per question, 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or
+  measurements: the token budgets (after layer 9), a cap on indexes per document or indexing jobs per user (layer 4),
+  and an exemption or higher caps for the harness account (layer 10).
 - Hosting and domain for RAG Lab (RAG Web uses a Cloudflare tunnel).
 
 ## 13. Build order

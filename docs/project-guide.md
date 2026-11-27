@@ -6,7 +6,7 @@ How RAG Lab is built and why. [design.md](design.md) is the source of truth for 
 
 RAG Lab is a RAG API built by a team of Claude Code agents: two local models and a router answer questions about uploaded documents, every question is measured (accuracy, latency, tokens), and each signed-in user changes the configuration in a playground to see how precision and token use respond. It reuses the architecture and the evaluated settings of RAG Web (the deployed RAG API) and the evaluation harness of RAG1 (the original command-line app); see design section 1.
 
-The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. Layer 2, Accounts and authentication, is built on top of it (section 6): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There are no documents or questions yet.
+The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. Layer 2, Accounts and authentication, is built on top of it (section 6): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. Layer 3, Configuration as data, is built on top of that (section 7): the settings users may change and their caps, the default profile in the database, each user's profiles, and a resolver that gives one complete configuration with a hash. There are no documents or questions yet.
 
 ## 2. Stack
 
@@ -42,7 +42,7 @@ The standards are in `CLAUDE.md` and the `layered-express-*` skills. In short: e
 Invisible characters are checked by a test, `test/repository/invisibleCharacters.test.ts`, which runs on every `npm test` and fails when a file of the project holds one.
 
 > [!NOTE]
-> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/`, `.claude/metrics/` (added 2026-11-26 with the process metrics, section 9) and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
+> **Decision:** an invisible-character test runs on every `npm test` (2026-11-26). It scans `src/`, `test/`, `migrations/`, `docs/`, `.claude/skills/`, `.claude/metrics/` (added 2026-11-26 with the process metrics, section 10) and the files of the project root for U+200B to U+200F, U+2028 to U+202F, U+2060 to U+206F, U+FEFF, U+00AD (soft hyphen), U+180E, U+FE00 to U+FE0F (variation selectors) and U+E0000 to U+E007F (tag characters), and reads UTF-16 files too. Such characters hide in pasted text and change what code or a document says without showing; checking by hand after each edit is not a guarantee, a test is. The test itself writes the ranges as numbers, so it never contains one.
 
 ## 5. Foundations (layer 1)
 
@@ -58,7 +58,7 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 ### Migrations and the wrong-database guard
 
-`migrations/` holds numbered SQL files: `001_init.sql` creates the pgvector extension, `002_api_role.sql` gives the API's role its rights and `003_users.sql` creates the `users` table (see "Database roles" below and section 6). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It connects as the owner with `MIGRATION_DATABASE_URL`, with its own pool (made by `createPool` in `pool.config.ts`), without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate. It never imports `db.config.ts`, so it does not need `DATABASE_URL`, and neither URL is a fallback for the other.
+`migrations/` holds numbered SQL files: `001_init.sql` creates the pgvector extension, `002_api_role.sql` gives the API's role its rights and `003_users.sql` creates the `users` table (see "Database roles" below and section 6); `004_default_profile.sql` creates and fills the default profile and `005_profiles.sql` creates the `profiles` table (section 7). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It connects as the owner with `MIGRATION_DATABASE_URL`, with its own pool (made by `createPool` in `pool.config.ts`), without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate. It never imports `db.config.ts`, so it does not need `DATABASE_URL`, and neither URL is a fallback for the other.
 
 `getMigrationStateService(targetPool)` (`schema.service.ts`) compares the files with the `schema_migrations` table and returns four lists: `applied`, `pending` (only in the files), `unknown` (recorded in the database but missing from the files) and `foreignTables` (tables of the public schema when there is no `schema_migrations` table at all). The pool is always passed: the server gives the API's, the migration script its own. Two of those mean the URL points at the wrong database:
 
@@ -73,6 +73,7 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 | The database answers and refuses (wrong password, missing database) | Stops with the reason (exit 1); it will not get better by itself |
 | The role of `DATABASE_URL` has more rights than the API needs (see "Database roles") | Stops and lists what the role can do; never prints the URL |
 | Pending migrations, unknown migrations or foreign tables | Stops and says to run `npm run migrate` or to check `DATABASE_URL` |
+| The default profile is missing, is at another configuration version or is outside the caps, or a stored profile is at another configuration version (section 7, "Startup check") | Stops and lists every problem |
 | Settings that are missing or unsafe (see Configuration) | Stops and lists every problem |
 
 > [!NOTE]
@@ -87,7 +88,7 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 ### Database roles
 
-The API connects as `rag_lab_api`; the owner `rag_lab` creates the schema. The owner creates the role once with `scripts/create-api-role.sql` (`CREATE ROLE ... LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, `REVOKE ALL ON DATABASE` from `PUBLIC`, `GRANT CONNECT`) and sets its password by hand with `\password rag_lab_api`; nothing in the repository holds that password. `migrations/002_api_role.sql` fails naming the script when the role is missing, then revokes `CREATE` on `public` from `PUBLIC`, grants `USAGE` on the schema and `SELECT` on `schema_migrations`, and sets default privileges so the tables and sequences the owner creates afterwards (`users`, and the tables of the next layers) are usable by the API without a new grant. The API role can read and change rows and nothing else: it cannot create, alter, drop or truncate anything, and it cannot change `schema_migrations`.
+The API connects as `rag_lab_api`; the owner `rag_lab` creates the schema. The owner creates the role once with `scripts/create-api-role.sql` (`CREATE ROLE ... LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, `REVOKE ALL ON DATABASE` from `PUBLIC`, `GRANT CONNECT`) and sets its password by hand with `\password rag_lab_api`; nothing in the repository holds that password. `migrations/002_api_role.sql` fails naming the script when the role is missing, then revokes `CREATE` on `public` from `PUBLIC`, grants `USAGE` on the schema and `SELECT` on `schema_migrations`, and sets default privileges so the tables and sequences the owner creates afterwards (`users`, and the tables of the next layers) are usable by the API without a new grant. The API role can read and change rows and nothing else: it cannot create, alter, drop or truncate anything, and it cannot change `schema_migrations`. Layer 3 narrows the default privileges where a table needs it: migration 004 revokes `INSERT`, `UPDATE` and `DELETE` on `default_profile` from the role, which leaves it `SELECT` only, and migration 005 revokes `UPDATE` on `profiles` and grants it back on four columns only (`name`, `settings`, `version`, `updated_at`), so the API can never change a profile's owner, id or creation time (section 7).
 
 Before it serves anything, the server asks the database what the role it connected as can do (`databaseRole.service.ts`, by capability and not by name) and stops if the role is a superuser, can create roles or databases, can create objects in the database or in `public`, owns relations in `public`, is a member of another role, or acts as another role than the one that logged in (the `role` connection option, or `SET ROLE`, would hide a login with more rights behind a harmless-looking current role).
 
@@ -103,7 +104,7 @@ Before it serves anything, the server asks the database what the role it connect
 > [!NOTE]
 > **Decision:** `npm run migrate` no longer needs `DATABASE_URL` (2026-11-26, decided by the orchestrator after the audit, without asking the owner; the owner can reverse it). The pool code was split into `pool.config.ts` (by the implementer, instead of making the API pool lazy, because the tests import the pool directly) so the migration script uses `MIGRATION_DATABASE_URL` alone and never imports `db.config.ts`, which throws at import without `DATABASE_URL`. Before the split, a shell or a CI job that set only the owner's URL crashed with "DATABASE_URL is not set" instead of migrating; the tests did not show it, because their helper passed the whole environment to the script.
 
-Operational note for layer 13: `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role.
+Operational note for layer 13: `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role. The explicit `REVOKE` on `default_profile` and the column grants on `profiles` (layer 3) rely on the same default privileges.
 
 > [!NOTE]
 > **Decision:** timeouts after the audit (2026-11-26). The API pool has a 30 s query timeout and keepAlive; the health probe has a 2 s timeout; `migrate` uses its own pool with no query timeout; shutdown waits at most 6 s for HTTP and 2 s for the pool (`closePoolGracefully`), under Docker's 10 s grace period. Without a query timeout, a connection that is open but no longer answers (a frozen PostgreSQL, a network dropping packets) holds its request forever. `closePoolGracefully` reads pg-pool's private client lists in one commented place (`getCheckedOutClients` in `shutdown.ts`), because the public API cannot list the clients lent out before it is called, and a stuck request is exactly one of those; if those fields ever disappear, it destroys nothing and gives up after one more second, so the process still exits.
@@ -281,14 +282,150 @@ The failed-login key is `email:<email>|<address>`, so guessing one account from 
 > [!NOTE]
 > **Decision:** the audit of layer 2 led to these changes, decided by the orchestrator and the implementer without asking the owner; the owner can reverse any of them (2026-11-26). After the audit: the readiness gate and the background retry when the database is down at startup (see "Migrations"); the per-user limit keyed per token version; account creations counted on every attempt after authorization and not only on successes; `updateUserService` locks and re-checks the actor; `migrate` no longer needs `DATABASE_URL`; 57P01, 57P02, 08000, 08003 and 08006 count as unreachable; the role check also refuses a session that acts as another role, a role that is a member of another role and `CREATE` on the database; and the dummy hash also runs after failures against old or unusable stored hashes. In the first implementation round: a password change or a rehash applies only if the stored hash is still the one that was checked (a concurrent change gets 409); stored hash parameters outside fixed ranges are refused without throwing; and the dummy hash is computed on first use and cached. The worktree's `node_modules` is a junction to the main checkout's (the orchestrator, local only).
 
-## 7. Contract for the frontend
+## 7. Configuration as data (layer 3)
 
-The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml) (version 0.2.0), explained in [api/README.md](api/README.md). It holds `GET /v1/health`, the six account endpoints of section 6, the schemas they use, and the shared answers every other `/v1` path gets (401, 403, 404, 429, 503).
+The settings a user may change, the caps on their values, the default profile, each user's own profiles, and the resolver that turns them into one complete configuration with a hash. Nothing calls a model yet: the configuration is what layers 4 to 6 will read. The routes follow the layered pattern (`configuration.routes.ts`, `profiles.routes.ts`, their controllers, `configuration.service.ts` and `profiles.service.ts`, `configuration.validator.ts` and `profiles.validator.ts`); the exact bodies, messages and status codes are in the [API contract](api/openapi.yaml). The design is in [design section 4](design.md#4-configuration-as-data).
+
+### Endpoints
+
+All are protected (a token) and counted in the per-user limit.
+
+| Method and path | What it does |
+|---|---|
+| `GET /v1/configuration` | The configuration version, the definition of each setting (type, allowed values or range, whether it is index time or question time), the defaults the database holds right now, and the limits on profiles (`maxPerUser`, `maxNameLength`) |
+| `POST /v1/configuration/resolve` | Body `{ profileId?, overrides? }`, both optional: the complete configuration a question would run with, `{ profileId, snapshot, hash }`. A dry run: it calls no model and writes nothing |
+| `GET /v1/profiles` | The caller's profiles, oldest first |
+| `POST /v1/profiles` | Body `{ name, settings? }`; `201` |
+| `GET /v1/profiles/:id` | One of the caller's profiles |
+| `PATCH /v1/profiles/:id` | Body with `name` and/or `settings`, at least one; the settings sent replace the stored object as a whole (`{}` goes back to the default) |
+| `DELETE /v1/profiles/:id` | Deletes the profile (also one saved by another configuration version) |
+
+A profile is `{ id, name, settings, problems, createdAt, updatedAt }`. `settings` holds only what the user set. `problems` lists what is wrong with the stored settings today (a value outside a cap, a setting this version does not have); it is empty for a profile made through the API, which checks the settings first. The owner's id and the version are never returned. Another user's profile, an id that is not a UUID and an id that does not exist are the same 404 "Profile not found", also for an admin.
+
+### Version 1 of the settings
+
+`config/configuration.config.ts` defines version 1: `CONFIGURATION_VERSION`, the eleven keys, and their caps. The defaults are data, in the row of `default_profile` (migration 004). `chunkSize` is measured in characters (RAG Web's `CHUNK_MAX_CHARS`). Sources of the defaults: RAG Web's `rag.config.ts`, `ollama.config.ts`, `fragments.util.ts` and `prompts.util.ts`.
+
+| Setting | Kind | Default | Cap |
+|---|---|---|---|
+| `chunkSize` | index | 1000 | 300, 500, 750, 1000, 2000 or 5000 |
+| `embeddingModel` | index | `qwen3-embedding:0.6b` | that model only |
+| `retrievalMode` | question | `vector` | `vector` only |
+| `topK` | question | 3 | whole number, 1 to 30 |
+| `minScore` | question | 0.3 | 0 to 1, at most 2 decimals |
+| `neighborWindow` | question | 1 | 1 or 2 |
+| `smallModel` | question | `qwen3.5:4b` | that model only |
+| `temperature` | question | 0 | 0 to 1, at most 2 decimals |
+| `maxTokens` | question | 1024 | whole number, 1 to 1024 |
+| `answerLanguage` | question | `en` | `en` or `es` |
+| `answerMode` | question | `baseline` | `baseline` or `structured` |
+
+`kind` says whether a change needs the documents indexed again (`index`) or only a new question (`question`). Not settings, so no user can change them: `num_ctx` 8192, `seed` 42, `think: false`, the prompt texts, `format: "json"` and the 1024 embedding dimensions.
+
+### Tables
+
+- `default_profile` (migration 004): one row, `singleton` (always true, the primary key, so a second row is impossible), `version`, `settings jsonb` (an object) and `updated_at`. Seeded with the defaults above. The API role has `SELECT` only.
+- `profiles` (migration 005): `id` (UUID), `user_id` (foreign key to `users`, `ON DELETE CASCADE`), `name` (1 to 100 characters), `version`, `settings jsonb` (an object, `{}` by default), `created_at`, `updated_at`. A unique index on `(user_id, lower(name))` makes a name one profile per user, whatever its capitalization. `version` has no default: the app writes it. The API role may `UPDATE` only `name`, `settings`, `version` and `updated_at`.
+
+Migration 005 was never on `main`, so a development database has nothing to re-migrate; after the merge the owner runs `npm run migrate`.
+
+### Resolution
+
+`resolveConfigurationService` builds the configuration key by key, for each of the eleven settings: the override if there is one, else the stored profile's value, else the default's. Keys are read as own properties (`Object.hasOwn`) and copied one by one into a new object, never spread or deep-merged, so a key such as `__proto__` is not a way to reach the result. The merged object is checked against the caps (the same schema as for writing: `completeSettingsSchema`), so a value is never clamped and the snapshot always matches what ran.
+
+| Situation | Answer |
+|---|---|
+| `profileId` is not a UUID | 400 "Validation error" ("Profile id must be a valid UUID") |
+| The profile does not exist or is another user's | 404 "Profile not found" |
+| A stored profile or the overrides are outside the caps, or hold a key that is not a setting | 400 "The configuration is not valid", with every problem in `details` |
+| The caller's profile was saved by another configuration version | 500 "Internal server error" (this code cannot read it) |
+| The default profile in the database is not valid (it changed while the server ran) | 500 "Internal server error"; the problems are logged, never sent |
+
+The default is checked on its own first, so its problems are never mixed with the caller's, and a broken default is never shown to a user as their 400. The `profileId` in the answer is the id in lower case, or `null` when none was asked for.
+
+### The snapshot and its hash
+
+The snapshot is `{ version, settings }` with all eleven settings, frozen. Its canonical text (`toCanonicalJson` in `configurationSnapshot.util.ts`) is JSON with the keys sorted at every level and no spaces; only what JSON can hold is accepted (`undefined`, a function, `NaN`, an infinity and an array with holes are errors, because a snapshot that lost a value would hash like one that never had it). The hash is the SHA-256 of that text as UTF-8, in lowercase hexadecimal. The profile id and the timestamps are not part of it. The resolver's answer to a client leaves out the canonical text: the snapshot and the hash are what it needs.
+
+### Startup check
+
+After the schema check, `getConfigurationProblemsService` (called from `server.ts`) reads the database. The server stops, listing every problem, when the default profile row is missing, is at another configuration version or is outside the caps (all eleven settings present, each inside its cap, nothing else), or when any stored profile is at another configuration version. A profile whose settings are outside today's caps is not a startup problem: it is shown with its `problems` and refused when it is resolved. The check does not verify that `rag_lab_api` still has only `SELECT` on `default_profile`.
+
+### Profile names
+
+The validator (`profiles.validator.ts`) stores the name in Unicode form NFC, with every space of category `Zs` turned into a plain space and the ends trimmed, so two spellings of the same text are one name. It refuses control, format, surrogate and line or paragraph separator characters, and the characters that draw nothing without being any of those (U+3164, U+115F, U+1160, U+FFA0, U+034F, U+2800). The name must hold a letter, number, symbol or punctuation. Because the zero-width joiner is a format character, joined emoji sequences are refused; a variation selector after an emoji is accepted. Joi counts UTF-16 units, so a name of emoji may be refused a little before 100 characters, never accepted past it.
+
+### Limits
+
+| Limit | Default | Where |
+|---|---|---|
+| Profiles per user | 20 (1 to 1000) | `MAX_PROFILES_PER_USER` in `limits.config.ts`; counted inside a transaction that locks the user's row, so two creations that arrive together are counted one after the other; the 21st is a 409 "You have reached the maximum number of profiles" |
+| Request body | 16 kB | `CONFIGURATION_BODY_LIMIT`, on the POST and PATCH routes of these two routers only; over it is a 413 "request entity too large", before the body is parsed |
+| Writes | no extra limit | the per-user limit of 120 requests per minute applies |
+
+The 409 answers of a profile are: "A profile with that name already exists", "You have reached the maximum number of profiles" (creation) and "This profile was saved by another configuration version" (PATCH; reading and deleting still work).
+
+### Decisions
+
+> [!NOTE]
+> **Decision:** the owner approved the plan of layer 3 with every recommendation of the planner (2026-11-27). The decisions below are the plan's.
+
+> [!NOTE]
+> **Decision:** version 1 holds only the settings whose shape and default are known, the eleven keys above (2026-11-27, the owner's decision). An enumeration the design already names widens in code without a version bump (`retrievalMode` will gain `vector_query_instruction` and `hybrid`). Settings of unknown shape (the big model, the router policy and thresholds, the gpt-oss thinking level, reranking, the hybrid weights, the chunking strategy, contextual headers) arrive with their layer and a version bump. A setting is never accepted and ignored: a client that sends a key this version does not have gets a 400. `num_ctx` 8192, `seed` 42, `think: false`, the prompt texts, `format: "json"` and the 1024 embedding dimensions are not settings.
+
+> [!NOTE]
+> **Decision:** `answerMode` (baseline or structured) is a setting, default `baseline` (2026-11-27, the owner's decision). In RAG Web's runs baseline scored 75/100 and structured 72/100. It is added to the table of design section 4.
+
+> [!NOTE]
+> **Decision:** keys are flat camelCase, and `kind` (`index` or `question`) is metadata of the definition (2026-11-27, the owner's decision).
+> [!NOTE]
+> **Decision:** profiles are sparse and carry a `version` (2026-11-27, the owner's decision). A profile stores only the keys the user set; a missing key takes the default. Upgrade rules: adding a key bumps the version, and a migration adds the key to the default row and moves the versions; widening a cap is code only; renaming or removing a key, or changing its type or unit, bumps the version and needs a data migration. The trade-off: an approved change to the default reaches every profile that did not set that key, while snapshots keep the history exact.
+
+> [!NOTE]
+> **Decision:** the default profile is a single-row table, `default_profile`, seeded by migration 004 (2026-11-27, the owner's decision). The API role has `SELECT` only, through an explicit `REVOKE` after the default privileges of migration 002; only a new migration changes it, and there is no admin endpoint.
+> [!NOTE]
+> **Decision:** the default chunk size is 1000 (2026-11-27, the owner's decision). It is RAG Web's value, and RAG1's 100-question run with it scored 75/100. 500 scored better in one RAG1 run, but experiment E1 decides. Changing a default is an approval gate and goes through the experiment loop.
+
+> [!NOTE]
+> **Decision:** value caps (what may run) are constants in `configuration.config.ts`; consumption caps (how much) are in `limits.config.ts` and `.env` (2026-11-27, the owner's decision). The caps are the table above. `maxTokens` 1024 is RAG Web's guard against runaway answers, not a value RAG1 evaluated. Spanish prompts have not been evaluated (experiment E2), so `answerLanguage` `es` is allowed but unproven. A cap changes with a new version and a migration, not in `.env`.
+
+> [!NOTE]
+> **Decision:** a stored profile outside today's caps is refused when it is used, with a 400 "The configuration is not valid" and its problems, and is shown in `problems` on every read (2026-11-27, the owner's decision). It is never clamped and never silently replaced, so the snapshot of a question is what ran and the user sees why a profile no longer works.
+
+> [!NOTE]
+> **Decision:** at most 20 profiles per user (`MAX_PROFILES_PER_USER`, range 1 to 1000; the owner set the maximum of 1000 after the audit), counted under a lock on the user's row, so the 21st is a 409 (2026-11-27, the owner's decision). Names have 1 to 100 characters and are unique per user whatever their capitalization. The body limit on these routes is 16 kB. There is no extra write limit: the general per-user limit applies.
+
+> [!NOTE]
+> **Decision:** a PATCH with `settings` replaces the stored object (2026-11-27, the owner's decision). `{}` goes back to the default.
+> [!NOTE]
+> **Decision:** `POST /v1/configuration/resolve` is a dry run that calls no model (2026-11-27, the owner's decision). A frontend can show what a question would run with, and the hash, before layers 4 to 6 exist.
+
+> [!NOTE]
+> **Decision:** layer 3 has no snapshot table (2026-11-27, the owner's decision). Layer 5's runs table stores `configuration jsonb`, `configuration_hash text` (indexed) and `profile_id` (nullable, `ON DELETE SET NULL`), so a deleted profile leaves its runs. A note for layer 5: the API role could be insert-only on the runs table.
+
+> [!NOTE]
+> **Decision:** the hash is the SHA-256, in hexadecimal, of the canonical JSON of `{ version, settings }` (2026-11-27, the owner's decision): keys sorted at every level, no spaces, UTF-8. `profileId` and the timestamps are outside it, so identical settings from two profiles or two users are one configuration. The hash is an identifier, not a security control. Layer 6 adds a `fixed` section (`num_ctx`, `seed`, `think`, the prompt id) with a version bump, and layers 5 and 13 add the model digests.
+
+> [!NOTE]
+> **Decision:** the playground caps of design section 12 are partly decided (2026-11-27, the owner's decision). The value caps are in code. Interim request caps arrive with the first layer that calls a model (5 for question embeddings, 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per user, 60 s per question and 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or measurements: the token budgets (after layer 9), a cap on indexes per document or indexing jobs per user (layer 4), and an exemption or higher caps for the harness account (layer 10).
+
+> [!NOTE]
+> **Decision:** admins have no powers over other users' profiles (2026-11-27, the owner's decision). An admin gets the same 404 as anyone else for a profile that is not theirs, and there is no admin route to profiles.
+
+> [!NOTE]
+> **Decision:** the audit of layer 3 led to a second round of fixes, and the owner approved the list (2026-11-27). The resolver's `profileId` follows the same UUID rule as `isUuid` (any version, hyphenated only); `MAX_PROFILES_PER_USER` has a maximum of 1000; a profile at another configuration version is a 409 on PATCH and a 500 on resolve, and `version` is written only when the settings are replaced (a rename keeps it); a default profile that breaks while the server runs is logged and answered as a 500 with the generic message, not as the user's 400; profile names also refuse U+3164, U+115F, U+1160, U+FFA0, U+034F and U+2800, turn every `Zs` space into U+0020 and must hold a letter, number, symbol or punctuation; joined emoji sequences are refused (the trade-off of refusing format characters) and a variation selector is accepted; the API role may `UPDATE` only four columns of `profiles` (migration 005), so it can never change the owner; an unknown setting key is echoed cut to 64 characters plus an ellipsis; a `__proto__` key no longer hides the other problems; and `toCanonicalJson` refuses arrays with holes. One audit claim was refuted: that the row lock on profile creation blocked other work.
+
+> [!NOTE]
+> **Decision:** these were taken without asking the owner, and the owner can reverse any of them (2026-11-27). The orchestrator fixed `test/db/users.test.ts` (`TRUNCATE users CASCADE`), which the new foreign key broke, and worded two messages: the 409 "This profile was saved by another configuration version" and the validator's "Name must contain a letter, number, symbol or punctuation". The implementer: used a Joi extension with a `prepare` hook to see an own `__proto__` key before Joi's copy drops it (the key is renamed to an internal stand-in so the rest is still validated, and the real name is restored in the error); answers 404 "User not found" when a profile is created for a user row that vanished; uses the singular in the startup message for one profile; limits names in UTF-16 units through Joi (a name of emoji can be refused slightly before the table's 100 characters, never accepted past it); counts the 64-character cut of an echoed key in code points; makes the resolver also report unknown override keys; and logs a broken default twice per request (once by the resolver and once by `errorMiddleware`).
+
+## 8. Contract for the frontend
+
+The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml) (version 0.3.0), explained in [api/README.md](api/README.md). It holds `GET /v1/health`, the six account endpoints of section 6, the seven configuration and profile endpoints of section 7, the schemas they use, and the shared answers every other `/v1` path gets (401, 403, 404, 429, 503).
 
 > [!NOTE]
 > **Decision:** the API contract is OpenAPI 3.1 YAML in `docs/api/` (2026-11-26). A machine-readable contract lets the frontend be built (and its client generated or checked) without reading the backend code, and it is frozen in layer 11.
 
-## 8. Findings deferred to later layers
+## 9. Findings deferred to later layers
 
 The audits of layer 1 found these; none was exploitable with the layer-1 code, because there were no accounts or documents yet. They are listed so they are not lost. The three that belonged to layer 2 are done.
 
@@ -309,12 +446,28 @@ The audits of layer 2 found these, which wait too:
 >
 > - A limit per account on failed logins across addresses (a slowdown or an alert, not a lockout, which would let anyone lock the owner out), and a cap on scrypt jobs running at once (layer 10 or 13).
 > - A check of new passwords against a list of breached passwords. It needs a list download, so it needs the owner's approval.
-> - `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role (an operations note, layer 13).
+> - `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role (an operations note, layer 13). Layer 3 touched it: the explicit `REVOKE` on `default_profile` and the column grants on `profiles` rely on the same default privileges.
 > - Rate-limit counters are in memory and reset when the API restarts; fine for one process (revisit if the API ever runs as several).
 > - The frontend keeps the token in memory and clears it on a 401 (layer 11, in the contract notes; already written in `docs/api/`).
 > - `TRUSTED_PROXIES` must match the tunnel, or every user shares one address and one counter (layers 11 and 13, already deferred above).
 
-## 9. Process metrics
+The audits of layer 3 found these, which wait too:
+
+> [!NOTE]
+> **Decision:** these findings from the audit of layer 3 wait for the layer that makes them matter (2026-11-27):
+>
+> - The combination topK × neighbors × chunk size has no cap. A prompt-size budget against `num_ctx`, refusing what does not fit (layer 6).
+> - Settings within the caps that would make the small model fail every time and force an escalation, for example `minScore` 1 or `maxTokens` 1 in structured mode. Abstain instead of escalating when the user's own settings caused it, and cap escalations per user per day (layer 8).
+> - Logout and login give a fresh per-user rate-limit counter, because its key holds the token version. A second counter by user id only (layer 10).
+> - Never accept a snapshot or a hash from the client, and cache keys must include the user and the document or index ids (layer 5).
+> - Index-time settings in per-request overrides could trigger index builds. Refuse unless the index exists, and cap builds per user (layer 4).
+> - CORS is open by default (already deferred to layers 11 and 13).
+> - Model digests in the snapshot (layers 5 and 13); interim consumption caps (layers 5 and 6); the harness exemption (layer 10); a run kind in layer 5, so retrieval-only runs ignore the answer settings.
+> - The startup check does not verify that `rag_lab_api` still has only `SELECT` on `default_profile` (defence in depth).
+> - A top-level unknown field in a body still echoes its key whole (Joi's `"<key>" is not allowed`); only setting keys are cut.
+> - There is no test yet for a default profile moved to another version while the server runs.
+
+## 10. Process metrics
 
 How much the agent team uses and costs is measured per loop (a feature or an experiment, from its start to the merge of its pull request), so loops can be compared and the owner can see where the usage goes. It measures the development agents, not the application's token accounting ([design section 14](design.md#14-process-metrics); the application's is [section 5](design.md#5-token-accounting-as-fine-as-possible)).
 

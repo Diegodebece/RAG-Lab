@@ -41,3 +41,7 @@ export const PASSWORD_CHANGE_WINDOW_MS = 15 * MINUTE_MS;
 export const USER_CREATIONS_PER_HOUR = readIntegerSetting("USER_CREATIONS_PER_HOUR", 20);
 
 export const USER_CREATION_WINDOW_MS = HOUR_MS;
+
+// profiles one user may keep, from 1 to 1000: each one is a row the user can fill with settings, so the number is capped
+// at both ends
+export const MAX_PROFILES_PER_USER = readIntegerSetting("MAX_PROFILES_PER_USER", 20, 1, 1000);
