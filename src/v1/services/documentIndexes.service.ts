@@ -20,13 +20,17 @@ import { abortIndexBuildService, notifyIndexQueuedService } from "./indexingQueu
 type Queryable = Pool | PoolClient;
 
 // The columns of an index as the API shows it, from document_indexes as "di". The place in line is counted over the queued
-// indexes of every user, in the order the worker takes them (queue time, then id), and is null for an index that is not queued.
+// indexes of the active users, in the order the worker takes them (queue time, then id), and is null for an index that is not
+// queued. The builds of a disabled user are skipped by the worker, use none of the model's time and so are not ahead of anyone
+// (decision D9 of layer 5).
 const INDEX_COLUMNS = `di.id, di.document_id AS "documentId", di.chunk_size AS "chunkSize", di.embedding_model AS "embeddingModel",
     di.status, di.chunk_count AS "chunkCount", di.embedded_count AS "embeddedCount", di.embedding_tokens AS "embeddingTokens",
     di.attempts, di.error,
     CASE WHEN di.status = 'queued' THEN (
         SELECT count(*)::int + 1 FROM document_indexes ahead
-        WHERE ahead.status = 'queued' AND (ahead.queued_at, ahead.id) < (di.queued_at, di.id)
+        JOIN documents ahead_document ON ahead_document.id = ahead.document_id
+        JOIN users ahead_user ON ahead_user.id = ahead_document.user_id
+        WHERE ahead.status = 'queued' AND ahead_user.status = 'active' AND (ahead.queued_at, ahead.id) < (di.queued_at, di.id)
     ) END AS "queuePosition",
     di.created_at AS "createdAt", di.queued_at AS "queuedAt", di.started_at AS "startedAt", di.finished_at AS "finishedAt"`;
 
@@ -113,7 +117,17 @@ export const assertBuildCapacityService = async (client: Queryable, userId: stri
         throw new AppError(429, GLOBAL_DAILY_MESSAGE);
     }
 
-    const queued = await countOf(client, "SELECT count(*)::int AS count FROM document_indexes WHERE status = 'queued'");
+    // the queued builds of disabled users are not counted: the worker skips them, so they take none of the model's time, and
+    // counting them would keep the places of an account nobody can clean up (an admin cannot delete another user's documents).
+    // Enabling the account again counts them again at once, so the queue can be over its cap by at most that user's active builds
+    // until it drains.
+    const queued = await countOf(
+        client,
+        `SELECT count(*)::int AS count FROM document_indexes di
+         JOIN documents d ON d.id = di.document_id
+         JOIN users u ON u.id = d.user_id
+         WHERE di.status = 'queued' AND u.status = 'active'`
+    );
 
     if (queued >= MAX_QUEUED_INDEX_BUILDS) {
         throw new AppError(503, QUEUE_FULL_MESSAGE);
