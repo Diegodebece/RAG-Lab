@@ -75,14 +75,16 @@ describe("TOKEN_LIFETIME_SECONDS", () => {
     });
 });
 
-// The five limits of the account routes: the default, a custom value, and a value that stops the app at startup
-// (0 would switch the limit off, and a malformed one would be read as something else). Each is its own setting.
+// The five limits of the account routes and the number of profiles a user may keep (layer 3): the default, a custom
+// value, and a value that stops the app at startup (0 would switch the limit off, and a malformed one would be read
+// as something else). Each is its own setting.
 const ACCOUNT_LIMITS: [name: string, defaultValue: number][] = [
     ["REQUESTS_PER_ADDRESS_PER_MINUTE", 300],
     ["LOGINS_PER_15_MINUTES", 10],
     ["FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES", 5],
     ["PASSWORD_CHANGES_PER_15_MINUTES", 5],
-    ["USER_CREATIONS_PER_HOUR", 20]
+    ["USER_CREATIONS_PER_HOUR", 20],
+    ["MAX_PROFILES_PER_USER", 20]
 ];
 
 describe("the limits of the account routes", () => {
@@ -122,6 +124,29 @@ describe("the limits of the account routes", () => {
             }
         });
     }
+});
+
+// The number of profiles a user may keep has a top as well as a bottom: each profile is a row, and a limit of a
+// billion would be no limit at all.
+describe("MAX_PROFILES_PER_USER", () => {
+    it("accepts 1 and 1000, the ends of its range", { timeout: 30_000 }, async () => {
+        for (const value of ["1", "1000"]) {
+            const loaded = await loadLimits({ MAX_PROFILES_PER_USER: value });
+
+            assert.equal(loaded.code, 0, `${value}: ${loaded.stderr}`);
+            assert.equal(JSON.parse(loaded.stdout).MAX_PROFILES_PER_USER, Number(value));
+        }
+    });
+
+    it("stops the app at startup on more than 1000, instead of shortening it", { timeout: 30_000 }, async () => {
+        for (const value of ["1001", "5000", "99999999999999"]) {
+            const loaded = await loadLimits({ MAX_PROFILES_PER_USER: value });
+
+            assert.notEqual(loaded.code, 0, `${value}: it loaded`);
+            assert.match(loaded.stderr, /MAX_PROFILES_PER_USER must be a whole number from 1 to 1000/, value);
+            assert.equal(loaded.stdout, "", `${value}: nothing was used`);
+        }
+    });
 });
 
 describe("HEALTH_CACHE_SECONDS", () => {

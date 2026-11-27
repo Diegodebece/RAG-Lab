@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
   title: RAG Lab API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     The API contract of RAG Lab for the frontend. Layer 1 (Foundations) added the health check; layer 2 (Accounts and
-    authentication) added login, logout and the user endpoints. Every later layer adds its paths here, in the same
-    change that adds them to the code.
+    authentication) added login, logout and the user endpoints; layer 3 (Configuration as data) added the
+    configuration and profile endpoints. Every later layer adds its paths here, in the same change that adds them to
+    the code.
 
     All paths start with `/v1`. Every response is JSON and carries `Cache-Control: no-store`.
 
@@ -49,6 +50,10 @@ tags:
     description: Login and logout
   - name: Users
     description: The signed-in user's own account, and the accounts an admin manages
+  - name: Configuration
+    description: What each setting accepts, the defaults, and the resolved configuration a question would run with
+  - name: Profiles
+    description: The signed-in user's own saved configurations
 paths:
   /v1/health:
     get:
@@ -443,6 +448,450 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+  /v1/configuration:
+    get:
+      tags: [Configuration]
+      operationId: getConfiguration
+      summary: What each setting accepts, and the defaults
+      security:
+        - bearerAuth: []
+      description: |
+        Everything a client needs to build a form for the settings: the configuration `version`, the definition of each
+        setting in a fixed order (its type, and its allowed values or its range), the `defaults` the database holds
+        right now, and the limits on profiles. Any signed-in user may read it.
+
+        Values must be sent exactly as the definition says: numbers are JSON numbers, never text, and a value is never
+        rounded or clamped by the server (a number with more decimals than `decimals` is refused, so 0.30000000000000004
+        is a 400).
+      responses:
+        "200":
+          description: The definition of the settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigurationViewResponse"
+              example:
+                success: true
+                message: Configuration retrieved successfully
+                data:
+                  version: 1
+                  defaults:
+                    chunkSize: 1000
+                    embeddingModel: qwen3-embedding:0.6b
+                    retrievalMode: vector
+                    topK: 3
+                    minScore: 0.3
+                    neighborWindow: 1
+                    smallModel: qwen3.5:4b
+                    temperature: 0
+                    maxTokens: 1024
+                    answerLanguage: en
+                    answerMode: baseline
+                  settings:
+                    - key: chunkSize
+                      label: Chunk size
+                      kind: index
+                      type: integer
+                      allowed: [300, 500, 750, 1000, 2000, 5000]
+                    - key: topK
+                      label: Top K
+                      kind: question
+                      type: integer
+                      min: 1
+                      max: 30
+                    - key: minScore
+                      label: Minimum score
+                      kind: question
+                      type: number
+                      min: 0
+                      max: 1
+                      decimals: 2
+                  profiles:
+                    maxPerUser: 20
+                    maxNameLength: 100
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/configuration/resolve:
+    post:
+      tags: [Configuration]
+      operationId: resolveConfiguration
+      summary: Resolve the configuration a question would run with
+      security:
+        - bearerAuth: []
+      description: |
+        A dry run: it reads the database, calls no model and writes nothing. It builds the complete configuration
+        for each of the eleven settings from, in this order, the `overrides` of the request, the stored settings of
+        the profile named by `profileId`, and the default profile. Both fields are optional; a request with no body
+        resolves the default profile.
+
+        The result is checked against the caps, and nothing is clamped: a value outside a cap is a 400 with every
+        problem in `details`, so the snapshot always matches what would run. `hash` is the SHA-256 (lowercase hex) of
+        the canonical JSON of the `snapshot` (keys sorted at every level, no spaces, UTF-8). The profile id and the
+        dates are not part of it, so the same settings from two profiles, or two users, have the same hash.
+
+        The body is read up to 16 kB; a bigger one is a 413. A `profileId` that is not a UUID is a 400. A profile that
+        does not exist, or is another user's (an admin's too), is a 404.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveConfigurationRequest"
+            example:
+              profileId: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+              overrides:
+                topK: 5
+      responses:
+        "200":
+          description: The resolved configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolvedConfigurationResponse"
+              example:
+                success: true
+                message: Configuration resolved successfully
+                data:
+                  profileId: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  snapshot:
+                    version: 1
+                    settings:
+                      chunkSize: 1000
+                      embeddingModel: qwen3-embedding:0.6b
+                      retrievalMode: vector
+                      topK: 5
+                      minScore: 0.3
+                      neighborWindow: 1
+                      smallModel: qwen3.5:4b
+                      temperature: 0
+                      maxTokens: 1024
+                      answerLanguage: en
+                      answerMode: baseline
+                  hash: 0000000000000000000000000000000000000000000000000000000000000000
+        "400":
+          description: |
+            Either the body is not valid ("Validation error", with `details`: a setting out of its cap, a number
+            sent as text, an unknown setting or field, a `profileId` that is not a UUID), or the settings stored in the
+            profile are outside today's caps or hold a key this version does not have ("The configuration is not
+            valid", with `details`: every problem, not only the first).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                validation:
+                  value:
+                    message: Validation error
+                    details:
+                      - Top K must be at most 30
+                storedProfileOutsideCaps:
+                  value:
+                    message: The configuration is not valid
+                    details:
+                      - Top K must be at most 30
+                      - "Unknown setting: foo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The profile does not exist, or belongs to another user ("Profile not found").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: Profile not found
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: |
+            An unexpected failure ("Internal server error"). It is also the answer when the profile was saved by
+            another configuration version (this server cannot read it) and when the default profile in the database
+            is not valid; neither is the client's doing, and the details are only in the server's log.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: Internal server error
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/profiles:
+    get:
+      tags: [Profiles]
+      operationId: listProfiles
+      summary: The signed-in user's profiles
+      security:
+        - bearerAuth: []
+      description: |
+        The caller's own profiles, oldest first. A profile of another user is never listed, an admin's request
+        included. A profile saved before a cap changed is listed with what is wrong with it in `problems`.
+      responses:
+        "200":
+          description: The profiles; an empty list when the user has none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileListResponse"
+              example:
+                success: true
+                message: Profiles retrieved successfully
+                data:
+                  - id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                    name: Precise
+                    settings:
+                      topK: 5
+                      temperature: 0.5
+                    problems: []
+                    createdAt: "2026-11-27T12:00:00.000Z"
+                    updatedAt: "2026-11-27T12:00:00.000Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      tags: [Profiles]
+      operationId: createProfile
+      summary: Create a profile
+      security:
+        - bearerAuth: []
+      description: |
+        Saves a named set of settings for the signed-in user. Only the settings the user sets are stored; a setting
+        that is not stored takes the default when the configuration is resolved. The owner is always the signed-in
+        user: an `id`, `userId`, `version` or any other field in the body is a 400.
+
+        A user may keep at most 20 profiles by default (`profiles.maxPerUser` of `GET /v1/configuration`); the one
+        over the limit is a 409. A name is unique per user whatever its capitalization.
+
+        The name is stored in Unicode form NFC, with every kind of space turned into a plain space and the ends
+        trimmed. It must have 1 to 100 characters, hold a letter, number, symbol or punctuation, and no control,
+        invisible or zero-width characters (joined emoji sequences are refused for that reason). The count is made in
+        UTF-16 units, so a name of emoji can be refused a little before 100 characters.
+
+        The body is read up to 16 kB; a bigger one is a 413.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProfileRequest"
+            example:
+              name: Precise
+              settings:
+                topK: 5
+                temperature: 0.5
+      responses:
+        "201":
+          description: The profile was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileResponse"
+              example:
+                success: true
+                message: Profile created successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  name: Precise
+                  settings:
+                    topK: 5
+                    temperature: 0.5
+                  problems: []
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  updatedAt: "2026-11-27T12:00:00.000Z"
+        "400":
+          $ref: "#/components/responses/SettingsValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The account no longer exists ("User not found"). Rare: the token check normally answers 401 first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: User not found
+        "409":
+          description: |
+            The user has a profile with that name already ("A profile with that name already exists"), or the user is at
+            the limit ("You have reached the maximum number of profiles"). Nothing was stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                nameTaken:
+                  value:
+                    message: A profile with that name already exists
+                limitReached:
+                  value:
+                    message: You have reached the maximum number of profiles
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/profiles/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          The profile's id, in any case. An id that is not a UUID, an id that does not exist and the id of another
+          user's profile (an admin's request included) are the same 404.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Profiles]
+      operationId: getProfile
+      summary: One of the signed-in user's profiles
+      security:
+        - bearerAuth: []
+      description: |
+        Also works for a profile saved by another configuration version, and for one with settings outside today's
+        caps: reading is always allowed, and `problems` says what is wrong.
+      responses:
+        "200":
+          description: The profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileResponse"
+              example:
+                success: true
+                message: Profile retrieved successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  name: Precise
+                  settings:
+                    topK: 5
+                  problems: []
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  updatedAt: "2026-11-27T12:00:00.000Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ProfileNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [Profiles]
+      operationId: updateProfile
+      summary: Rename a profile or replace its settings
+      security:
+        - bearerAuth: []
+      description: |
+        Changes `name` and/or `settings`; at least one is required. The `settings` sent replace the stored ones as a
+        whole: a setting that is not sent is gone and takes the default again, and `{}` empties them. A rename alone
+        leaves the settings as they are, even when they are outside today's caps. The rules for the name are those
+        of `POST /v1/profiles`; renaming a profile to its own name in another capitalization is allowed.
+
+        A profile saved by another configuration version cannot be changed (409); it can still be read and deleted.
+
+        The body is read up to 16 kB; a bigger one is a 413.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProfileRequest"
+            example:
+              settings:
+                answerLanguage: es
+      responses:
+        "200":
+          description: The profile after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileResponse"
+              example:
+                success: true
+                message: Profile updated successfully
+                data:
+                  id: 3f2b8c1e-5d4a-4f6b-9a7c-1e2d3c4b5a69
+                  name: Precise
+                  settings:
+                    answerLanguage: es
+                  problems: []
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  updatedAt: "2026-11-27T12:30:00.000Z"
+        "400":
+          $ref: "#/components/responses/SettingsValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ProfileNotFound"
+        "409":
+          description: |
+            Another profile of the user has that name ("A profile with that name already exists"), or the profile was
+            saved by another configuration version ("This profile was saved by another configuration version").
+            Nothing was changed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                nameTaken:
+                  value:
+                    message: A profile with that name already exists
+                otherVersion:
+                  value:
+                    message: This profile was saved by another configuration version
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Profiles]
+      operationId: deleteProfile
+      summary: Delete a profile
+      security:
+        - bearerAuth: []
+      description: Works for any profile of the signed-in user, also one saved by another configuration version.
+      responses:
+        "200":
+          description: The profile was deleted. There is no `data`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+              example:
+                success: true
+                message: Profile deleted successfully
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ProfileNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -624,7 +1073,305 @@ components:
           type: array
           items:
             type: string
-          description: One entry per problem; present for validation errors only.
+          description: |
+            One entry per problem; present for validation errors only. An entry can hold text the client sent (an unknown
+            setting's key, cut to its first 64 characters and an ellipsis; an unknown top-level field's key, whole), so
+            render it as text, never as HTML.
+    Settings:
+      type: object
+      description: |
+        All eleven settings of configuration version 1, with the value each one has. Numbers are JSON numbers.
+        `chunkSize` is measured in characters.
+      required:
+        - chunkSize
+        - embeddingModel
+        - retrievalMode
+        - topK
+        - minScore
+        - neighborWindow
+        - smallModel
+        - temperature
+        - maxTokens
+        - answerLanguage
+        - answerMode
+      properties:
+        chunkSize:
+          type: integer
+          enum: [300, 500, 750, 1000, 2000, 5000]
+          description: Index time. The size of a chunk, in characters.
+        embeddingModel:
+          type: string
+          enum: [qwen3-embedding:0.6b]
+          description: Index time.
+        retrievalMode:
+          type: string
+          enum: [vector]
+        topK:
+          type: integer
+          minimum: 1
+          maximum: 30
+        minScore:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: At most 2 decimal places; more are refused, not rounded.
+        neighborWindow:
+          type: integer
+          enum: [1, 2]
+        smallModel:
+          type: string
+          enum: [qwen3.5:4b]
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: At most 2 decimal places; more are refused, not rounded.
+        maxTokens:
+          type: integer
+          minimum: 1
+          maximum: 1024
+        answerLanguage:
+          type: string
+          enum: [en, es]
+          description: Spanish prompts have not been evaluated yet.
+        answerMode:
+          type: string
+          enum: [baseline, structured]
+    SettingsInput:
+      type: object
+      additionalProperties: false
+      description: |
+        The settings a user chooses: each one is optional, and a key that is not one of the eleven settings is refused
+        (a setting is never accepted and ignored). Nothing is converted, rounded or clamped: a number written as text,
+        a value outside its cap and a number with too many decimals are each a 400.
+      properties:
+        chunkSize:
+          $ref: "#/components/schemas/Settings/properties/chunkSize"
+        embeddingModel:
+          $ref: "#/components/schemas/Settings/properties/embeddingModel"
+        retrievalMode:
+          $ref: "#/components/schemas/Settings/properties/retrievalMode"
+        topK:
+          $ref: "#/components/schemas/Settings/properties/topK"
+        minScore:
+          $ref: "#/components/schemas/Settings/properties/minScore"
+        neighborWindow:
+          $ref: "#/components/schemas/Settings/properties/neighborWindow"
+        smallModel:
+          $ref: "#/components/schemas/Settings/properties/smallModel"
+        temperature:
+          $ref: "#/components/schemas/Settings/properties/temperature"
+        maxTokens:
+          $ref: "#/components/schemas/Settings/properties/maxTokens"
+        answerLanguage:
+          $ref: "#/components/schemas/Settings/properties/answerLanguage"
+        answerMode:
+          $ref: "#/components/schemas/Settings/properties/answerMode"
+    SettingDefinition:
+      type: object
+      description: What one setting accepts. A setting has either `allowed` or `min` and `max`.
+      required: [key, label, kind, type]
+      properties:
+        key:
+          type: string
+          enum:
+            - chunkSize
+            - embeddingModel
+            - retrievalMode
+            - topK
+            - minScore
+            - neighborWindow
+            - smallModel
+            - temperature
+            - maxTokens
+            - answerLanguage
+            - answerMode
+        label:
+          type: string
+          description: The name to show; the error messages use it too.
+        kind:
+          type: string
+          enum: [index, question]
+          description: "`index`: changing it needs the documents indexed again. `question`: it applies to the next question."
+        type:
+          type: string
+          enum: [integer, number, string]
+        allowed:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: integer
+          description: The only values accepted, compared as written.
+        min:
+          type: number
+        max:
+          type: number
+        decimals:
+          type: integer
+          description: The most decimal places a value may have.
+    ConfigurationView:
+      type: object
+      required: [version, defaults, settings, profiles]
+      properties:
+        version:
+          type: integer
+          description: The configuration version this server reads.
+        defaults:
+          $ref: "#/components/schemas/Settings"
+        settings:
+          type: array
+          items:
+            $ref: "#/components/schemas/SettingDefinition"
+        profiles:
+          type: object
+          required: [maxPerUser, maxNameLength]
+          properties:
+            maxPerUser:
+              type: integer
+              description: The most profiles a user may keep.
+            maxNameLength:
+              type: integer
+              description: The longest profile name, in characters.
+    ConfigurationSnapshot:
+      type: object
+      description: The configuration a question runs with, complete and checked against the caps.
+      required: [version, settings]
+      properties:
+        version:
+          type: integer
+        settings:
+          $ref: "#/components/schemas/Settings"
+    ResolvedConfiguration:
+      type: object
+      required: [profileId, snapshot, hash]
+      properties:
+        profileId:
+          type:
+            - string
+            - "null"
+          format: uuid
+          description: The id of the profile asked for, in lower case; null when the request named none.
+        snapshot:
+          $ref: "#/components/schemas/ConfigurationSnapshot"
+        hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: |
+            SHA-256 in lowercase hex of the canonical JSON of the snapshot (keys sorted at every level, no spaces,
+            UTF-8). The profile id and the dates are not part of it. An identifier, not a security control.
+    Profile:
+      type: object
+      description: A saved configuration. The owner's id and the configuration version are never returned.
+      required: [id, name, settings, problems, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        settings:
+          type: object
+          additionalProperties: true
+          description: |
+            Only the settings the user set; the rest comes from the default when the configuration is resolved. They
+            are shown as stored: a profile saved before a cap changed can hold a value outside it, or a key this
+            version does not have (see `problems`).
+        problems:
+          type: array
+          items:
+            type: string
+          description: |
+            What is wrong with the stored settings today, one sentence each. Empty for a profile made through this API,
+            whose settings were checked first. A profile with problems is refused with a 400 when it is resolved. An
+            entry can hold the key of an unknown setting (cut to 64 characters), so render it as text.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CreateProfileRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Trimmed and normalized (Unicode NFC); unique per user whatever its capitalization. See `POST /v1/profiles` for what a name may hold.
+        settings:
+          $ref: "#/components/schemas/SettingsInput"
+    UpdateProfileRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        settings:
+          $ref: "#/components/schemas/SettingsInput"
+    ResolveConfigurationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        profileId:
+          type: string
+          format: uuid
+          description: The profile to start from, one of the caller's own. Plain hyphenated form, any case.
+        overrides:
+          $ref: "#/components/schemas/SettingsInput"
+    ConfigurationViewResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/ConfigurationView"
+    ResolvedConfigurationResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/ResolvedConfiguration"
+    ProfileResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/Profile"
+    ProfileListResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Profile"
   responses:
     Unauthorized:
       description: |
@@ -663,6 +1410,49 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             message: You do not have permission to perform this action
+    SettingsValidationError:
+      description: |
+        The body does not pass validation ("Validation error"). `details` has one sentence per problem, and every
+        problem of the body is listed: a name that is empty, too long or has invisible characters, a setting outside its
+        cap or sent as text, a setting this version does not have ("Unknown setting: <key>", the key cut to 64
+        characters), an unknown field, an empty body on PATCH ("At least one field must be provided"). A body that is
+        not valid JSON is also a 400, with a `message` and no `details`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            outsideCap:
+              value:
+                message: Validation error
+                details:
+                  - Top K must be at most 30
+            unknownSetting:
+              value:
+                message: Validation error
+                details:
+                  - "Unknown setting: foo"
+            name:
+              value:
+                message: Validation error
+                details:
+                  - Name cannot be empty
+    ProfileNotFound:
+      description: The profile does not exist, is not the caller's (an admin's request included), or the id is not a UUID ("Profile not found").
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Profile not found
+    PayloadTooLarge:
+      description: The body is over 16 kB ("request entity too large"). It is refused before it is parsed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: request entity too large
     NotFound:
       description: |
         The path does not exist ("Route not found"). Under `/v1` it needs a valid token first; otherwise the

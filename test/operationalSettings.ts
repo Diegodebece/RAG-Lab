@@ -21,6 +21,8 @@ export const OPERATIONAL_DEFAULTS: Record<string, string> = {
     FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES: "5",
     PASSWORD_CHANGES_PER_15_MINUTES: "5",
     USER_CREATIONS_PER_HOUR: "20",
+    // profiles one user may keep (layer 3)
+    MAX_PROFILES_PER_USER: "20",
     // a closed port: a test that forgets to start the fake Ollama gets "connection refused" instead of reaching
     // the real models on this computer
     OLLAMA_BASE_URL: "http://127.0.0.1:1"

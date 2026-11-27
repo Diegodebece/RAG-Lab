@@ -8,7 +8,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 before(resetTestDatabase);
 
-beforeEach(() => ownerPool.query("TRUNCATE users"));
+beforeEach(() => ownerPool.query("TRUNCATE users CASCADE"));
 
 after(closeTestPools);
 

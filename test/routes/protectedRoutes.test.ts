@@ -69,7 +69,14 @@ describe("the protected section of /v1", () => {
             ["get", "/v1/users/me"],
             ["patch", "/v1/users/me/password"],
             ["post", "/v1/users"],
-            ["patch", `/v1/users/${randomUUID()}`]
+            ["patch", `/v1/users/${randomUUID()}`],
+            ["get", "/v1/configuration"],
+            ["post", "/v1/configuration/resolve"],
+            ["get", "/v1/profiles"],
+            ["post", "/v1/profiles"],
+            ["get", `/v1/profiles/${randomUUID()}`],
+            ["patch", `/v1/profiles/${randomUUID()}`],
+            ["delete", `/v1/profiles/${randomUUID()}`]
         ];
 
         for (const [method, path] of noToken) {
@@ -83,6 +90,31 @@ describe("the protected section of /v1", () => {
 
         assert.equal(login.status, 400, "login does not ask for a token: it answers the empty body with a validation error");
         assert.equal(login.body.message, "Validation error");
+    });
+});
+
+// The test above also passes for a path that does not exist (every /v1 path asks for a token first), so this one
+// shows the seven routes of layer 3 are mounted behind the token. One account per request: the limit of this file
+// is three requests a minute for each account.
+describe("the configuration and profile routes", () => {
+    it("exist: with a valid token none of the seven answers 'Route not found'", { timeout: 20_000 }, async () => {
+        const routes: [string, string][] = [
+            ["get", "/v1/configuration"],
+            ["post", "/v1/configuration/resolve"],
+            ["get", "/v1/profiles"],
+            ["post", "/v1/profiles"],
+            ["get", `/v1/profiles/${randomUUID()}`],
+            ["patch", `/v1/profiles/${randomUUID()}`],
+            ["delete", `/v1/profiles/${randomUUID()}`]
+        ];
+
+        for (const [index, [method, path]] of routes.entries()) {
+            const user = await createTestUser({ email: `route${index}@example.com` });
+            const response = await request(app)[method as "get"](path).set(...user.auth);
+
+            assert.notEqual(response.body.message, "Route not found", `${method} ${path}`);
+            assert.notEqual(response.status, 401, `${method} ${path}`);
+        }
     });
 });
 

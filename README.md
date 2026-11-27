@@ -4,7 +4,7 @@ A RAG API built by a team of Claude Code agents. It answers questions about uplo
 
 The design, with every decision and its reason, is in [docs/design.md](docs/design.md); the architecture and the decisions taken while building are in [docs/project-guide.md](docs/project-guide.md).
 
-> **Status:** layer 2 of 13, Accounts and authentication, is built on top of layer 1 (Foundations): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There are no documents or questions yet. The order of the layers is in the [design](docs/design.md#13-build-order).
+> **Status:** layer 3 of 13, Configuration as data, is built on top of layer 2 (Accounts and authentication) and layer 1 (Foundations): the settings users may change with their caps, a default profile in the database, each user's own profiles, and a resolver that turns them into one configuration with a hash. Layer 2 gave accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There are no documents or questions yet. The order of the layers is in the [design](docs/design.md#13-build-order).
 
 ## Requirements
 
@@ -116,6 +116,10 @@ The database already has its tables, and `.env` has the old `DATABASE_URL`, whic
 
 The server stops at startup if `DATABASE_URL` still connects as the owner, and says to use the role `rag_lab_api`.
 
+### An existing checkout (after layer 3 is merged)
+
+Run `npm run migrate` (step 9). Migration `004_default_profile.sql` creates and fills the default profile, and `005_profiles.sql` creates the profiles table. The server refuses to start while they are pending, and when the default profile in the database is missing or outside the caps, or a stored profile is at another configuration version.
+
 ## Scripts
 
 | Script | What it does |
@@ -162,14 +166,23 @@ All paths start with `/v1`. Protected endpoints need the header `Authorization: 
 | `PATCH /users/me/password` | Token | Body `{ currentPassword, newPassword }` (8 to 64 characters); answers with a new `token`, and the old ones stop working. 5 attempts per 15 minutes |
 | `POST /users` | Admin | Creates an account: `{ email, password, role? }`; answers `201`. 20 attempts per hour |
 | `PATCH /users/:id` | Admin | Changes another account's `role` and/or `status` (`active` or `disabled`); never your own |
+| `GET /configuration` | Token | What each setting accepts (type, allowed values or range), the defaults the database holds, and the limits on profiles |
+| `POST /configuration/resolve` | Token | Body `{ profileId?, overrides? }`, both optional; answers the complete configuration a question would run with, and its hash. A dry run: it calls no model |
+| `GET /profiles` | Token | The caller's profiles, oldest first, each with its `problems` |
+| `POST /profiles` | Token | Body `{ name, settings? }`; answers `201`. `409` over `MAX_PROFILES_PER_USER` or for a name the user already has |
+| `GET /profiles/:id` | Token | One of the caller's profiles; another user's is a `404`, an admin's too |
+| `PATCH /profiles/:id` | Token | Body with `name` and/or `settings`, at least one; the settings sent replace the stored ones |
+| `DELETE /profiles/:id` | Token | Deletes the profile |
 
-Successful responses look like `{ success: true, message, data }`; errors look like `{ message }`, with `details` for validation errors. While the database cannot be reached, every endpoint except `GET /health` answers `503`.
+Numbers in settings must be JSON numbers, never text, and a value outside its cap is refused, never rounded or clamped. Successful responses look like `{ success: true, message, data }`; errors look like `{ message }`, with `details` for validation errors. While the database cannot be reached, every endpoint except `GET /health` answers `503`.
 
 ## Configuration
 
 Every variable is in [.env.example](.env.example), with its default and range. A value out of range, or not written as plain decimal digits, stops the API at startup. The server also refuses to start with a missing or placeholder `SECRET_KEY`, or with an `OLLAMA_BASE_URL` that is not an absolute http or https URL.
 
 `DATABASE_URL` must connect as the role `rag_lab_api`. The server refuses to start when that role is a superuser, can create roles or databases, can create objects in the database or in the `public` schema, owns tables there, is a member of another role, or acts as another role than the one that logged in: the owner's URL belongs in `MIGRATION_DATABASE_URL`. If the database cannot be reached at startup, the server starts anyway, checks again every 3 seconds, and answers `503` on every route but `GET /v1/health` until the check passes. The limits of the account routes (`REQUESTS_PER_ADDRESS_PER_MINUTE`, `LOGINS_PER_15_MINUTES`, `FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES`, `PASSWORD_CHANGES_PER_15_MINUTES`, `USER_CREATIONS_PER_HOUR`) have defaults and are counted in memory, so they reset when the API restarts. Behind a tunnel, `TRUSTED_PROXIES` must match it, or every user shares one address and one counter.
+
+A user may keep at most `MAX_PROFILES_PER_USER` profiles (default 20, range 1 to 1000). The values the settings may take (chunk size, models, top K and the rest) are capped in the code, in `src/v1/config/configuration.config.ts`, not in `.env`; the defaults are the row of the `default_profile` table, which only a migration changes. At startup the server also refuses a default profile that is missing or outside the caps, and a stored profile at another configuration version.
 
 ## Project structure
 

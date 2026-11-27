@@ -5,7 +5,9 @@ import { currentUserMiddleware } from "./middlewares/currentUser.middleware.js";
 import { databaseReadyMiddleware } from "./middlewares/databaseReady.middleware.js";
 import { rateLimitMiddleware } from "./middlewares/rateLimit.middleware.js";
 import { authProtectedRouter, authRouter } from "./routes/auth.routes.js";
+import { configurationRouter } from "./routes/configuration.routes.js";
 import { healthRouter } from "./routes/health.routes.js";
+import { profilesRouter } from "./routes/profiles.routes.js";
 import { usersRouter } from "./routes/users.routes.js";
 
 export const v1Router = express.Router({ mergeParams: true });
@@ -34,3 +36,5 @@ v1Router.use(currentUserMiddleware);
 // protected routes: the next layers mount theirs here
 v1Router.use("/auth", authProtectedRouter);
 v1Router.use("/users", usersRouter);
+v1Router.use("/configuration", configurationRouter);
+v1Router.use("/profiles", profilesRouter);
