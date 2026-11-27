@@ -3,6 +3,6 @@
 // checked at startup by getStartupConfigProblems (env.config.ts).
 export const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://localhost:11434").replace(/\/+$/, "");
 
-// The models the API needs installed to be fully healthy: the router and the embedding model. The answer
-// models become profile settings (checked against caps) in a later layer, so they are not listed here.
+// The models the API needs installed to be fully healthy: the router and the embedding model. The models a profile may
+// choose are limited by the caps in configuration.config.ts, and the answer models are added there when they exist.
 export const REQUIRED_MODELS = ["qwen3.5:4b", "qwen3-embedding:0.6b"];

@@ -1,8 +1,8 @@
 import { readIntegerSetting } from "./env.config.js";
 
 // Server-side limits; each one can be overridden in .env (a value outside its range, or not written as plain
-// decimal digits, stops the app at startup; it is never shortened to fit). The caps on the settings users change
-// (layer 3) will live here too.
+// decimal digits, stops the app at startup; it is never shortened to fit). The caps on the values of the settings users
+// change live in configuration.config.ts, next to the definitions they belong to.
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -43,6 +43,9 @@ export const PASSWORD_CHANGE_WINDOW_MS = 15 * MINUTE_MS;
 export const USER_CREATIONS_PER_HOUR = readIntegerSetting("USER_CREATIONS_PER_HOUR", 20);
 
 export const USER_CREATION_WINDOW_MS = HOUR_MS;
+
+// profiles one user may keep: each one is a row the user can fill with settings, so the number is capped
+export const MAX_PROFILES_PER_USER = readIntegerSetting("MAX_PROFILES_PER_USER", 20);
 
 // health checks per client address per minute; the endpoint is public
 export const HEALTH_CHECKS_PER_MINUTE = readIntegerSetting("HEALTH_CHECKS_PER_MINUTE", 30);
