@@ -74,8 +74,10 @@ describe("the search requests per minute of one user (QUESTIONS_PER_MINUTE)", ()
         // ...and can still upload a document and ask for an index
         const upload = await request(app).post("/v1/documents").set(...ana.auth).send({ filename: "notes.txt", text: "A short invented text about nothing." });
         assert.equal(upload.status, 202, JSON.stringify(upload.body));
-        const build = await request(app).post(`/v1/documents/${upload.body.data.id}/indexes`).set(...ana.auth).send({ chunkSize: 500 });
-        assert.ok(build.status === 202 || build.status === 200, `an index build is not counted with the searches: ${build.status} ${JSON.stringify(build.body)}`);
+        // the upload queued the index of the default size (1000) and no worker runs here, so asking for it again is the 200
+        // "already there": a new size would be the 409 of builds in progress (layer 4), which says nothing about this counter
+        const build = await request(app).post(`/v1/documents/${upload.body.data.id}/indexes`).set(...ana.auth).send({ chunkSize: 1000 });
+        assert.equal(build.status, 200, `an index request is not counted with the searches: ${build.status} ${JSON.stringify(build.body)}`);
 
         // bob uses up his uploads (5 a minute) and his index builds (5 a minute): his searches are untouched
         for (let attempt = 1; attempt <= 5; attempt++) {
