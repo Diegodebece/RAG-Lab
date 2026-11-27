@@ -10,8 +10,10 @@ process.env.SECRET_KEY = SECRET;
 const { app } = await import("../../src/app.js");
 const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
 const { createTestUser } = await import("./testUsers.js");
+const { LONG_KEY, LONG_KEY_DETAIL, PROTO_WITH_OTHER_ERRORS, assertDetails } = await import("../configurationFixtures.js");
 
 const NOT_FOUND = { message: "Profile not found" };
+const OTHER_VERSION = { message: "This profile was saved by another configuration version" };
 const INVALID_TOKEN = { message: "Invalid or expired authentication token" };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -69,6 +71,11 @@ const rowById = async (id: string): Promise<Row | undefined> =>
 // a profile the way an older version of the app, or the owner, could have left it
 const seedRaw = async (userId: string, name: string, settings: string): Promise<string> =>
     (await ownerPool.query<{ id: string }>("INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, $2, 1, $3::jsonb) RETURNING id", [userId, name, settings])).rows[0].id;
+
+// a profile that another version of the app left behind, or the owner changed: the version column is never the client's
+const setVersion = async (id: string, version: number): Promise<void> => {
+    await ownerPool.query("UPDATE profiles SET version = $2 WHERE id = $1", [id, version]);
+};
 
 const PROFILE_KEYS = ["createdAt", "id", "name", "problems", "settings", "updatedAt"];
 
@@ -206,16 +213,117 @@ describe("POST /v1/profiles", () => {
         assert.equal(Object.hasOwn(Object.prototype, "polluted"), false);
     });
 
-    it("answers 400 for a missing name, an empty one, one with an invisible character and one of 101 characters", { timeout: 15_000 }, async () => {
+    it("answers 400 for a missing name, an empty one, one with an invisible character and one of 101 characters, each with its own detail", { timeout: 15_000 }, async () => {
         const ana = await createTestUser({ email: "ana@example.com" });
 
-        for (const body of [{}, { name: "" }, { name: "   " }, { name: `a${String.fromCodePoint(0x200b)}b` }, { name: "a".repeat(101) }, { name: 5 }]) {
+        const cases: [body: object, details: string[]][] = [
+            [{}, ["Name is required"]],
+            [{ name: "" }, ["Name cannot be empty"]],
+            [{ name: "   " }, ["Name cannot be empty"]],
+            [{ name: `a${String.fromCodePoint(0x200b)}b` }, ["Name cannot contain control or invisible characters"]],
+            [{ name: "a".repeat(101) }, ["Name cannot have more than 100 characters"]],
+            [{ name: 5 }, ["Name must be a string"]],
+            [{ name: null }, ["Name must be a string"]],
+            [{ name: ["Precise"] }, ["Name must be a string"]]
+        ];
+
+        for (const [body, details] of cases) {
             const response = await create(ana.auth, body);
 
             assert.equal(response.status, 400, JSON.stringify(body).slice(0, 40));
             assert.equal(response.body.message, "Validation error");
+            assert.deepEqual(response.body.details, details, JSON.stringify(body).slice(0, 40));
         }
 
+        assert.equal(await countAll(), 0);
+    });
+
+    it("answers 400 for a name made only of a combining mark, and for names of blank-looking characters, and stores nothing", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const marksOnly = await create(ana.auth, { name: String.fromCodePoint(0x301) });
+        assert.equal(marksOnly.status, 400);
+        assert.deepEqual(marksOnly.body.details, ["Name must contain a letter, number, symbol or punctuation"]);
+
+        for (const codePoint of [0x3164, 0x115f, 0x1160, 0xffa0, 0x034f, 0x2800]) {
+            const response = await create(ana.auth, { name: `a${String.fromCodePoint(codePoint)}b` });
+
+            assert.equal(response.status, 400, `U+${codePoint.toString(16)}`);
+            assert.deepEqual(response.body.details, ["Name cannot contain control or invisible characters"], `U+${codePoint.toString(16)}`);
+        }
+
+        assert.equal(await countAll(), 0);
+    });
+
+    // the zero-width joiner is a format character, so every joined emoji is refused: the known cost of refusing them all
+    it("answers 400 for a name with a joined emoji sequence, which holds zero-width joiners", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await create(ana.auth, { name: `Family ${String.fromCodePoint(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467)}` });
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.message, "Validation error");
+        assert.deepEqual(response.body.details, ["Name cannot contain control or invisible characters"]);
+        assert.equal(await countAll(), 0);
+    });
+
+    it("stores a space of category Zs inside the name as a plain space", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await create(ana.auth, { name: `a${String.fromCodePoint(0xa0)}b` });
+
+        assert.equal(response.status, 201);
+        assert.equal(response.body.data.name, "a b", "answered with a plain space");
+        assert.equal((await rowsOf(ana.id))[0].name, "a b", "stored with a plain space");
+    });
+
+    it("answers 409 for a name that differs from one the user has only by a no-break space, an em space or an ideographic space", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        assert.equal((await create(ana.auth, { name: "a b" })).status, 201);
+
+        for (const codePoint of [0xa0, 0x2003, 0x3000]) {
+            const response = await create(ana.auth, { name: `a${String.fromCodePoint(codePoint)}b` });
+
+            assert.equal(response.status, 409, `U+${codePoint.toString(16)}`);
+            assert.deepEqual(response.body, { message: "A profile with that name already exists" });
+        }
+
+        assert.equal((await rowsOf(ana.id)).length, 1);
+    });
+
+    it("accepts a heart with a variation selector, a plain emoji and an accented name, and stores them as they are", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        for (const name of [`Heart ${String.fromCodePoint(0x2764, 0xfe0f)}`, `Thumbs ${String.fromCodePoint(0x1f44d)}`, `Caf${String.fromCodePoint(0xe9)} ${String.fromCodePoint(0xf1)}`]) {
+            const response = await create(ana.auth, { name });
+
+            assert.equal(response.status, 201, name);
+            assert.equal(response.body.data.name, name);
+        }
+    });
+
+    it("answers 400, reporting all three problems, for settings with a __proto__ key, a value past its cap and an unknown key", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await createRaw(ana.auth, `{"name": "Proto", "settings": ${PROTO_WITH_OTHER_ERRORS}}`);
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.message, "Validation error");
+        assert.equal(response.body.details.length, 3, JSON.stringify(response.body.details));
+        assert.ok(response.body.details.includes("Unknown setting: __proto__"));
+        assert.ok(response.body.details.includes("Unknown setting: foo"));
+        assert.ok(response.body.details.some((detail: string) => /^Top K.*at most 30/.test(detail)));
+        assert.equal(await countAll(), 0);
+    });
+
+    it("answers 400 echoing an unknown setting of 15,000 characters cut to its first 64 and an ellipsis", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await create(ana.auth, { name: "Long", settings: { [LONG_KEY]: 1 } });
+
+        assert.equal(response.status, 400);
+        assertDetails(response.body.details, [LONG_KEY_DETAIL]);
+        assert.ok(!response.text.includes("k".repeat(65)), "the answer does not carry the key back");
         assert.equal(await countAll(), 0);
     });
 
@@ -325,6 +433,29 @@ describe("GET /v1/profiles", () => {
         assert.deepEqual(fine.problems, []);
     });
 
+    it("shows a profile saved by another configuration version, with 200: reading is allowed", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Old", settings: { topK: 5 } });
+        await createdId(ana.auth, { name: "Current" });
+        await setVersion(id, 2);
+
+        const response = await list(ana.auth);
+
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body.data.map((profile: { name: string }) => profile.name), ["Old", "Current"]);
+        assert.deepEqual(response.body.data[0].settings, { topK: 5 });
+    });
+
+    it("echoes an unknown key of a stored profile cut to 64 characters in its problems", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        await seedRaw(ana.id, "Long", JSON.stringify({ [LONG_KEY]: 1 }));
+
+        const response = await list(ana.auth);
+
+        assert.equal(response.status, 200);
+        assertDetails(response.body.data[0].problems, [LONG_KEY_DETAIL]);
+    });
+
     it("does not list another user's profile to an admin either", { timeout: 15_000 }, async () => {
         const ana = await createTestUser({ email: "ana@example.com" });
         const boss = await createTestUser({ email: "boss@example.com", role: "admin" });
@@ -395,6 +526,18 @@ describe("GET /v1/profiles/:id", () => {
         assert.deepEqual(response.body.data.settings, { topK: 31 });
         assert.equal(response.body.data.problems.length, 1);
         assert.match(response.body.data.problems[0], /^Top K/);
+    });
+
+    it("shows a profile saved by another configuration version, with 200: reading is allowed", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Old", settings: { topK: 5 } });
+        await setVersion(id, 2);
+
+        const response = await show(ana.auth, id);
+
+        assert.equal(response.status, 200);
+        assert.equal(response.body.data.name, "Old");
+        assert.deepEqual(response.body.data.settings, { topK: 5 });
     });
 
     it("answers an admin with 404 for another user's profile", { timeout: 15_000 }, async () => {
@@ -561,6 +704,95 @@ describe("PATCH /v1/profiles/:id", () => {
         assert.equal(Object.hasOwn(Object.prototype, "polluted"), false);
     });
 
+    // The version column says which definition of the settings the stored ones were written for. A profile at another
+    // version is not this code's to rewrite: saving it as version 1 would mark settings of another shape as current.
+    it("answers 409 'This profile was saved by another configuration version', and changes nothing, for a profile at another version", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Old", settings: { topK: 5 } });
+        await setVersion(id, 2);
+        const before = await rowById(id);
+
+        assert.equal(before?.version, 2);
+
+        for (const body of [{ name: "Renamed" }, { settings: { topK: 9 } }, { name: "Renamed", settings: { topK: 9 } }, { settings: {} }]) {
+            const response = await update(ana.auth, id, body);
+
+            assert.equal(response.status, 409, JSON.stringify(body));
+            assert.deepEqual(response.body, OTHER_VERSION, JSON.stringify(body));
+        }
+
+        assert.deepEqual(await rowById(id), before, "the row is exactly as it was: version 2, the name, the settings and the date");
+    });
+
+    it("answers 404, and not 409, for another user's profile that is at another version", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const bob = await createTestUser({ email: "bob@example.com" });
+        const id = await createdId(ana.auth, { name: "Old" });
+        await setVersion(id, 2);
+
+        const response = await update(bob.auth, id, { name: "Hijacked" });
+
+        assert.equal(response.status, 404);
+        assert.deepEqual(response.body, NOT_FOUND);
+    });
+
+    it("renames a profile without touching its settings, even when they are outside today's caps, and keeps version 1", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await seedRaw(ana.id, "Stale", "{\"topK\": 31, \"foo\": 1, \"temperature\": 0.5}");
+
+        const response = await update(ana.auth, id, { name: "Renamed" });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.name, "Renamed");
+        assert.deepEqual(response.body.data.settings, { topK: 31, foo: 1, temperature: 0.5 });
+
+        const row = await rowById(id);
+        assert.deepEqual(row?.settings, { topK: 31, foo: 1, temperature: 0.5 }, "the stored settings are exactly as they were");
+        assert.equal(row?.version, 1);
+    });
+
+    it("answers 400 for settings with a __proto__ key, a value past its cap and an unknown key, reporting all three, and changes nothing", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Mine", settings: { topK: 5 } });
+        const before = await rowsOf(ana.id);
+
+        const response = await patchRaw(ana.auth, id, `{"settings": ${PROTO_WITH_OTHER_ERRORS}}`);
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.details.length, 3, JSON.stringify(response.body.details));
+        assert.ok(response.body.details.includes("Unknown setting: __proto__"));
+        assert.ok(response.body.details.includes("Unknown setting: foo"));
+        assert.ok(response.body.details.some((detail: string) => /^Top K.*at most 30/.test(detail)));
+        assert.deepEqual(await rowsOf(ana.id), before);
+    });
+
+    it("answers 409 when a new name differs from another profile's only by a no-break space", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        await create(ana.auth, { name: "a b" });
+        const other = await createdId(ana.auth, { name: "Other" });
+
+        const response = await update(ana.auth, other, { name: `a${String.fromCodePoint(0xa0)}b` });
+
+        assert.equal(response.status, 409);
+        assert.deepEqual(response.body, { message: "A profile with that name already exists" });
+        assert.equal((await rowById(other))?.name, "Other");
+    });
+
+    it("answers 400 for a name of a combining mark alone, for a blank-looking character and for a joined emoji, and changes nothing", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Mine" });
+        const before = await rowsOf(ana.id);
+
+        for (const name of [String.fromCodePoint(0x301), `a${String.fromCodePoint(0x3164)}b`, `a${String.fromCodePoint(0x1f468, 0x200d, 0x1f469)}b`]) {
+            const response = await update(ana.auth, id, { name });
+
+            assert.equal(response.status, 400, JSON.stringify(name));
+            assert.equal(response.body.message, "Validation error");
+        }
+
+        assert.deepEqual(await rowsOf(ana.id), before);
+    });
+
     it("answers 413 for a body over 16 kB", { timeout: 15_000 }, async () => {
         const ana = await createTestUser({ email: "ana@example.com" });
         const id = await createdId(ana.auth, { name: "Mine" });
@@ -600,6 +832,18 @@ describe("DELETE /v1/profiles/:id", () => {
         assert.equal((await show(ana.auth, id)).status, 404);
         assert.equal(await rowById(id), undefined);
         assert.equal((await remove(ana.auth, id)).status, 404, "a second delete finds nothing");
+    });
+
+    // the way out for a profile the server can no longer read or rewrite
+    it("deletes a profile that was saved by another configuration version", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const id = await createdId(ana.auth, { name: "Old" });
+        await setVersion(id, 2);
+
+        const response = await remove(ana.auth, id);
+
+        assert.equal(response.status, 200);
+        assert.equal(await rowById(id), undefined);
     });
 
     it("answers 404, and leaves the row, for another user's profile and for ids that are not anyone's", { timeout: 15_000 }, async () => {

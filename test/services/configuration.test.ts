@@ -5,7 +5,7 @@ import { pool } from "../../src/v1/config/db.config.js";
 import { getConfigurationProblemsService, resolveConfigurationService } from "../../src/v1/services/configuration.service.js";
 import { AppError } from "../../src/v1/utils/appError.util.js";
 import { closeTestPools, ownerPool, resetTestDatabase } from "../db/testDatabase.js";
-import { DEFAULT_SETTINGS, DEFAULT_SNAPSHOT_HASH, DEFAULT_SNAPSHOT_TEXT, SETTING_KEYS, canonicalText, sha256Hex } from "../configurationFixtures.js";
+import { DEFAULT_SETTINGS, DEFAULT_SNAPSHOT_HASH, DEFAULT_SNAPSHOT_TEXT, ELLIPSIS, LONG_KEY, LONG_KEY_DETAIL, PROTO_WITH_OTHER_ERRORS, SETTING_KEYS, assertDetails, canonicalText, sha256Hex } from "../configurationFixtures.js";
 
 // resolveConfigurationService(userId, { profileId?, overrides? }) turns a user's choices into the complete
 // configuration a question will use, and getConfigurationProblemsService(pool) is what the server asks at startup.
@@ -46,6 +46,20 @@ const rejection = async (promise: Promise<unknown>): Promise<AppError> => {
         await promise;
     } catch (error) {
         assert.ok(error instanceof AppError, `an AppError, not ${String(error)}`);
+        return error;
+    }
+
+    assert.fail("it resolved, and it should have been refused");
+};
+
+// data the server cannot use is the server's problem and not the client's: a plain Error, which errorMiddleware answers
+// with the generic 500, and never an AppError (whose message and details reach the client)
+const serverFailure = async (promise: Promise<unknown>): Promise<Error> => {
+    try {
+        await promise;
+    } catch (error) {
+        assert.ok(error instanceof Error, `an Error, not ${String(error)}`);
+        assert.ok(!(error instanceof AppError), `a plain Error (a 500), not an AppError with status ${(error as AppError).status}`);
         return error;
     }
 
@@ -179,6 +193,88 @@ describe("resolveConfigurationService", () => {
         const constructed = await rejection(resolve(user, { profileId: constructorId }));
         assert.equal(constructed.status, 400);
         assert.deepEqual(constructed.details, ["Unknown setting: constructor"]);
+
+        assertPrototypeIsClean();
+    });
+
+    it("fails with a plain error, not a 400, when the default profile was damaged after the server started: a setting past its cap, or one missing", { timeout: 15_000 }, async () => {
+        const user = await seedUser("ana@example.com");
+        const profileId = await seedProfile(user, "{\"temperature\": 0.5}");
+
+        for (const assignment of ["settings = jsonb_set(settings, '{topK}', '31')", "settings = settings - 'topK'"]) {
+            await ownerPool.query(`UPDATE default_profile SET ${assignment}`);
+
+            await serverFailure(resolve(user, {}));
+            await serverFailure(resolve(user, { profileId }));
+
+            await ownerPool.query("UPDATE default_profile SET settings = $1::jsonb", [JSON.stringify(DEFAULT_SETTINGS)]);
+        }
+
+        assert.equal((await resolve(user, {})).snapshot.settings.topK, 3, "put back, it resolves again");
+    });
+
+    it("fails with a plain error, not a 400, for a profile saved by another configuration version", { timeout: 15_000 }, async () => {
+        const user = await seedUser("ana@example.com");
+        const profileId = await seedProfile(user, "{\"topK\": 5}", "Old", 2);
+
+        await serverFailure(resolve(user, { profileId }));
+        await serverFailure(resolve(user, { profileId, overrides: { topK: 7 } }));
+    });
+
+    it("answers 404 for another user's profile at another version, before it says anything about the version", { timeout: 15_000 }, async () => {
+        const ana = await seedUser("ana@example.com");
+        const bob = await seedUser("bob@example.com");
+        const anas = await seedProfile(ana, "{}", "Old", 2);
+
+        const error = await rejection(resolve(bob, { profileId: anas }));
+
+        assert.equal(error.status, 404);
+        assert.equal(error.message, "Profile not found");
+    });
+
+    it("refuses with 400 'The configuration is not valid' overrides that are outside the caps, when the service is given them directly", { timeout: 15_000 }, async () => {
+        const user = await seedUser("ana@example.com");
+
+        const error = await rejection(resolve(user, { overrides: { topK: 31, foo: 1 } }));
+
+        assert.equal(error.status, 400);
+        assert.equal(error.message, "The configuration is not valid");
+        assert.equal(error.details?.length, 2, JSON.stringify(error.details));
+        assert.ok(error.details?.some((detail) => /^Top K/.test(detail)));
+        assert.ok(error.details?.includes("Unknown setting: foo"));
+    });
+
+    it("echoes an unknown key of a stored profile or of the overrides cut to its first 64 characters and an ellipsis, and a key of 64 whole", { timeout: 15_000 }, async () => {
+        const user = await seedUser("ana@example.com");
+        const storedLong = await seedProfile(user, JSON.stringify({ [LONG_KEY]: 1 }), "Long");
+        const storedEdge = await seedProfile(user, JSON.stringify({ ["k".repeat(64)]: 1, ["j".repeat(65)]: 1 }), "Edge");
+
+        const stored = await rejection(resolve(user, { profileId: storedLong }));
+        assertDetails(stored.details, [LONG_KEY_DETAIL], "a stored profile");
+        assert.ok((stored.details?.[0].length ?? 1000) < 100);
+
+        const edge = await rejection(resolve(user, { profileId: storedEdge }));
+        assertDetails(edge.details?.slice().sort(), [`Unknown setting: ${"j".repeat(64)}${ELLIPSIS}`, `Unknown setting: ${"k".repeat(64)}`], "the edge of 64");
+
+        const given = await rejection(resolve(user, { overrides: { [LONG_KEY]: 1 } }));
+        assertDetails(given.details, [LONG_KEY_DETAIL], "the overrides");
+    });
+
+    // an own "__proto__" key made by JSON.parse, in the stored settings and in the overrides, next to two other problems
+    it("reports a __proto__ key together with a value past its cap and an unknown key, all three, in a stored profile and in the overrides", { timeout: 15_000 }, async () => {
+        const user = await seedUser("ana@example.com");
+        const profileId = await seedProfile(user, PROTO_WITH_OTHER_ERRORS);
+
+        for (const error of [
+            await rejection(resolve(user, { profileId })),
+            await rejection(resolve(user, { overrides: JSON.parse(PROTO_WITH_OTHER_ERRORS) as object }))
+        ]) {
+            assert.equal(error.status, 400);
+            assert.equal(error.details?.length, 3, JSON.stringify(error.details));
+            assert.ok(error.details?.includes("Unknown setting: __proto__"));
+            assert.ok(error.details?.includes("Unknown setting: foo"));
+            assert.ok(error.details?.some((detail) => /^Top K.*at most 30/.test(detail)));
+        }
 
         assertPrototypeIsClean();
     });
@@ -326,6 +422,14 @@ describe("getConfigurationProblemsService", () => {
         const found = await problems();
 
         assert.ok(found.includes("Unknown setting: foo"), JSON.stringify(found));
+    });
+
+    it("names a default with a setting of a very long name cut to 64 characters", { timeout: 15_000 }, async () => {
+        await ownerPool.query("UPDATE default_profile SET settings = settings || $1::jsonb", [JSON.stringify({ [LONG_KEY]: 1 })]);
+
+        const found = await problems();
+
+        assertDetails(found, [LONG_KEY_DETAIL]);
     });
 
     it("names a default setting outside its cap", { timeout: 15_000 }, async () => {

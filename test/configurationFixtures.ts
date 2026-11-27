@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 // What the tests of layer 3 (configuration as data) expect, written out here and not read from the app: a test that
@@ -19,6 +20,30 @@ export const DEFAULT_SETTINGS: Record<string, string | number> = {
 };
 
 export const SETTING_KEYS: string[] = Object.keys(DEFAULT_SETTINGS);
+
+// An unknown setting key is echoed back in a detail only up to 64 characters; a longer one is cut there and ends in
+// this sign (U+2026). Built from its number, so this file holds no character that is hard to see.
+export const ELLIPSIS = String.fromCodePoint(0x2026);
+
+// the detail for an unknown key of 15,000 characters (the longest a 16 kB body can carry in one key) made of one letter
+export const LONG_KEY = "k".repeat(15_000);
+export const LONG_KEY_DETAIL = `Unknown setting: ${"k".repeat(64)}${ELLIPSIS}`;
+
+// A list of details compared with the expected ones. A failure shows each text cut to 120 characters: the keys of
+// these tests are 15,000 characters long, and a plain deepEqual would print them whole.
+export const assertDetails = (actual: unknown, expected: string[], label = "details"): void => {
+    const clipped = JSON.stringify(actual, (_key, value: unknown) =>
+        typeof value === "string" && value.length > 120 ? `${value.slice(0, 120)}... (${value.length} characters)` : value);
+
+    assert.ok(
+        Array.isArray(actual) && actual.length === expected.length && actual.every((detail, index) => detail === expected[index]),
+        `${label}: expected ${expected.length} detail(s) equal to the expected ones, got ${clipped}`
+    );
+};
+
+// The text of a body with an own "__proto__" key next to a value past its cap and an unknown key, which JSON.parse keeps
+// as own keys and an object literal would not.
+export const PROTO_WITH_OTHER_ERRORS = "{\"__proto__\": {}, \"topK\": 99, \"foo\": 1}";
 
 export interface ExpectedDefinition {
     key: string;

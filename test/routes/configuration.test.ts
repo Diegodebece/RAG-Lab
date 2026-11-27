@@ -11,7 +11,7 @@ const { app } = await import("../../src/app.js");
 const { REQUIRED_MODELS } = await import("../../src/v1/config/ollama.config.js");
 const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
 const { createTestUser } = await import("./testUsers.js");
-const { DEFAULT_SETTINGS, DEFAULT_SNAPSHOT_HASH, DEFAULT_SNAPSHOT_TEXT, SETTING_DEFINITIONS, SETTING_KEYS, canonicalText, sha256Hex } = await import("../configurationFixtures.js");
+const { DEFAULT_SETTINGS, DEFAULT_SNAPSHOT_HASH, DEFAULT_SNAPSHOT_TEXT, ELLIPSIS, LONG_KEY, assertDetails, LONG_KEY_DETAIL, PROTO_WITH_OTHER_ERRORS, SETTING_DEFINITIONS, SETTING_KEYS, canonicalText, sha256Hex } = await import("../configurationFixtures.js");
 
 before(resetTestDatabase);
 
@@ -30,8 +30,19 @@ const resolve = (auth: Auth, body: unknown) => request(app).post("/v1/configurat
 
 const resolveRaw = (auth: Auth, text: string) => request(app).post("/v1/configuration/resolve").set(...auth).set("Content-Type", "application/json").send(text);
 
-const seedProfile = async (userId: string, settings: string, name = "Mine"): Promise<string> =>
-    (await ownerPool.query<{ id: string }>("INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, $2, 1, $3::jsonb) RETURNING id", [userId, name, settings])).rows[0].id;
+const seedProfile = async (userId: string, settings: string, name = "Mine", version = 1): Promise<string> =>
+    (await ownerPool.query<{ id: string }>("INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, $2, $3, $4::jsonb) RETURNING id", [userId, name, version, settings])).rows[0].id;
+
+// a profile with an id the owner chose: the app makes version 4 ids, but the column takes any UUID
+const seedProfileWithId = async (id: string, userId: string, settings: string): Promise<void> => {
+    await ownerPool.query("INSERT INTO profiles (id, user_id, name, version, settings) VALUES ($1, $2, 'Chosen id', 1, $3::jsonb)", [id, userId, settings]);
+};
+
+// the text of what console.error was called with, so a test can look for what the server reported
+const loggedText = (spy: { mock: { calls: { arguments: unknown[] }[] } }): string =>
+    spy.mock.calls.map((call) => call.arguments.map((argument) => (argument instanceof Error ? argument.message : String(argument))).join(" ")).join("\n");
+
+const GENERIC_500 = { message: "Internal server error" };
 
 describe("GET /v1/configuration", () => {
     it("describes configuration version 1: the defaults, one definition per setting, and the profile limits", { timeout: 15_000 }, async () => {
@@ -233,6 +244,60 @@ describe("POST /v1/configuration/resolve", () => {
         assert.deepEqual(extra.body.details, ["\"userId\" is not allowed"]);
     });
 
+    // the same rule as GET /v1/profiles/:id (isUuid): the plain hyphenated form, so the id is never one thing to the
+    // validator and another to the lookup
+    it("answers 400 'Profile id must be a valid UUID' for the id of an own profile written wrapped in braces, brackets or parentheses, without hyphens, or with colons", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const profileId = await seedProfile(ana.id, "{\"topK\": 5}");
+
+        assert.equal((await resolve(ana.auth, { profileId })).status, 200, "the plain form resolves");
+
+        const forms: Record<string, string> = {
+            "in braces": `{${profileId}}`,
+            "in brackets": `[${profileId}]`,
+            "in parentheses": `(${profileId})`,
+            "without hyphens": profileId.replaceAll("-", ""),
+            "with colons": profileId.replaceAll("-", ":")
+        };
+
+        for (const [label, written] of Object.entries(forms)) {
+            const response = await resolve(ana.auth, { profileId: written });
+
+            assert.equal(response.status, 400, `${label}: ${written}`);
+            assert.equal(response.body.message, "Validation error", label);
+            assert.deepEqual(response.body.details, ["Profile id must be a valid UUID"], label);
+        }
+    });
+
+    it("answers 404 'Profile not found', like GET /v1/profiles/:id, for a valid UUID that is not version 4 and that nobody owns", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const versionOne = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        const versionSeven = "01890a5d-ac96-774b-bcce-b302099a8057";
+
+        for (const profileId of [versionOne, versionSeven]) {
+            const response = await resolve(ana.auth, { profileId });
+
+            assert.equal(response.status, 404, profileId);
+            assert.deepEqual(response.body, { message: "Profile not found" }, profileId);
+            assert.equal((await request(app).get(`/v1/profiles/${profileId}`).set(...ana.auth)).status, 404, `${profileId} on the profile route`);
+        }
+    });
+
+    it("resolves an own profile whose id is not version 4, and one written in upper case", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const versionSeven = "01890a5d-ac96-774b-bcce-b302099a8057";
+        await seedProfileWithId(versionSeven, ana.id, "{\"topK\": 5}");
+
+        const response = await resolve(ana.auth, { profileId: versionSeven });
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.profileId, versionSeven);
+        assert.equal(response.body.data.snapshot.settings.topK, 5);
+
+        const upper = await resolve(ana.auth, { profileId: versionSeven.toUpperCase() });
+        assert.equal(upper.status, 200, JSON.stringify(upper.body));
+        assert.equal(upper.body.data.profileId, versionSeven, "the id comes back in lower case");
+    });
+
     it("answers 404 'Profile not found' for another user's profile and for an id nobody has", { timeout: 15_000 }, async () => {
         const ana = await createTestUser({ email: "ana@example.com" });
         const bob = await createTestUser({ email: "bob@example.com" });
@@ -261,14 +326,116 @@ describe("POST /v1/configuration/resolve", () => {
         assert.ok(response.body.details.includes("Unknown setting: foo"));
     });
 
-    it("answers 400 'The configuration is not valid' when the default profile in the database is outside the caps", { timeout: 15_000 }, async () => {
+    // The default is the server's own data, checked at startup: a default that breaks while the server runs is the server's
+    // fault and not the client's, so the client gets the generic 500 (nothing about the stored data) and the server logs
+    // which setting it is.
+    it("answers 500 with the generic message and no details, and logs the setting, when the default profile was damaged while the server runs", { timeout: 15_000 }, async (t) => {
+        const consoleError = t.mock.method(console, "error", () => {});
         const ana = await createTestUser({ email: "ana@example.com" });
-        await ownerPool.query("UPDATE default_profile SET settings = jsonb_set(settings, '{topK}', '31')");
+        const profileId = await seedProfile(ana.id, "{\"temperature\": 0.5}");
 
-        const response = await resolve(ana.auth, {});
+        const damages: [label: string, assignment: string][] = [
+            ["topK past its cap", "settings = jsonb_set(settings, '{topK}', '31')"],
+            ["topK removed", "settings = settings - 'topK'"]
+        ];
+
+        for (const [label, assignment] of damages) {
+            await ownerPool.query(`UPDATE default_profile SET ${assignment}`);
+            consoleError.mock.resetCalls();
+
+            for (const body of [{}, { profileId }]) {
+                const response = await resolve(ana.auth, body);
+
+                assert.equal(response.status, 500, `${label}: ${JSON.stringify(body)}`);
+                assert.deepEqual(response.body, GENERIC_500, `${label}: no details, no message about the data`);
+            }
+
+            assert.match(loggedText(consoleError), /Top K/, `${label}: the server logs which setting`);
+
+            await ownerPool.query("UPDATE default_profile SET settings = $1::jsonb", [JSON.stringify(DEFAULT_SETTINGS)]);
+        }
+
+        assert.equal((await resolve(ana.auth, {})).status, 200, "put back, it resolves again");
+    });
+
+    it("keeps answering 400 'The configuration is not valid' for a stored profile outside the caps while the default is sound", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const profileId = await seedProfile(ana.id, "{\"topK\": 31}");
+
+        const response = await resolve(ana.auth, { profileId });
 
         assert.equal(response.status, 400);
         assert.equal(response.body.message, "The configuration is not valid");
+        assert.ok(Array.isArray(response.body.details) && response.body.details.length === 1);
+    });
+
+    // a profile at another version is data this code cannot read: the user did nothing wrong, so it is a 500 and not a 400
+    it("answers 500 with the generic message and no details for a profile saved by another configuration version", { timeout: 15_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const profileId = await seedProfile(ana.id, "{\"topK\": 5}", "Mine", 1);
+        await ownerPool.query("UPDATE profiles SET version = 2 WHERE id = $1", [profileId]);
+
+        for (const body of [{ profileId }, { profileId, overrides: { topK: 7 } }]) {
+            const response = await resolve(ana.auth, body);
+
+            assert.equal(response.status, 500, JSON.stringify(body));
+            assert.deepEqual(response.body, GENERIC_500, JSON.stringify(body));
+        }
+
+        assert.equal((await resolve(ana.auth, {})).status, 200, "without the profile the default still resolves");
+    });
+
+    it("answers 404 'Profile not found', and not 500, for another user's profile that is at another configuration version", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const bob = await createTestUser({ email: "bob@example.com" });
+        const anas = await seedProfile(ana.id, "{}", "Mine", 2);
+
+        const response = await resolve(bob.auth, { profileId: anas });
+
+        assert.equal(response.status, 404);
+        assert.deepEqual(response.body, { message: "Profile not found" });
+    });
+
+    // keys longer than 64 characters are echoed cut: a 16 kB body must not become a 16 kB answer, a log line or a stored detail
+    it("echoes an unknown override of 15,000 characters cut to its first 64 followed by an ellipsis, and a key of 64 whole", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const long = await resolve(ana.auth, { overrides: { [LONG_KEY]: 1 } });
+        assert.equal(long.status, 400);
+        assertDetails(long.body.details, [LONG_KEY_DETAIL]);
+        assert.ok(long.body.details[0].length < 100);
+
+        const sixtyFive = await resolve(ana.auth, { overrides: { ["k".repeat(65)]: 1 } });
+        assert.deepEqual(sixtyFive.body.details, [`Unknown setting: ${"k".repeat(64)}${ELLIPSIS}`]);
+
+        const sixtyFour = await resolve(ana.auth, { overrides: { ["k".repeat(64)]: 1 } });
+        assert.deepEqual(sixtyFour.body.details, [`Unknown setting: ${"k".repeat(64)}`]);
+    });
+
+    it("echoes an unknown key of a stored profile cut to 64 characters too", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const profileId = await seedProfile(ana.id, JSON.stringify({ [LONG_KEY]: 1 }));
+
+        const response = await resolve(ana.auth, { profileId });
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.message, "The configuration is not valid");
+        assertDetails(response.body.details, [LONG_KEY_DETAIL]);
+    });
+
+    it("reports a __proto__ override together with a value past its cap and an unknown key, all three", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await resolveRaw(ana.auth, `{"overrides": ${PROTO_WITH_OTHER_ERRORS}}`);
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.message, "Validation error");
+        assert.equal(response.body.details.length, 3, JSON.stringify(response.body.details));
+        assert.ok(response.body.details.includes("Unknown setting: __proto__"));
+        assert.ok(response.body.details.includes("Unknown setting: foo"));
+        assert.ok(response.body.details.some((detail: string) => /^Top K.*at most 30/.test(detail)));
+        assert.equal(Object.hasOwn(Object.prototype, "foo"), false);
     });
 
     it("answers 413 'request entity too large' for a body over 16 kB, and reads one just under it", { timeout: 15_000 }, async () => {

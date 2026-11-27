@@ -269,37 +269,44 @@ describe("server startup: configuration data", () => {
         await resetTestDatabase();
     });
 
-    const expectRefusal = async (problem: RegExp): Promise<void> => {
+    // The server prints one header and the problems under it, one per line. The sentences are checked whole, in the
+    // exact text of the message, and as the only problems: a word like "default" or "version" would also be found in a
+    // refusal for any other reason.
+    const HEADER = "Cannot start the server: the configuration data in the database is not valid:";
+
+    const expectRefusal = async (problems: string[]): Promise<void> => {
         const server = await startServer();
 
         assert.equal(await waitForExit(server), 1);
-        assert.match(server.output().stderr, /Cannot start the server/);
-        assert.match(allOutput(server), problem, "it names the problem");
+        assert.ok(
+            server.output().stderr.includes(`${HEADER}\n- ${problems.join("\n- ")}`),
+            `expected the header and exactly these problems: ${JSON.stringify(problems)}; stderr was ${JSON.stringify(server.output().stderr)}`
+        );
         assert.doesNotMatch(server.output().stdout, /Server running/);
     };
 
-    it("refuses to start, naming the problem, when the default profile was deleted", { timeout: 25_000 }, async () => {
+    it("refuses to start, saying the default profile is missing from its table, when it was deleted", { timeout: 25_000 }, async () => {
         const { resetTestDatabase, ownerPool } = await loadDatabase();
         await resetTestDatabase();
         await ownerPool.query("DELETE FROM default_profile");
 
-        await expectRefusal(/default/i);
+        await expectRefusal(["The default profile is missing from the default_profile table"]);
     });
 
-    it("refuses to start, naming the setting, when a default setting is outside its cap", { timeout: 25_000 }, async () => {
+    it("refuses to start, naming the setting and its cap, when a default setting is outside its cap", { timeout: 25_000 }, async () => {
         const { resetTestDatabase, ownerPool } = await loadDatabase();
         await resetTestDatabase();
         await ownerPool.query("UPDATE default_profile SET settings = jsonb_set(settings, '{topK}', '31')");
 
-        await expectRefusal(/Top K/);
+        await expectRefusal(["Top K must be at most 30"]);
     });
 
-    it("refuses to start when the default profile is at another configuration version", { timeout: 25_000 }, async () => {
+    it("refuses to start, naming both versions, when the default profile is at another configuration version", { timeout: 25_000 }, async () => {
         const { resetTestDatabase, ownerPool } = await loadDatabase();
         await resetTestDatabase();
         await ownerPool.query("UPDATE default_profile SET version = 2");
 
-        await expectRefusal(/version/i);
+        await expectRefusal(["The default profile is at configuration version 2, and this server reads version 1"]);
     });
 
     it("refuses to start, counting them, when stored profiles are at another configuration version", { timeout: 25_000 }, async () => {
@@ -308,7 +315,26 @@ describe("server startup: configuration data", () => {
         const { rows } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('ana@example.com', 'x') RETURNING id");
         await ownerPool.query("INSERT INTO profiles (user_id, name, version) VALUES ($1, 'Old one', 2), ($1, 'Old two', 3), ($1, 'Current', 1)", [rows[0].id]);
 
-        await expectRefusal(/2 stored profiles are not at configuration version 1/);
+        await expectRefusal(["2 stored profiles are not at configuration version 1"]);
+    });
+
+    it("refuses to start, saying 'profile is' for one profile at another configuration version", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        const { rows } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('ana@example.com', 'x') RETURNING id");
+        await ownerPool.query("INSERT INTO profiles (user_id, name, version) VALUES ($1, 'Old one', 2)", [rows[0].id]);
+
+        await expectRefusal(["1 stored profile is not at configuration version 1"]);
+    });
+
+    it("refuses to start, listing every problem under the header, when the default and the profiles are both wrong", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        const { rows } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('ana@example.com', 'x') RETURNING id");
+        await ownerPool.query("INSERT INTO profiles (user_id, name, version) VALUES ($1, 'Old one', 2)", [rows[0].id]);
+        await ownerPool.query("UPDATE default_profile SET settings = jsonb_set(settings, '{topK}', '31')");
+
+        await expectRefusal(["Top K must be at most 30", "1 stored profile is not at configuration version 1"]);
     });
 
     // the control for the refusals above: the check is not a refusal of every database that has profiles

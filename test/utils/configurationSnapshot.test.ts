@@ -41,6 +41,26 @@ describe("toCanonicalJson", () => {
         assert.throws(() => toCanonicalJson({ a: [1, undefined] } as never));
     });
 
+    // an array with a hole is not what JSON can hold: JSON.stringify writes null for the hole, and a join would write
+    // nothing, so a snapshot with a hole would hash like one that had a different value there
+    it("refuses an array with holes, the way it refuses undefined, whole or as a value", () => {
+        const leadingHole: unknown[] = new Array(2);
+        leadingHole[1] = 1;
+        const trailingHole: unknown[] = new Array(2);
+        trailingHole[0] = 1;
+        const onlyHoles: unknown[] = new Array(3);
+
+        for (const sparse of [leadingHole, trailingHole, onlyHoles]) {
+            assert.ok(Object.keys(sparse).length < sparse.length, "the array under test does have a hole");
+            assert.throws(() => toCanonicalJson(sparse as never), JSON.stringify(sparse));
+            assert.throws(() => toCanonicalJson({ a: sparse } as never));
+            assert.throws(() => toCanonicalJson({ a: { b: [sparse] } } as never));
+        }
+
+        assert.equal(toCanonicalJson([1, 2]), "[1,2]", "a full array is still fine");
+        assert.equal(toCanonicalJson([]), "[]", "and so is an empty one");
+    });
+
     it("refuses a function, whole or as a value", () => {
         assert.throws(() => toCanonicalJson((() => 1) as never));
         assert.throws(() => toCanonicalJson({ a: () => 1 } as never));

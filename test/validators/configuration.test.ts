@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Schema, ValidationResult } from "joi";
 import { completeSettingsSchema, resolveConfigurationSchema, settingsSchema } from "../../src/v1/validators/configuration.validator.js";
-import { DEFAULT_SETTINGS, LABELS, SETTING_KEYS } from "../configurationFixtures.js";
+import { DEFAULT_SETTINGS, ELLIPSIS, LABELS, LONG_KEY, LONG_KEY_DETAIL, PROTO_WITH_OTHER_ERRORS, SETTING_KEYS, assertDetails } from "../configurationFixtures.js";
 
 // validated the way validateBodyMiddleware does it: every problem is collected, not only the first
 const validate = (schema: Schema, body: unknown): ValidationResult => schema.validate(body, { abortEarly: false });
@@ -259,6 +259,53 @@ describe("the settings schema: keys it does not know", () => {
         assert.deepEqual(Object.keys(Object.prototype), []);
     });
 
+    it("echoes an unknown key cut to its first 64 characters followed by an ellipsis: a key of 64 is whole, one of 65 and one of 15,000 are cut", () => {
+        assert.deepEqual(messagesOf(settings({ ["k".repeat(64)]: 1 })), [`Unknown setting: ${"k".repeat(64)}`]);
+        assert.deepEqual(messagesOf(settings({ ["k".repeat(65)]: 1 })), [`Unknown setting: ${"k".repeat(64)}${ELLIPSIS}`]);
+
+        const long = messagesOf(settings({ [LONG_KEY]: 1 }));
+
+        assertDetails(long, [LONG_KEY_DETAIL]);
+        assert.ok(long[0].length < 100, `${long[0].length} characters`);
+    });
+
+    it("cuts a long key at its first 64 characters, so two keys that differ later give the same detail, and a short key is never touched", () => {
+        const messages = messagesOf(settings({ [`${"a".repeat(64)}x`]: 1, [`${"a".repeat(64)}y`]: 1, short: 1 }));
+
+        assert.deepEqual(messages.sort(), [`Unknown setting: ${"a".repeat(64)}${ELLIPSIS}`, `Unknown setting: ${"a".repeat(64)}${ELLIPSIS}`, "Unknown setting: short"]);
+    });
+
+    it("cuts a long unknown key in the complete schema as well", () => {
+        const messages = messagesOf(validate(completeSettingsSchema, { ...DEFAULT_SETTINGS, [LONG_KEY]: 1 }));
+
+        assertDetails(messages, [LONG_KEY_DETAIL]);
+    });
+
+    // JSON.parse keeps "__proto__" as an own key; Joi's copy drops it, so it has to be found before the copy is made and
+    // must not hide the other problems of the same object
+    it("reports __proto__ together with a value past its cap and an unknown key: all three, one detail each", () => {
+        const body = JSON.parse(PROTO_WITH_OTHER_ERRORS) as unknown;
+
+        const messages = messagesOf(settings(body));
+
+        assert.equal(messages.length, 3, JSON.stringify(messages));
+        assert.ok(messages.includes("Unknown setting: __proto__"));
+        assert.ok(messages.includes("Unknown setting: foo"));
+        assert.ok(messages.some((message) => /^Top K.*at most 30/.test(message)));
+        assert.equal(Object.hasOwn(Object.prototype, "foo"), false);
+    });
+
+    it("reports __proto__ with the other problems of a complete set of settings too", () => {
+        const body = JSON.parse(`{${SETTING_KEYS.filter((key) => key !== "topK").map((key) => `${JSON.stringify(key)}: ${JSON.stringify(DEFAULT_SETTINGS[key])}`).join(",")}, "topK": 99, "foo": 1, "__proto__": {}}`) as unknown;
+
+        const messages = messagesOf(validate(completeSettingsSchema, body));
+
+        assert.equal(messages.length, 3, JSON.stringify(messages));
+        assert.ok(messages.includes("Unknown setting: __proto__"));
+        assert.ok(messages.includes("Unknown setting: foo"));
+        assert.ok(messages.some((message) => /^Top K.*at most 30/.test(message)));
+    });
+
     it("refuses __proto__ next to the eleven valid settings, in the complete schema too", () => {
         const body = JSON.parse(`{${SETTING_KEYS.map((key) => `${JSON.stringify(key)}: ${JSON.stringify(DEFAULT_SETTINGS[key])}`).join(",")}, "__proto__": {"polluted": true}}`) as unknown;
 
@@ -348,6 +395,49 @@ describe("the body of the resolver", () => {
             assert.deepEqual(messagesOf(result), ["Profile id must be a valid UUID"], JSON.stringify(profileId));
             assert.deepEqual(pathsOf(result), ["profileId"]);
         }
+    });
+
+    // the rule is isUuid's (src/v1/utils/uuid.util.ts): the plain hyphenated form of any version, in either case
+    it("refuses a profileId wrapped in braces, brackets or parentheses, without hyphens, or with colons", () => {
+        const forms = [`{${UUID}}`, `[${UUID}]`, `(${UUID})`, UUID.replaceAll("-", ""), UUID.replaceAll("-", ":"), `{${UUID}`, `${UUID}}`, `${UUID}\n`, ` ${UUID}`];
+
+        for (const profileId of forms) {
+            const result = resolve({ profileId });
+
+            assert.deepEqual(messagesOf(result), ["Profile id must be a valid UUID"], JSON.stringify(profileId));
+            assert.deepEqual(pathsOf(result), ["profileId"]);
+        }
+    });
+
+    it("accepts a profileId that is a plain hyphenated UUID of any version, in upper or lower case, returned unchanged", () => {
+        const ids = [
+            UUID,
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "01890a5d-ac96-774b-bcce-b302099a8057",
+            "00000000-0000-0000-0000-000000000000",
+            UUID.toUpperCase()
+        ];
+
+        for (const profileId of ids) {
+            const result = resolve({ profileId });
+
+            assert.equal(result.error, undefined, `${profileId}: ${JSON.stringify(messagesOf(result))}`);
+            assert.deepEqual(result.value, { profileId });
+        }
+    });
+
+    it("reports __proto__ in the overrides together with a value past its cap and an unknown key", () => {
+        const result = resolve({ overrides: JSON.parse(PROTO_WITH_OTHER_ERRORS) as unknown });
+        const messages = messagesOf(result);
+
+        assert.equal(messages.length, 3, JSON.stringify(messages));
+        assert.ok(messages.includes("Unknown setting: __proto__"));
+        assert.ok(messages.includes("Unknown setting: foo"));
+        assert.ok(messages.some((message) => /^Top K.*at most 30/.test(message)));
+    });
+
+    it("cuts an unknown override key of 15,000 characters to 64 and an ellipsis", () => {
+        assertDetails(messagesOf(resolve({ overrides: { [LONG_KEY]: 1 } })), [LONG_KEY_DETAIL]);
     });
 
     it("refuses a profileId that is empty or not text", () => {

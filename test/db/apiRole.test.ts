@@ -60,15 +60,127 @@ const failureCodeOf = async (statement: string): Promise<string | undefined> => 
     }
 };
 
+// whether the role may update one column of a table: has_column_privilege is also true when the whole table can be updated
+const canUpdateColumn = async (table: string, column: string): Promise<boolean> => {
+    const { rows } = await ownerPool.query<{ held: boolean }>(
+        "SELECT has_column_privilege($1::name, format('public.%I', $2::text), $3::text, 'UPDATE') AS held",
+        [API_ROLE, table, column]
+    );
+    return rows[0].held;
+};
+
+// the columns of profiles the service changes: the name, the settings, the version and the date
+const UPDATABLE_PROFILE_COLUMNS = ["name", "settings", "updated_at", "version"];
+const FIXED_PROFILE_COLUMNS = ["created_at", "id", "user_id"];
+
 const checkTheRights = (): void => {
-    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations and default_profile, and nothing more", async () => {
-        const tables = (await publicTables()).filter((table) => table !== "schema_migrations" && table !== "default_profile");
+    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile and profiles, and nothing more", async () => {
+        const tables = (await publicTables()).filter((table) => !["schema_migrations", "default_profile", "profiles"].includes(table));
 
         assert.ok(tables.includes("users"), "the users table is among them");
-        assert.ok(tables.includes("profiles"), "the profiles table is among them");
 
         for (const table of tables) {
             assert.deepEqual(await privilegesOn(table), ["SELECT", "INSERT", "UPDATE", "DELETE"], table);
+        }
+    });
+
+    // a profile belongs to the user who made it for as long as it exists, and its id and creation date never change: the
+    // role may change only the columns the service changes, so a flaw in a route cannot hand a profile to another user
+    it("holds SELECT, INSERT and DELETE on profiles as a whole, and UPDATE only on some of its columns (which is not UPDATE on the table)", async () => {
+        assert.deepEqual(await privilegesOn("profiles"), ["SELECT", "INSERT", "DELETE"]);
+    });
+
+    it("may update name, settings, version and updated_at of profiles, and not id, user_id or created_at", async () => {
+        for (const column of UPDATABLE_PROFILE_COLUMNS) {
+            assert.equal(await canUpdateColumn("profiles", column), true, `${column} can be updated`);
+        }
+
+        for (const column of FIXED_PROFILE_COLUMNS) {
+            assert.equal(await canUpdateColumn("profiles", column), false, `${column} cannot be updated`);
+        }
+    });
+
+    it("may update no column of profiles besides those four, so a column added later is a decision and not an accident", async () => {
+        const { rows } = await ownerPool.query<{ column_name: string }>(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'profiles' ORDER BY column_name"
+        );
+        const updatable: string[] = [];
+
+        for (const { column_name: column } of rows) {
+            if (await canUpdateColumn("profiles", column)) {
+                updatable.push(column);
+            }
+        }
+
+        assert.deepEqual(rows.map((row) => row.column_name).sort(), [...UPDATABLE_PROFILE_COLUMNS, ...FIXED_PROFILE_COLUMNS].sort(), "the columns the test knows");
+        assert.deepEqual(updatable, UPDATABLE_PROFILE_COLUMNS);
+    });
+
+    it("is refused an UPDATE of the id, the owner or the creation date of a profile (42501), also next to a column it may change, and the row is unchanged", async () => {
+        const { rows: users } = await pool.query<{ id: string }>(
+            "INSERT INTO users (email, password_hash) VALUES ('owner.probe@example.com', 'x'), ('thief.probe@example.com', 'x') RETURNING id"
+        );
+        const [ownerId, thiefId] = users.map((user) => user.id);
+
+        try {
+            const { rows: created } = await pool.query<{ id: string }>(
+                "INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, 'Probe', 1, '{}'::jsonb) RETURNING id",
+                [ownerId]
+            );
+            const id = created[0].id;
+            const read = async () => (await ownerPool.query("SELECT id, user_id, name, version, settings, created_at, updated_at FROM profiles WHERE user_id = ANY($1::uuid[])", [[ownerId, thiefId]])).rows;
+            const before = await read();
+
+            assert.equal(before.length, 1);
+            assert.equal(before[0].user_id, ownerId);
+
+            const statements: Record<string, string> = {
+                "user_id": `UPDATE profiles SET user_id = '${thiefId}' WHERE id = '${id}'`,
+                "user_id of every row": `UPDATE profiles SET user_id = '${thiefId}'`,
+                "id": `UPDATE profiles SET id = gen_random_uuid() WHERE id = '${id}'`,
+                "created_at": `UPDATE profiles SET created_at = now() WHERE id = '${id}'`,
+                "name together with user_id": `UPDATE profiles SET name = 'Seized', user_id = '${thiefId}' WHERE id = '${id}'`,
+                "user_id set to itself": `UPDATE profiles SET user_id = user_id WHERE id = '${id}'`
+            };
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await read(), before, "the row is as it was, the name included");
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = ANY($1::uuid[])", [[ownerId, thiefId]]);
+        }
+    });
+
+    it("still does what the profile service does: updates name, settings, version and updated_at, with the owner in the WHERE and a RETURNING", async () => {
+        const { rows: users } = await pool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('service.probe@example.com', 'x') RETURNING id");
+        const userId = users[0].id;
+
+        try {
+            const { rows: created } = await pool.query<{ id: string }>(
+                "INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, 'Probe', 1, '{\"topK\": 5}'::jsonb) RETURNING id",
+                [userId]
+            );
+            const id = created[0].id;
+
+            const { rows } = await pool.query<{ id: string; name: string; settings: object; updatedAt: Date }>(
+                `UPDATE profiles SET
+                     name = COALESCE($3::text, name),
+                     settings = COALESCE($4::jsonb, settings),
+                     version = $5,
+                     updated_at = now()
+                 WHERE id = $1 AND user_id = $2
+                 RETURNING id, name, settings, updated_at AS "updatedAt"`,
+                [id, userId, "Renamed", "{\"topK\": 9}", 1]
+            );
+
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].id, id);
+            assert.equal(rows[0].name, "Renamed");
+            assert.deepEqual(rows[0].settings, { topK: 9 });
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = $1", [userId]);
         }
     });
 
