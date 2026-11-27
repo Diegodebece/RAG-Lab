@@ -61,10 +61,11 @@ const failureCodeOf = async (statement: string): Promise<string | undefined> => 
 };
 
 const checkTheRights = (): void => {
-    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, and nothing more", async () => {
-        const tables = (await publicTables()).filter((table) => table !== "schema_migrations");
+    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations and default_profile, and nothing more", async () => {
+        const tables = (await publicTables()).filter((table) => table !== "schema_migrations" && table !== "default_profile");
 
         assert.ok(tables.includes("users"), "the users table is among them");
+        assert.ok(tables.includes("profiles"), "the profiles table is among them");
 
         for (const table of tables) {
             assert.deepEqual(await privilegesOn(table), ["SELECT", "INSERT", "UPDATE", "DELETE"], table);
@@ -75,6 +76,40 @@ const checkTheRights = (): void => {
         assert.deepEqual(await privilegesOn("schema_migrations"), ["SELECT"]);
     });
 
+    // The default profile is what every user's configuration falls back on: only the owner, through a migration,
+    // may change it, so a flaw in a route cannot rewrite the defaults (and the caps they are checked against).
+    it("holds only SELECT on default_profile", async () => {
+        assert.deepEqual(await privilegesOn("default_profile"), ["SELECT"]);
+    });
+
+    it("is refused INSERT, UPDATE and DELETE on default_profile (42501), and the row is unchanged", async () => {
+        const read = async () => (await ownerPool.query("SELECT singleton, version, settings, updated_at FROM default_profile")).rows;
+        const before = await read();
+
+        assert.equal(before.length, 1, "the migration seeded one row");
+
+        const statements: Record<string, string> = {
+            "INSERT": "INSERT INTO default_profile (version, settings) VALUES (1, '{}')",
+            "UPDATE of the settings": "UPDATE default_profile SET settings = '{}'",
+            "UPDATE of the version": "UPDATE default_profile SET version = 2",
+            "DELETE": "DELETE FROM default_profile"
+        };
+
+        for (const [label, statement] of Object.entries(statements)) {
+            assert.equal(await failureCodeOf(statement), "42501", label);
+        }
+
+        assert.deepEqual(await read(), before, "the row is as the migration made it");
+    });
+
+    it("reads default_profile, the way the API does", async () => {
+        const { rows } = await pool.query<{ version: number; settings: Record<string, unknown> }>("SELECT version, settings FROM default_profile");
+
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].version, 1);
+        assert.equal(rows[0].settings.topK, 3);
+    });
+
     it("is refused every change to the schema with 'permission denied' (42501)", async () => {
         const statements: Record<string, string> = {
             "CREATE TABLE": "CREATE TABLE api_made_this (id integer)",
@@ -82,6 +117,13 @@ const checkTheRights = (): void => {
             "DROP TABLE users": "DROP TABLE users",
             "DROP TABLE schema_migrations": "DROP TABLE schema_migrations",
             "TRUNCATE users": "TRUNCATE users",
+            "ALTER TABLE profiles": "ALTER TABLE profiles ADD COLUMN api_made_this integer",
+            "DROP TABLE profiles": "DROP TABLE profiles",
+            "TRUNCATE profiles": "TRUNCATE profiles",
+            "CREATE INDEX ON profiles": "CREATE INDEX ON profiles (name)",
+            "ALTER TABLE default_profile": "ALTER TABLE default_profile ADD COLUMN api_made_this integer",
+            "DROP TABLE default_profile": "DROP TABLE default_profile",
+            "TRUNCATE default_profile": "TRUNCATE default_profile",
             "CREATE FUNCTION": "CREATE FUNCTION api_made_this() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
             "CREATE SCHEMA": "CREATE SCHEMA api_made_this",
             "INSERT INTO schema_migrations": "INSERT INTO schema_migrations (version) VALUES ('999_api_made_this.sql')",
@@ -93,7 +135,9 @@ const checkTheRights = (): void => {
             assert.equal(await failureCodeOf(statement), "42501", label);
         }
 
-        assert.ok((await publicTables()).includes("users"), "users is still there");
+        for (const table of ["users", "profiles", "default_profile"]) {
+            assert.ok((await publicTables()).includes(table), `${table} is still there`);
+        }
         assert.ok(!(await publicTables()).includes("api_made_this"));
     });
 
@@ -137,10 +181,30 @@ describe("the API role", () => {
         assert.equal((await pool.query("SELECT 1 FROM users WHERE id = $1", [id])).rowCount, 0);
     });
 
+    it("reads and writes the profiles table, the way the API does", async () => {
+        const { rows: owners } = await pool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('profile.probe@example.com', 'x') RETURNING id");
+        const userId = owners[0].id;
+
+        const { rows: inserted } = await pool.query<{ id: string }>(
+            "INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, 'Probe', 1, '{\"topK\": 5}'::jsonb) RETURNING id",
+            [userId]
+        );
+        const id = inserted[0].id;
+
+        await pool.query("UPDATE profiles SET name = 'Renamed', settings = '{}'::jsonb, updated_at = now() WHERE id = $1", [id]);
+        const { rows } = await pool.query<{ name: string; settings: object }>("SELECT name, settings FROM profiles WHERE id = $1", [id]);
+        assert.deepEqual(rows, [{ name: "Renamed", settings: {} }]);
+
+        await pool.query("DELETE FROM profiles WHERE id = $1", [id]);
+        assert.equal((await pool.query("SELECT 1 FROM profiles WHERE id = $1", [id])).rowCount, 0);
+
+        await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+    });
+
     it("reads schema_migrations, which is how the server checks the schema at startup", async () => {
         const { rows } = await pool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
 
-        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql"]);
+        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql"]);
     });
 
     it("can use pgvector's type and operators, which live in the schema it was given USAGE on", async () => {

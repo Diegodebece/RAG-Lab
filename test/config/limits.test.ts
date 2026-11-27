@@ -75,14 +75,16 @@ describe("TOKEN_LIFETIME_SECONDS", () => {
     });
 });
 
-// The five limits of the account routes: the default, a custom value, and a value that stops the app at startup
-// (0 would switch the limit off, and a malformed one would be read as something else). Each is its own setting.
+// The five limits of the account routes and the number of profiles a user may keep (layer 3): the default, a custom
+// value, and a value that stops the app at startup (0 would switch the limit off, and a malformed one would be read
+// as something else). Each is its own setting.
 const ACCOUNT_LIMITS: [name: string, defaultValue: number][] = [
     ["REQUESTS_PER_ADDRESS_PER_MINUTE", 300],
     ["LOGINS_PER_15_MINUTES", 10],
     ["FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES", 5],
     ["PASSWORD_CHANGES_PER_15_MINUTES", 5],
-    ["USER_CREATIONS_PER_HOUR", 20]
+    ["USER_CREATIONS_PER_HOUR", 20],
+    ["MAX_PROFILES_PER_USER", 20]
 ];
 
 describe("the limits of the account routes", () => {

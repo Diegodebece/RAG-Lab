@@ -258,6 +258,73 @@ describe("server startup: database schema", () => {
     });
 });
 
+// The configuration is data in the database (layer 3): the default profile every user's settings fall back on, and
+// the stored profiles. A default that is missing, or outside the caps the code enforces, would give every question a
+// configuration nobody checked, and profiles at another configuration version cannot be read by this code. The server
+// stops at startup and says which. Each test tampers as the owner (the API role cannot change default_profile), and
+// the database is migrated again afterwards so no later test sees the damage.
+describe("server startup: configuration data", () => {
+    after(async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+    });
+
+    const expectRefusal = async (problem: RegExp): Promise<void> => {
+        const server = await startServer();
+
+        assert.equal(await waitForExit(server), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(allOutput(server), problem, "it names the problem");
+        assert.doesNotMatch(server.output().stdout, /Server running/);
+    };
+
+    it("refuses to start, naming the problem, when the default profile was deleted", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        await ownerPool.query("DELETE FROM default_profile");
+
+        await expectRefusal(/default/i);
+    });
+
+    it("refuses to start, naming the setting, when a default setting is outside its cap", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        await ownerPool.query("UPDATE default_profile SET settings = jsonb_set(settings, '{topK}', '31')");
+
+        await expectRefusal(/Top K/);
+    });
+
+    it("refuses to start when the default profile is at another configuration version", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        await ownerPool.query("UPDATE default_profile SET version = 2");
+
+        await expectRefusal(/version/i);
+    });
+
+    it("refuses to start, counting them, when stored profiles are at another configuration version", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        const { rows } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('ana@example.com', 'x') RETURNING id");
+        await ownerPool.query("INSERT INTO profiles (user_id, name, version) VALUES ($1, 'Old one', 2), ($1, 'Old two', 3), ($1, 'Current', 1)", [rows[0].id]);
+
+        await expectRefusal(/2 stored profiles are not at configuration version 1/);
+    });
+
+    // the control for the refusals above: the check is not a refusal of every database that has profiles
+    it("starts when the stored profiles are at version 1, whatever their settings hold", { timeout: 25_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        const { rows } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('ana@example.com', 'x') RETURNING id");
+        await ownerPool.query("INSERT INTO profiles (user_id, name, version, settings) VALUES ($1, 'Empty', 1, '{}'), ($1, 'Sparse', 1, '{\"topK\": 5}')", [rows[0].id]);
+
+        const server = await startServer();
+
+        await waitForOutput(server, "Server running");
+        assert.equal((await getHealth(server)).body.data.database, "up");
+    });
+});
+
 // The API must run with the least rights it needs: a server whose connection could change the schema, create roles
 // or databases, or take over the tables would turn any flaw in a route into a flaw in the whole database. The
 // server stops at startup and says which role to use, without printing the URL or the password it was given.
@@ -681,6 +748,23 @@ describe("server startup: a database that cannot be reached at first and comes b
         assert.match(server.output().stderr, /Cannot start the server/);
         assert.match(allOutput(server), /001_init\.sql/, "it names the pending migration");
         assert.match(allOutput(server), /npm run migrate|DATABASE_URL/, "it says what to do");
+    });
+
+    // The configuration check is part of the check that repeats, not only of the first one.
+    it("stops, naming the problem, when the database comes back and the default profile is missing", { timeout: 60_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+        await ownerPool.query("DELETE FROM default_profile");
+        assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+        const port = await getFreePort();
+        const server = await startServer({ DATABASE_URL: urlThroughProxy(process.env.RAG_LAB_TEST_API_DATABASE_URL, port), ...RELAXED });
+
+        await waitForOutput(server, "Server running");
+        await bringDatabaseBack(port);
+
+        assert.equal(await waitForExit(server, 20_000), 1);
+        assert.match(server.output().stderr, /Cannot start the server/);
+        assert.match(allOutput(server), /default/i, "it names the problem");
     });
 
     it("keeps running while the database stays away, however many times it has tried", { timeout: 30_000 }, async () => {

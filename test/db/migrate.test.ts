@@ -41,11 +41,13 @@ describe("migrate script", () => {
         assert.match(output, /Applied 001_init\.sql/);
         assert.match(output, /Applied 002_api_role\.sql/);
         assert.match(output, /Applied 003_users\.sql/);
+        assert.match(output, /Applied 004_default_profile\.sql/);
+        assert.match(output, /Applied 005_profiles\.sql/);
 
         const { rows } = await ownerPool.query<{ table_name: string }>(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
         );
-        assert.deepEqual(rows.map((row) => row.table_name), ["schema_migrations", "users"]);
+        assert.deepEqual(rows.map((row) => row.table_name), ["default_profile", "profiles", "schema_migrations", "users"]);
     });
 
     it("enables pgvector, with cosine distance on 1024-dimension vectors", async () => {
@@ -65,7 +67,7 @@ describe("migrate script", () => {
         assert.match(output, /Database is up to date/);
 
         const { rows } = await ownerPool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
-        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql"]);
+        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql"]);
     });
 });
 
@@ -136,7 +138,8 @@ describe("migrate script with only MIGRATION_DATABASE_URL", () => {
 
         assert.match(outcome.stdout, /Applied 001_init\.sql/);
         assert.match(outcome.stdout, /Applied 003_users\.sql/);
-        assert.deepEqual(await publicTables(), ["schema_migrations", "users"]);
+        assert.match(outcome.stdout, /Applied 005_profiles\.sql/);
+        assert.deepEqual(await publicTables(), ["default_profile", "profiles", "schema_migrations", "users"]);
     });
 });
 
