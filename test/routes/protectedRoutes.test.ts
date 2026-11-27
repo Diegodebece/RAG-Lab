@@ -76,7 +76,14 @@ describe("the protected section of /v1", () => {
             ["post", "/v1/profiles"],
             ["get", `/v1/profiles/${randomUUID()}`],
             ["patch", `/v1/profiles/${randomUUID()}`],
-            ["delete", `/v1/profiles/${randomUUID()}`]
+            ["delete", `/v1/profiles/${randomUUID()}`],
+            ["get", "/v1/documents"],
+            ["post", "/v1/documents"],
+            ["get", `/v1/documents/${randomUUID()}`],
+            ["delete", `/v1/documents/${randomUUID()}`],
+            ["post", `/v1/documents/${randomUUID()}/indexes`],
+            ["get", `/v1/documents/${randomUUID()}/indexes/${randomUUID()}`],
+            ["delete", `/v1/documents/${randomUUID()}/indexes/${randomUUID()}`]
         ];
 
         for (const [method, path] of noToken) {
@@ -94,10 +101,10 @@ describe("the protected section of /v1", () => {
 });
 
 // The test above also passes for a path that does not exist (every /v1 path asks for a token first), so this one
-// shows the seven routes of layer 3 are mounted behind the token. One account per request: the limit of this file
-// is three requests a minute for each account.
-describe("the configuration and profile routes", () => {
-    it("exist: with a valid token none of the seven answers 'Route not found'", { timeout: 20_000 }, async () => {
+// shows the seven routes of layer 3 and the seven of layer 4 are mounted behind the token. One account per request:
+// the limit of this file is three requests a minute for each account.
+describe("the configuration, profile and document routes", () => {
+    it("exist: with a valid token none of the fourteen answers 'Route not found'", { timeout: 40_000 }, async () => {
         const routes: [string, string][] = [
             ["get", "/v1/configuration"],
             ["post", "/v1/configuration/resolve"],
@@ -105,7 +112,14 @@ describe("the configuration and profile routes", () => {
             ["post", "/v1/profiles"],
             ["get", `/v1/profiles/${randomUUID()}`],
             ["patch", `/v1/profiles/${randomUUID()}`],
-            ["delete", `/v1/profiles/${randomUUID()}`]
+            ["delete", `/v1/profiles/${randomUUID()}`],
+            ["get", "/v1/documents"],
+            ["post", "/v1/documents"],
+            ["get", `/v1/documents/${randomUUID()}`],
+            ["delete", `/v1/documents/${randomUUID()}`],
+            ["post", `/v1/documents/${randomUUID()}/indexes`],
+            ["get", `/v1/documents/${randomUUID()}/indexes/${randomUUID()}`],
+            ["delete", `/v1/documents/${randomUUID()}/indexes/${randomUUID()}`]
         ];
 
         for (const [index, [method, path]] of routes.entries()) {

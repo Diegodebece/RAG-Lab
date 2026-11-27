@@ -3,14 +3,20 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import request from "supertest";
+import { startFakeOllama } from "../doubles/fakeOllama.js";
 
 const SECRET = "test-secret-only-for-these-tests-0123456789";
 process.env.SECRET_KEY = SECRET;
+
+// resolving a configuration must never reach the model server: the double records every request, so a test can see none came
+const fake = await startFakeOllama();
+process.env.OLLAMA_BASE_URL = fake.url;
 
 const { app } = await import("../../src/app.js");
 const { REQUIRED_MODELS } = await import("../../src/v1/config/ollama.config.js");
 const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
 const { createTestUser } = await import("./testUsers.js");
+const { countRows, seedDocument, seedIndex } = await import("../documentsFixtures.js");
 const { DEFAULT_SETTINGS, DEFAULT_SNAPSHOT_HASH, DEFAULT_SNAPSHOT_TEXT, ELLIPSIS, LONG_KEY, assertDetails, LONG_KEY_DETAIL, PROTO_WITH_OTHER_ERRORS, SETTING_DEFINITIONS, SETTING_KEYS, canonicalText, sha256Hex } = await import("../configurationFixtures.js");
 
 before(resetTestDatabase);
@@ -20,7 +26,10 @@ beforeEach(() => ownerPool.query("TRUNCATE users CASCADE"));
 // some tests change the default row
 afterEach(() => ownerPool.query("UPDATE default_profile SET version = 1, settings = $1::jsonb", [JSON.stringify(DEFAULT_SETTINGS)]));
 
-after(closeTestPools);
+after(async () => {
+    await fake.close();
+    await closeTestPools();
+});
 
 type Auth = [string, string];
 
@@ -53,9 +62,20 @@ describe("GET /v1/configuration", () => {
         assert.equal(response.status, 200);
         assert.equal(response.body.success, true);
         assert.equal(response.body.message, "Configuration retrieved successfully");
-        assert.deepEqual(Object.keys(response.body.data).sort(), ["defaults", "profiles", "settings", "version"]);
+        assert.deepEqual(Object.keys(response.body.data).sort(), ["defaults", "documents", "indexes", "profiles", "settings", "version"]);
         assert.equal(response.body.data.version, 1);
         assert.deepEqual(response.body.data.profiles, { maxPerUser: 20, maxNameLength: 100 });
+    });
+
+    // what a client that builds an upload form needs to know: the limits on documents and on the builds of indexes
+    it("reports the limits on documents and on index builds, with the values of the server", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await view(ana.auth);
+
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body.data.documents, { maxPerUser: 3, maxCharacters: 1_000_000, maxFilenameLength: 255 });
+        assert.deepEqual(response.body.data.indexes, { maxActivePerUser: 1, maxBuildsPerDay: 6, maxBuildsPerDayTotal: 100 });
     });
 
     it("gives the defaults the default_profile row holds, with the eleven values of RAG Web", { timeout: 15_000 }, async () => {
@@ -133,6 +153,26 @@ describe("POST /v1/configuration/resolve", () => {
         assert.equal(response.body.data.hash, sha256Hex(canonicalText(response.body.data.snapshot)), "computed here, from the snapshot");
         assert.equal(canonicalText(response.body.data.snapshot), DEFAULT_SNAPSHOT_TEXT);
         assert.equal(response.body.data.hash, DEFAULT_SNAPSHOT_HASH);
+    });
+
+    // Layer 4 closes the risk of a question starting an indexing job: resolving a configuration whose chunk size no index of
+    // the user's document has (here 300) only reads. It builds nothing, counts nothing against the user's builds of the
+    // day and does not ask the model server for anything: only the two document endpoints build indexes.
+    it("resolves overrides with a chunk size the user's document has no index for (300), and builds nothing: no index row, no usage row, no request to Ollama", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedDocument(ana.id);
+        await seedIndex(document.id, { status: "ready", chunkSize: 1000 });
+        const indexesBefore = await countRows("document_indexes");
+        const chunksBefore = await countRows("chunks");
+
+        const response = await resolve(ana.auth, { overrides: { chunkSize: 300 } });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.snapshot.settings.chunkSize, 300);
+        assert.equal(await countRows("document_indexes"), indexesBefore, "no index row was made");
+        assert.equal(await countRows("chunks"), chunksBefore, "no chunk row was made");
+        assert.equal(await countRows("index_build_usage"), 0, "no build was counted");
+        assert.deepEqual(fake.requests, [], "nothing reached the model server");
     });
 
     it("resolves a request with no body at all the same way", { timeout: 15_000 }, async () => {

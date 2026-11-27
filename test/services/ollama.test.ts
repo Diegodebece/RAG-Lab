@@ -28,7 +28,7 @@ describe("listInstalledModelsService", () => {
         const names = await listInstalledModelsService({ timeoutMs: 2000 });
 
         assert.deepEqual(names, ["qwen3.5:4b", "qwen3-embedding:0.6b", "other-model:latest"]);
-        assert.deepEqual(fake.requests.at(-1), { method: "GET", path: "/api/tags" });
+        assert.deepEqual(fake.requests.at(-1), { method: "GET", path: "/api/tags", body: null });
     });
 
     it("returns an empty list when no model is installed", { timeout: 5000 }, async () => {

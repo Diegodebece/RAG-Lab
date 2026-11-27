@@ -23,7 +23,7 @@ describe("OLLAMA_BASE_URL with a trailing slash", () => {
             names = undefined;
         }
 
-        assert.deepEqual(fake.requests, [{ method: "GET", path: "/api/tags" }]);
+        assert.deepEqual(fake.requests, [{ method: "GET", path: "/api/tags", body: null }]);
         assert.deepEqual(names, ["qwen3.5:4b"]);
     });
 });

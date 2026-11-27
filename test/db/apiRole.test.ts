@@ -73,9 +73,69 @@ const canUpdateColumn = async (table: string, column: string): Promise<boolean> 
 const UPDATABLE_PROFILE_COLUMNS = ["name", "settings", "updated_at", "version"];
 const FIXED_PROFILE_COLUMNS = ["created_at", "id", "user_id"];
 
+// The tables of layer 4 and what the services change in them. A document is written once and never changed (not even to
+// move it to another user), an index changes only as its build goes on, a chunk gets its vector and nothing else, and a
+// usage row is written once and only ever counted. The columns are listed in alphabetical order, as the database lists them.
+const UPDATABLE_INDEX_COLUMNS = ["attempts", "embedded_count", "embedding_tokens", "error", "finished_at", "queued_at", "started_at", "status"];
+const FIXED_INDEX_COLUMNS = ["chunk_count", "chunk_size", "created_at", "document_id", "embedding_model", "id"];
+const DOCUMENT_COLUMNS = ["character_count", "content_hash", "created_at", "filename", "id", "text", "user_id"];
+const CHUNK_COLUMNS = ["chunk_index", "embedding", "index_id", "text"];
+const USAGE_COLUMNS = ["accepted_at", "id", "user_id"];
+
+// the columns of a table the API role may update, in alphabetical order, and the columns the table has
+const updatableColumnsOf = async (table: string): Promise<{ all: string[]; updatable: string[] }> => {
+    const { rows } = await ownerPool.query<{ column_name: string }>(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY column_name",
+        [table]
+    );
+    const updatable: string[] = [];
+
+    for (const { column_name: column } of rows) {
+        if (await canUpdateColumn(table, column)) {
+            updatable.push(column);
+        }
+    }
+
+    return { all: rows.map((row) => row.column_name), updatable };
+};
+
+interface DocumentProbe {
+    userId: string;
+    documentId: string;
+    indexId: string;
+}
+
+// A user with a document, an index of two chunks and a usage row, made the way the API makes them (as the API role).
+const makeDocumentProbe = async (email: string): Promise<DocumentProbe> => {
+    const { rows: users } = await pool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ($1, 'x') RETURNING id", [email]);
+    const userId = users[0].id;
+    const { rows: documents } = await pool.query<{ id: string }>(
+        "INSERT INTO documents (user_id, filename, text, character_count, content_hash) VALUES ($1, 'probe.txt', 'probe text', 10, repeat('a', 64)) RETURNING id",
+        [userId]
+    );
+    const { rows: indexes } = await pool.query<{ id: string }>(
+        "INSERT INTO document_indexes (document_id, chunk_size, embedding_model, chunk_count) VALUES ($1, 1000, 'probe-model:1', 2) RETURNING id",
+        [documents[0].id]
+    );
+    await pool.query("INSERT INTO chunks (index_id, chunk_index, text) VALUES ($1, 0, 'one'), ($1, 1, 'two')", [indexes[0].id]);
+    await pool.query("INSERT INTO index_build_usage (user_id) VALUES ($1)", [userId]);
+
+    return { userId, documentId: documents[0].id, indexId: indexes[0].id };
+};
+
+// every row of the probe's four tables, as the owner reads them: a refused statement must leave all of it as it was
+const readProbe = async (probe: DocumentProbe): Promise<unknown[]> => [
+    (await ownerPool.query("SELECT * FROM documents WHERE id = $1", [probe.documentId])).rows,
+    (await ownerPool.query("SELECT * FROM document_indexes WHERE id = $1", [probe.indexId])).rows,
+    (await ownerPool.query("SELECT index_id, chunk_index, text, embedding::text AS embedding FROM chunks WHERE index_id = $1 ORDER BY chunk_index", [probe.indexId])).rows,
+    (await ownerPool.query("SELECT * FROM index_build_usage WHERE user_id = $1", [probe.userId])).rows
+];
+
+const NEW_TABLES = ["documents", "document_indexes", "chunks", "index_build_usage"];
+
 const checkTheRights = (): void => {
-    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile and profiles, and nothing more", async () => {
-        const tables = (await publicTables()).filter((table) => !["schema_migrations", "default_profile", "profiles"].includes(table));
+    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile, profiles and the four tables of documents and indexes, and nothing more", async () => {
+        const tables = (await publicTables()).filter((table) => !["schema_migrations", "default_profile", "profiles", ...NEW_TABLES].includes(table));
 
         assert.ok(tables.includes("users"), "the users table is among them");
 
@@ -181,6 +241,210 @@ const checkTheRights = (): void => {
             assert.deepEqual(rows[0].settings, { topK: 9 });
         } finally {
             await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+        }
+    });
+
+    it("holds SELECT, INSERT and DELETE on documents, and no UPDATE on any column of it", async () => {
+        assert.deepEqual(await privilegesOn("documents"), ["SELECT", "INSERT", "DELETE"]);
+        assert.deepEqual(await updatableColumnsOf("documents"), { all: DOCUMENT_COLUMNS, updatable: [] });
+    });
+
+    it("holds SELECT, INSERT and DELETE on document_indexes as a whole, and UPDATE on exactly the eight columns a build changes", async () => {
+        assert.deepEqual(await privilegesOn("document_indexes"), ["SELECT", "INSERT", "DELETE"]);
+
+        const { all, updatable } = await updatableColumnsOf("document_indexes");
+
+        assert.deepEqual(all, [...UPDATABLE_INDEX_COLUMNS, ...FIXED_INDEX_COLUMNS].sort(), "the columns the test knows: a column added later is a decision and not an accident");
+        assert.deepEqual(updatable, UPDATABLE_INDEX_COLUMNS);
+    });
+
+    it("holds SELECT and INSERT on chunks as a whole, and UPDATE on the embedding column only", async () => {
+        assert.deepEqual(await privilegesOn("chunks"), ["SELECT", "INSERT"]);
+        assert.deepEqual(await updatableColumnsOf("chunks"), { all: CHUNK_COLUMNS, updatable: ["embedding"] });
+    });
+
+    it("holds only SELECT and INSERT on index_build_usage, and no UPDATE on any column of it", async () => {
+        assert.deepEqual(await privilegesOn("index_build_usage"), ["SELECT", "INSERT"]);
+        assert.deepEqual(await updatableColumnsOf("index_build_usage"), { all: USAGE_COLUMNS, updatable: [] });
+    });
+
+    it("is refused an UPDATE of any column of documents (42501), the owner included, and the rows are unchanged", async () => {
+        const probe = await makeDocumentProbe("update.documents.probe@example.com");
+        const other = await makeDocumentProbe("update.documents.other@example.com");
+
+        try {
+            const before = await readProbe(probe);
+            const statements: Record<string, string> = {
+                "user_id": `UPDATE documents SET user_id = '${other.userId}' WHERE id = '${probe.documentId}'`,
+                "user_id of every row": `UPDATE documents SET user_id = '${other.userId}'`,
+                "text": `UPDATE documents SET text = 'rewritten' WHERE id = '${probe.documentId}'`,
+                "filename": `UPDATE documents SET filename = 'renamed.txt' WHERE id = '${probe.documentId}'`,
+                "content_hash": `UPDATE documents SET content_hash = repeat('b', 64) WHERE id = '${probe.documentId}'`,
+                "character_count": `UPDATE documents SET character_count = 99 WHERE id = '${probe.documentId}'`,
+                "a column set to itself": `UPDATE documents SET text = text WHERE id = '${probe.documentId}'`
+            };
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await readProbe(probe), before, "the rows are as they were");
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = ANY($1::uuid[])", [[probe.userId, other.userId]]);
+        }
+    });
+
+    it("is refused an UPDATE of the document, the size, the model, the chunk count, the id or the creation date of an index (42501), also next to a column it may change", async () => {
+        const probe = await makeDocumentProbe("update.index.probe@example.com");
+        const other = await makeDocumentProbe("update.index.other@example.com");
+
+        try {
+            const before = await readProbe(probe);
+            const where = `WHERE id = '${probe.indexId}'`;
+            const statements: Record<string, string> = {
+                "document_id": `UPDATE document_indexes SET document_id = '${other.documentId}' ${where}`,
+                "chunk_size": `UPDATE document_indexes SET chunk_size = 500 ${where}`,
+                "embedding_model": `UPDATE document_indexes SET embedding_model = 'other-model:1' ${where}`,
+                "chunk_count": `UPDATE document_indexes SET chunk_count = 5 ${where}`,
+                "id": `UPDATE document_indexes SET id = gen_random_uuid() ${where}`,
+                "created_at": `UPDATE document_indexes SET created_at = now() ${where}`,
+                "chunk_size together with status": `UPDATE document_indexes SET status = 'indexing', chunk_size = 500 ${where}`,
+                "document_id set to itself": `UPDATE document_indexes SET document_id = document_id ${where}`
+            };
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await readProbe(probe), before, "the rows are as they were, the status included");
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = ANY($1::uuid[])", [[probe.userId, other.userId]]);
+        }
+    });
+
+    it("is refused an UPDATE of the text, the number or the index of a chunk, and a DELETE of chunks (42501), and the chunks are unchanged", async () => {
+        const probe = await makeDocumentProbe("update.chunks.probe@example.com");
+        const other = await makeDocumentProbe("update.chunks.other@example.com");
+
+        try {
+            const before = await readProbe(probe);
+            const statements: Record<string, string> = {
+                "text": `UPDATE chunks SET text = 'rewritten' WHERE index_id = '${probe.indexId}'`,
+                "chunk_index": `UPDATE chunks SET chunk_index = chunk_index + 10 WHERE index_id = '${probe.indexId}'`,
+                "index_id": `UPDATE chunks SET index_id = '${other.indexId}' WHERE index_id = '${probe.indexId}'`,
+                "text together with embedding": `UPDATE chunks SET embedding = embedding, text = 'rewritten' WHERE index_id = '${probe.indexId}'`,
+                "DELETE of one index's chunks": `DELETE FROM chunks WHERE index_id = '${probe.indexId}'`,
+                "DELETE of every chunk": "DELETE FROM chunks"
+            };
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await readProbe(probe), before, "the chunks are as they were");
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = ANY($1::uuid[])", [[probe.userId, other.userId]]);
+        }
+    });
+
+    it("is refused UPDATE and DELETE on index_build_usage (42501), so a user's day cannot be given back, and the rows are unchanged", async () => {
+        const probe = await makeDocumentProbe("usage.probe@example.com");
+
+        try {
+            const before = await readProbe(probe);
+            const statements: Record<string, string> = {
+                "UPDATE of accepted_at": `UPDATE index_build_usage SET accepted_at = now() - interval '2 days' WHERE user_id = '${probe.userId}'`,
+                "UPDATE of user_id": `UPDATE index_build_usage SET user_id = user_id`,
+                "DELETE of one user's rows": `DELETE FROM index_build_usage WHERE user_id = '${probe.userId}'`,
+                "DELETE of every row": "DELETE FROM index_build_usage"
+            };
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await readProbe(probe), before, "the rows are as they were");
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = $1", [probe.userId]);
+        }
+    });
+
+    it("still does what the services do: updates the columns of a build, writes the vectors of a batch, and deletes an index", async () => {
+        const probe = await makeDocumentProbe("service.documents.probe@example.com");
+
+        try {
+            const { rows: started } = await pool.query<{ id: string }>(
+                "UPDATE document_indexes SET status = 'indexing', started_at = now(), attempts = attempts + 1, error = NULL WHERE id = $1 RETURNING id",
+                [probe.indexId]
+            );
+            assert.equal(started.length, 1);
+
+            const vector = JSON.stringify(new Array(1024).fill(0.5));
+            const { rowCount } = await pool.query(
+                `UPDATE chunks SET embedding = batch.embedding::vector
+                 FROM unnest($2::int[], $3::text[]) AS batch(chunk_index, embedding)
+                 WHERE chunks.index_id = $1 AND chunks.chunk_index = batch.chunk_index`,
+                [probe.indexId, [0, 1], [vector, vector]]
+            );
+            assert.equal(rowCount, 2);
+
+            await pool.query("UPDATE document_indexes SET embedded_count = 2, embedding_tokens = embedding_tokens + 7 WHERE id = $1", [probe.indexId]);
+            await pool.query("UPDATE document_indexes SET status = 'ready', finished_at = now() WHERE id = $1", [probe.indexId]);
+            await pool.query("UPDATE document_indexes SET status = 'queued', queued_at = now(), started_at = NULL, finished_at = NULL, error = 'Indexing failed' WHERE id = $1", [probe.indexId]);
+
+            const { rows } = await ownerPool.query("SELECT status, embedded_count, embedding_tokens, attempts, error FROM document_indexes WHERE id = $1", [probe.indexId]);
+            assert.deepEqual(rows, [{ status: "queued", embedded_count: 2, embedding_tokens: 7, attempts: 1, error: "Indexing failed" }]);
+
+            assert.equal((await pool.query("DELETE FROM document_indexes WHERE id = $1", [probe.indexId])).rowCount, 1);
+            assert.equal((await pool.query("DELETE FROM documents WHERE id = $1", [probe.documentId])).rowCount, 1);
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = $1", [probe.userId]);
+        }
+    });
+
+    // The chunks of an index go with it although the API role may not delete chunks: the cascade of a foreign key is
+    // carried out with the rights of the table's owner.
+    it("deletes the chunks of an index when it deletes the index, and of a document when it deletes the document, although it cannot delete chunks itself", async () => {
+        const probe = await makeDocumentProbe("cascade.probe@example.com");
+
+        try {
+            assert.equal((await ownerPool.query("SELECT 1 FROM chunks WHERE index_id = $1", [probe.indexId])).rowCount, 2, "the probe has its chunks");
+
+            await pool.query("DELETE FROM document_indexes WHERE id = $1", [probe.indexId]);
+            assert.equal((await ownerPool.query("SELECT 1 FROM chunks WHERE index_id = $1", [probe.indexId])).rowCount, 0, "the index took its chunks with it");
+
+            const { rows: indexes } = await pool.query<{ id: string }>(
+                "INSERT INTO document_indexes (document_id, chunk_size, embedding_model, chunk_count) VALUES ($1, 500, 'probe-model:1', 1) RETURNING id",
+                [probe.documentId]
+            );
+            await pool.query("INSERT INTO chunks (index_id, chunk_index, text) VALUES ($1, 0, 'one')", [indexes[0].id]);
+
+            await pool.query("DELETE FROM documents WHERE id = $1", [probe.documentId]);
+            assert.equal((await ownerPool.query("SELECT 1 FROM chunks WHERE index_id = $1", [indexes[0].id])).rowCount, 0, "the document took the chunks of its indexes with it");
+            assert.equal((await ownerPool.query("SELECT 1 FROM document_indexes WHERE id = $1", [indexes[0].id])).rowCount, 0);
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = $1", [probe.userId]);
+        }
+    });
+
+    it("writes a vector into a chunk and orders chunks by cosine distance, the way retrieval will", async () => {
+        const probe = await makeDocumentProbe("vector.probe@example.com");
+
+        try {
+            // a vector with a weight on its first number and a weight on its second, and zeros everywhere else
+            const mix = (first: number, second: number): number[] => Array.from({ length: 1024 }, (_, index) => (index === 0 ? first : index === 1 ? second : 0));
+            await pool.query("UPDATE chunks SET embedding = $2::vector WHERE index_id = $1 AND chunk_index = 0", [probe.indexId, JSON.stringify(mix(1, 0))]);
+            await pool.query("UPDATE chunks SET embedding = $2::vector WHERE index_id = $1 AND chunk_index = 1", [probe.indexId, JSON.stringify(mix(0, 1))]);
+
+            const nearest = async (query: number[]): Promise<number[]> => (await pool.query<{ chunk_index: number }>(
+                "SELECT chunk_index FROM chunks WHERE index_id = $1 ORDER BY embedding <=> $2::vector",
+                [probe.indexId, JSON.stringify(query)]
+            )).rows.map((row) => row.chunk_index);
+
+            assert.deepEqual(await nearest(mix(0.9, 0.1)), [0, 1]);
+            assert.deepEqual(await nearest(mix(0.1, 0.9)), [1, 0]);
+        } finally {
+            await pool.query("DELETE FROM users WHERE id = $1", [probe.userId]);
         }
     });
 
@@ -316,7 +580,10 @@ describe("the API role", () => {
     it("reads schema_migrations, which is how the server checks the schema at startup", async () => {
         const { rows } = await pool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
 
-        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql"]);
+        assert.deepEqual(rows.map((row) => row.version), [
+            "001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql",
+            "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql"
+        ]);
     });
 
     it("can use pgvector's type and operators, which live in the schema it was given USAGE on", async () => {

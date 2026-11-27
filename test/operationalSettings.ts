@@ -23,6 +23,17 @@ export const OPERATIONAL_DEFAULTS: Record<string, string> = {
     USER_CREATIONS_PER_HOUR: "20",
     // profiles one user may keep (layer 3)
     MAX_PROFILES_PER_USER: "20",
+    // documents and indexes (layer 4): what one user may keep and build, what the whole server may queue and build
+    // per day, the size of a document and how often one user may upload
+    MAX_DOCUMENTS_PER_USER: "3",
+    MAX_DOCUMENT_CHARACTERS: "1000000",
+    UPLOAD_REQUESTS_PER_MINUTE: "5",
+    MAX_ACTIVE_INDEX_BUILDS_PER_USER: "1",
+    MAX_QUEUED_INDEX_BUILDS: "20",
+    MAX_INDEX_BUILDS_PER_DAY: "6",
+    MAX_INDEX_BUILDS_PER_DAY_TOTAL: "100",
+    // how long one request to the model server may take before the API gives up on it
+    OLLAMA_TIMEOUT_MS: "120000",
     // a closed port: a test that forgets to start the fake Ollama gets "connection refused" instead of reaching
     // the real models on this computer
     OLLAMA_BASE_URL: "http://127.0.0.1:1"
