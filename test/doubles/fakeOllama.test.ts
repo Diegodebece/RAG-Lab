@@ -1,6 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama, waitForRequests } from "./fakeOllama.js";
+import { cutResponse, dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama, waitForRequests } from "./fakeOllama.js";
 
 // The double itself: every other test that uses it trusts these behaviors.
 const fake = await startFakeOllama();
@@ -74,6 +74,15 @@ describe("fake Ollama", () => {
         await assert.rejects(fetch(`${fake.url}/api/tags`));
     });
 
+    it("can cut an answer in the middle of its body: the status arrives, and reading the body fails", { timeout: 5000 }, async () => {
+        fake.respond("/api/tags", cutResponse);
+
+        const response = await fetch(`${fake.url}/api/tags`, { signal: AbortSignal.timeout(4000) });
+
+        assert.equal(response.status, 200);
+        await assert.rejects(response.json(), (error: unknown) => error instanceof TypeError, "a read that ends early, not text that is not JSON");
+    });
+
     it("can stay silent, and the caller's timeout ends the wait", { timeout: 5000 }, async () => {
         fake.respond("/api/tags", neverAnswer);
 
@@ -126,6 +135,15 @@ describe("fake Ollama: the embed endpoint", () => {
         fake.respond("/api/embed", embeddings({ beforeAnswer: (input) => { seen = input; } }));
         await embed({ model: "m:1", input: ["x", "y"] });
         assert.deepEqual(seen, ["x", "y"]);
+    });
+
+    it("embeddings() can put a chosen number first in every vector", { timeout: 5000 }, async () => {
+        fake.respond("/api/embed", embeddings({ firstValue: 1e39 }));
+
+        const answer = await (await embed({ model: "m:1", input: ["a", "b"] })).json() as { embeddings: number[][] };
+
+        assert.deepEqual(answer.embeddings.map((vector) => vector[0]), [1e39, 1e39]);
+        assert.deepEqual(answer.embeddings[0].slice(1), fakeVectorFor("a").slice(1), "the rest of the vector is the usual one");
     });
 
     it("embeddings() answers 400 when the body has no list of inputs", { timeout: 5000 }, async () => {

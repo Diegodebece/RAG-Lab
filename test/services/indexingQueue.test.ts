@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import request from "supertest";
-import { dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, modelList, startFakeOllama, waitForRequests } from "../doubles/fakeOllama.js";
+import { cutResponse, dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, modelList, startFakeOllama, waitForRequests } from "../doubles/fakeOllama.js";
 import type { FakeOllamaHandler } from "../doubles/fakeOllama.js";
 
 // The indexing queue (layer 4): the rows of document_indexes are the queue, one worker builds one index at a time, and
@@ -24,6 +24,7 @@ const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/tes
 const { createTestUser } = await import("../routes/testUsers.js");
 const { DEFAULT_EMBEDDING_MODEL, SEEDED_VECTOR_VALUE, chunkTexts, countRows, readChunks, readIndex, sameVector, seedDocument, seedDocumentWithIndex, seedIndex, seedUser, waitFor } = await import("../documentsFixtures.js");
 const queue = await import("../../src/v1/services/indexingQueue.service.js");
+const { pool } = await import("../../src/v1/config/db.config.js");
 const { subscribeToEvents } = await import("../../src/v1/services/events.service.js");
 const { getModelTurnWaitingCount, runWithModelTurnService } = await import("../../src/v1/services/modelTurn.service.js");
 // what the tests read of an indexing event: its type, the index it is about, its owner, and the other fields it carries
@@ -333,6 +334,137 @@ describe("processQueuedIndexesService: when Ollama cannot be reached", () => {
     });
 });
 
+// Ollama "down" is only a connection that cannot be made (ModelUnavailableError) or a probe that times out. A probe that is
+// answered, whatever the answer is, means the server is up: if the answer is a 404, a 500 or something that cannot be read,
+// it is up but broken, and a build that keeps failing against it must run out of attempts instead of being queued again for
+// ever, every poll.
+describe("processQueuedIndexesService: when a batch fails and /api/tags is up but broken", () => {
+    const brokenProbes: Record<string, FakeOllamaHandler> = {
+        "an HTTP 404": httpError(404),
+        "an HTTP 500": httpError(500),
+        "a body that is not JSON": malformedBody,
+        "a list of models of another shape": jsonBody({ models: "x" })
+    };
+
+    for (const [label, probe] of Object.entries(brokenProbes)) {
+        it(`counts an attempt and queues the index again, and fails it with 'Indexing failed' after 3 attempts, when /api/tags answers ${label}`, { timeout: 40_000 }, async (t) => {
+            t.mock.method(console, "error", () => {});
+            const { index } = await seedBuild(`broken probe ${label}`, 15);
+            fake.respond("/api/embed", dropConnection);
+            fake.respond("/api/tags", probe);
+
+            await within(20_000, "the first run", queue.processQueuedIndexesService());
+
+            const afterFirst = await readIndex(index.id);
+            assert.equal(afterFirst?.status, "queued", "back in the queue for its next try");
+            assert.equal(afterFirst?.attempts, 1, "the server answered, so it is up: the failed batch is an attempt");
+
+            for (let run = 0; run < 5 && (await statusOf(index.id)) !== "failed"; run++) {
+                await within(20_000, "a run", queue.processQueuedIndexesService());
+            }
+
+            const row = await readIndex(index.id);
+            assert.equal(row?.status, "failed");
+            assert.equal(row?.error, "Indexing failed");
+            assert.equal(row?.attempts, 3);
+            assert.equal(embedRequests().length, 3, "three attempts and no more");
+            assert.equal(tagRequests().length, 3, "one probe after each");
+            assert.equal(events.at(-1)?.type, "failed");
+        });
+    }
+});
+
+// A body that is cut in the middle is the connection failing, so it is handled like any other failure of Ollama: the probe
+// decides (down: the index waits, no attempt; up: an attempt). It is not an answer that is wrong, which fails the index at once.
+describe("processQueuedIndexesService: when the response of a batch is cut in the middle of its body", () => {
+    it("puts the index back in the queue with its attempts unchanged when /api/tags cannot be reached either", { timeout: 40_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const { index } = await seedBuild("cut and down", 15);
+        fake.respond("/api/embed", cutResponse);
+        fake.respond("/api/tags", dropConnection);
+
+        await within(20_000, "the run", queue.processQueuedIndexesService());
+
+        const row = await readIndex(index.id);
+        assert.equal(row?.status, "queued", "not failed: the server may only be restarting");
+        assert.equal(row?.attempts, 0);
+        assert.equal(row?.error, null);
+        assert.equal(tagRequests().length, 1, "Ollama was asked once if it is up");
+        assert.ok(!events.some((event) => event.type === "failed"));
+    });
+
+    it("counts an attempt and queues the index again when /api/tags answers, and finishes it once the batches come whole", { timeout: 40_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const { index } = await seedBuild("cut and up", 15);
+        let calls = 0;
+        fake.respond("/api/embed", (req, res, body) => (++calls === 1 ? cutResponse : embeddings())(req, res, body));
+
+        for (let run = 0; run < 3 && (await statusOf(index.id)) !== "ready"; run++) {
+            await within(20_000, "a run", queue.processQueuedIndexesService());
+
+            if (run === 0) {
+                const afterFirst = await readIndex(index.id);
+                assert.equal(afterFirst?.status, "queued");
+                assert.equal(afterFirst?.attempts, 1, "the cut batch was an attempt");
+            }
+        }
+
+        const row = await readIndex(index.id);
+        assert.equal(row?.status, "ready");
+        assert.equal(row?.attempts, 1);
+        assert.equal(tagRequests().length, 1);
+        assert.ok(!events.some((event) => event.type === "failed"));
+    });
+});
+
+// The worker builds the indexes of active users only: an account that was disabled while its indexes waited does not use
+// the model server's time. Its indexes stay as they are, so enabling the account again finds them in their place.
+describe("processQueuedIndexesService: the indexes of users who are not active", () => {
+    const setStatus = (userId: string, status: "active" | "disabled") => ownerPool.query("UPDATE users SET status = $2 WHERE id = $1", [userId, status]);
+
+    it("claims the active user's index and not the older one of a disabled user, which stays queued and unchanged", { timeout: 30_000 }, async () => {
+        const disabled = await seedBuild("disabled user", 5, { queuedAt: new Date(Date.now() - 120_000) });
+        const active = await seedBuild("active user", 3, { queuedAt: new Date(Date.now() - 60_000) });
+        await setStatus(disabled.userId, "disabled");
+        const before = await readIndex(disabled.index.id);
+        const chunksBefore = await readChunks(disabled.index.id);
+
+        await within(20_000, "the run", queue.processQueuedIndexesService());
+
+        assert.equal(await statusOf(active.index.id), "ready", "the active user's index was built");
+        assert.deepEqual(batchesSent().flat(), active.index.chunks, "only the active user's chunks were sent");
+        assert.deepEqual(await readIndex(disabled.index.id), before, "queued, with nothing changed: not started, not counted, not failed");
+        assert.deepEqual(await readChunks(disabled.index.id), chunksBefore);
+        assert.ok(!events.some((event) => event.indexId === disabled.index.id), "no event about it");
+    });
+
+    it("builds nothing and sends nothing to Ollama when the only queued indexes are those of disabled users", { timeout: 30_000 }, async () => {
+        const first = await seedBuild("disabled one", 3);
+        const second = await seedBuild("disabled two", 3);
+        await setStatus(first.userId, "disabled");
+        await setStatus(second.userId, "disabled");
+
+        await within(20_000, "the run", queue.processQueuedIndexesService());
+
+        assert.equal(fake.requests.length, 0, "nothing reached Ollama");
+        assert.equal(await statusOf(first.index.id), "queued");
+        assert.equal(await statusOf(second.index.id), "queued");
+    });
+
+    it("builds the index once the account is active again", { timeout: 30_000 }, async () => {
+        const user = await seedBuild("comes back", 3);
+        await setStatus(user.userId, "disabled");
+
+        await within(20_000, "the first run", queue.processQueuedIndexesService());
+        assert.equal(await statusOf(user.index.id), "queued", "skipped while disabled");
+
+        await setStatus(user.userId, "active");
+        await within(20_000, "the second run", queue.processQueuedIndexesService());
+
+        assert.equal(await statusOf(user.index.id), "ready");
+    });
+});
+
 describe("processQueuedIndexesService: when the build cannot succeed", () => {
     it("fails with 'The embedding model is not installed on the model server' when the model is missing from /api/tags and the embed answers 404", { timeout: 30_000 }, async (t) => {
         t.mock.method(console, "error", () => {});
@@ -352,7 +484,9 @@ describe("processQueuedIndexesService: when the build cannot succeed", () => {
     const damaged: Record<string, () => FakeOllamaHandler> = {
         "vectors of the wrong size": () => embeddings({ dimensions: 3 }),
         "an all-zero vector": () => embeddings({ zeroVector: true }),
-        "no token count": () => embeddings({ omitTokenCount: true })
+        "no token count": () => embeddings({ omitTokenCount: true }),
+        // pgvector stores float4 and would refuse the number: the model's answer is what is wrong, not the database
+        "a number outside the float4 range": () => embeddings({ firstValue: 1e39 })
     };
 
     for (const [label, makeHandler] of Object.entries(damaged)) {
@@ -531,6 +665,36 @@ describe("the worker", () => {
         const requestsAtStop = fake.requests.length;
         await sleep(300);
         assert.equal(fake.requests.length, requestsAtStop, "a stopped worker sends nothing more");
+    });
+
+    // The poll comes every 10 seconds and this test waits for less than 9: only a wake can explain the start. The wake arrives at the one
+    // moment that is hard to hit with a real request, so the test makes it arrive there: the pass has looked at the queue and
+    // found it empty (the claim has been answered by the database), and has not yet reported itself finished.
+    it("runs again for an index queued while the loop is finishing its last pass: the wake is not lost, and the poll is not needed", { timeout: 30_000 }, async (t) => {
+        const claimQuery = pool.query.bind(pool) as unknown as (...args: unknown[]) => Promise<{ rows: unknown[] }>;
+        let late: Awaited<ReturnType<typeof seedBuild>> | undefined;
+        let injected = false;
+
+        t.mock.method(pool, "query", async (...args: unknown[]) => {
+            const result = await claimQuery(...args);
+
+            if (!injected && typeof args[0] === "string" && args[0].includes("SET status = 'indexing'") && result.rows.length === 0) {
+                injected = true;
+                late = await seedBuild("late", 3);
+                queue.notifyIndexQueuedService();
+            }
+
+            return result;
+        });
+
+        const startedAt = Date.now();
+        await queue.startIndexingWorkerService();
+
+        await waitFor("the empty claim to be answered and the late index queued", async () => (late ? true : undefined), 3_000);
+        await waitFor("the late index to be ready", async () => (late && (await statusOf(late.index.id)) === "ready" ? true : undefined), 6_000);
+
+        assert.ok(Date.now() - startedAt < 9_000, "well before the poll's first round");
+        assert.deepEqual(batchesSent().flat(), late?.index.chunks, "its chunks, once");
     });
 
     it("can be stopped when it is idle, and more than once", { timeout: 15_000 }, async () => {

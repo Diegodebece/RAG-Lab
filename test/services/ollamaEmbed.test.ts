@@ -1,6 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, neverAnswer, redirectTo, startFakeOllama } from "../doubles/fakeOllama.js";
+import { cutResponse, dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, neverAnswer, redirectTo, startFakeOllama } from "../doubles/fakeOllama.js";
 import type { FakeOllamaHandler } from "../doubles/fakeOllama.js";
 
 // The fake answers on a free port of this computer; the base URL is read when the service loads, so it is set first.
@@ -13,6 +13,7 @@ const { embedTextsService } = await import("../../src/v1/services/ollama.service
 const { AppError } = await import("../../src/v1/utils/appError.util.js");
 const { ModelUnavailableError } = await import("../../src/v1/utils/modelUnavailableError.util.js");
 const { RequestCancelledError } = await import("../../src/v1/utils/requestCancelledError.util.js");
+const { MalformedModelAnswerError } = await import("../../src/v1/utils/malformedModelAnswerError.util.js");
 
 after(async () => {
     await fake.close();
@@ -86,6 +87,17 @@ describe("embedTextsService: when Ollama cannot be used", () => {
         await assert.rejects(embedTextsService(MODEL, ["a"], { timeoutMs: 2000 }), (error: unknown) => error instanceof ModelUnavailableError);
     });
 
+    // a connection that closes in the middle of the body is the connection failing, as much as one that never opened: it is
+    // not an answer that is wrong (MalformedModelAnswerError), and the caller must be able to treat it as "away"
+    it("throws ModelUnavailableError, not MalformedModelAnswerError, when the connection closes in the middle of the body", { timeout: 5000 }, async () => {
+        fake.respond("/api/embed", cutResponse);
+
+        await assert.rejects(
+            embedTextsService(MODEL, ["a"], { timeoutMs: 2000 }),
+            (error: unknown) => error instanceof ModelUnavailableError && !(error instanceof MalformedModelAnswerError)
+        );
+    });
+
     it("throws a 504 AppError when Ollama does not answer within the time given (200 ms here)", { timeout: 5000 }, async () => {
         fake.respond("/api/embed", neverAnswer);
 
@@ -133,6 +145,11 @@ describe("embedTextsService: an answer that is not what the API needs", () => {
         "a null where a number should be": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), [...fakeVectorFor("b").slice(0, 1023), null]] })),
         "a vector that is not a list": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), "not a vector"] })),
         "an all-zero vector": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), new Array<number>(1024).fill(0)] })),
+        // pgvector stores float4: a number outside its range cannot be stored, and the model produced it, so it is its fault
+        "a number above the float4 range": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), [3.5e38, ...fakeVectorFor("b").slice(1)]] })),
+        "a number below the float4 range": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), [-3.5e38, ...fakeVectorFor("b").slice(1)]] })),
+        "a number far above the float4 range": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), [1e39, ...fakeVectorFor("b").slice(1)]] })),
+        "a number that is huge for a double too": jsonBody(goodAnswer(2, { embeddings: [fakeVectorFor("a"), [...fakeVectorFor("b").slice(1), -1e308]] })),
         "no prompt_eval_count": jsonBody((() => { const { prompt_eval_count: _unused, ...rest } = goodAnswer(2); return rest; })()),
         "a negative prompt_eval_count": jsonBody(goodAnswer(2, { prompt_eval_count: -1 })),
         "a fractional prompt_eval_count": jsonBody(goodAnswer(2, { prompt_eval_count: 2.5 })),
@@ -145,12 +162,25 @@ describe("embedTextsService: an answer that is not what the API needs", () => {
     };
 
     for (const [label, handler] of Object.entries(damaged)) {
-        it(`throws a plain Error, not an AppError, for ${label}`, { timeout: 5000 }, async () => {
+        it(`throws a MalformedModelAnswerError, a plain Error and not an AppError, for ${label}`, { timeout: 5000 }, async () => {
             fake.respond("/api/embed", handler);
 
-            await assert.rejects(embedTextsService(MODEL, ["a", "b"], { timeoutMs: 2000 }), isPlainError);
+            await assert.rejects(
+                embedTextsService(MODEL, ["a", "b"], { timeoutMs: 2000 }),
+                (error: unknown) => error instanceof MalformedModelAnswerError && isPlainError(error)
+            );
         });
     }
+
+    it("accepts the largest number a float4 holds, and its negative: the range is refused only beyond it", { timeout: 5000 }, async () => {
+        const largest = 3.4028234663852886e38;
+        const vector = [largest, -largest, ...fakeVectorFor("b").slice(2)];
+        fake.respond("/api/embed", jsonBody(goodAnswer(1, { embeddings: [vector] })));
+
+        const result = await embedTextsService(MODEL, ["b"], { timeoutMs: 2000 });
+
+        assert.deepEqual(result.embeddings, [vector]);
+    });
 
     it("takes the very answer the double gives for the same two texts, so the cases above are refused for what is wrong with them", { timeout: 5000 }, async () => {
         fake.respond("/api/embed", embeddings());

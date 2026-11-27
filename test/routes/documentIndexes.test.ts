@@ -16,6 +16,7 @@ process.env.MAX_INDEX_BUILDS_PER_DAY = "4";
 process.env.MAX_INDEX_BUILDS_PER_DAY_TOTAL = "8";
 
 const { app } = await import("../../src/app.js");
+const { pool } = await import("../../src/v1/config/db.config.js");
 const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
 const { createTestUser } = await import("./testUsers.js");
 const { chunkText } = await import("../../src/v1/utils/chunkText.util.js");
@@ -603,6 +604,98 @@ describe("POST /v1/documents/:id/indexes: the limits", () => {
 
         assert.deepEqual(answers.map((answer) => answer.status).sort(), [202, 429]);
         assert.equal(await countRows("index_build_usage"), 8, "never more than the cap");
+    });
+});
+
+// The text of a document can be a million characters, and cutting it takes the server's time: a request that is going to be
+// refused for a cap must not pay for it. There is no way to spy on the function that cuts the text (an ES module's export
+// cannot be replaced), so the test watches the one thing that comes before it: the API's own pool reading the text column of
+// the documents table. The seeding goes through another pool (the owner's), so every statement seen here is the API's.
+describe("POST /v1/documents/:id/indexes: the caps are checked before the document is read and chunked", () => {
+    const sqlOf = (argument: unknown): string => (typeof argument === "string" ? argument : String((argument as { text?: unknown })?.text ?? ""));
+
+    const readsOfDocumentText = (spy: { mock: { calls: { arguments: unknown[] }[] } }): string[] =>
+        spy.mock.calls.map((call) => sqlOf(call.arguments[0])).filter((sql) => /\btext\b/i.test(sql) && /\bdocuments\b/i.test(sql));
+
+    // other users' queued builds, each on a document of its own
+    const fillTheQueue = async (howMany: number): Promise<void> => {
+        const owners = [await createTestUser({ email: "bob@example.com" }), await createTestUser({ email: "cara@example.com" })];
+
+        for (let index = 0; index < howMany; index++) {
+            await seedIndex((await seedLongDocument(owners[index % 2].id, `queued ${index}`)).id, { status: "queued" });
+        }
+    };
+
+    it("reads the text of the document when the request is under every cap (the seam sees what it is meant to see)", { timeout: 20_000 }, async (t) => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedLongDocument(ana.id);
+        const spy = t.mock.method(pool, "query");
+
+        const response = await build(ana.auth, document.id, { chunkSize: 500 });
+
+        assert.equal(response.status, 202);
+        assert.ok(readsOfDocumentText(spy).length >= 1, "the text was read to be chunked");
+    });
+
+    const refusals: Record<string, { status: number; body: object; setUp: (ana: { id: string }) => Promise<void> }> = {
+        "409 when the user has the most builds in progress": {
+            status: 409,
+            body: IN_PROGRESS,
+            setUp: async (ana) => {
+                await seedIndex((await seedLongDocument(ana.id, "first")).id, { status: "queued" });
+                await seedIndex((await seedLongDocument(ana.id, "second")).id, { status: "indexing" });
+            }
+        },
+        "429 when the user has used their builds of the day": {
+            status: 429,
+            body: USER_DAILY,
+            setUp: async (ana) => seedUsage(ana.id, 4)
+        },
+        "429 when the builds of all users in the last day reach the global cap": {
+            status: 429,
+            body: GLOBAL_DAILY,
+            setUp: async () => {
+                await seedUsage((await createTestUser({ email: "bob@example.com" })).id, 4);
+                await seedUsage((await createTestUser({ email: "cara@example.com" })).id, 4);
+            }
+        },
+        "503 when the queue is full": {
+            status: 503,
+            body: QUEUE_FULL,
+            setUp: async () => fillTheQueue(6)
+        }
+    };
+
+    for (const [label, refusal] of Object.entries(refusals)) {
+        it(`answers ${label}, without the text of the document being read, and stores and counts nothing`, { timeout: 30_000 }, async (t) => {
+            const ana = await createTestUser({ email: "ana@example.com" });
+            const document = await seedLongDocument(ana.id);
+            await refusal.setUp(ana);
+            const before = await counts();
+            const spy = t.mock.method(pool, "query");
+
+            const response = await build(ana.auth, document.id, { chunkSize: 500 });
+
+            assert.equal(response.status, refusal.status);
+            assert.deepEqual(response.body, refusal.body);
+            assert.deepEqual(readsOfDocumentText(spy), [], "the document was not read, so it was not chunked");
+            assert.deepEqual(await counts(), before, "nothing stored, nothing counted");
+        });
+    }
+
+    it("still answers 200 with the existing index, without reading the text, when the user is at every cap", { timeout: 20_000 }, async (t) => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedLongDocument(ana.id);
+        const index = await seedIndex(document.id, { status: "queued", chunkSize: 500 });
+        await seedIndex((await seedLongDocument(ana.id, "other")).id, { status: "indexing", chunkSize: 500 });
+        await seedUsage(ana.id, 4);
+        const spy = t.mock.method(pool, "query");
+
+        const response = await build(ana.auth, document.id, { chunkSize: 500 });
+
+        assert.equal(response.status, 200);
+        assert.equal(response.body.data.id, index.id);
+        assert.deepEqual(readsOfDocumentText(spy), []);
     });
 });
 

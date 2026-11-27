@@ -1,6 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama } from "../doubles/fakeOllama.js";
+import { cutResponse, dropConnection, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama } from "../doubles/fakeOllama.js";
 import type { FakeOllamaHandler } from "../doubles/fakeOllama.js";
 
 // The fake answers on a free port of this computer; the base URL is read when the service loads, so it is set first.
@@ -12,6 +12,7 @@ process.env.OLLAMA_BASE_URL = fake.url;
 const { listInstalledModelsService } = await import("../../src/v1/services/ollama.service.js");
 const { AppError } = await import("../../src/v1/utils/appError.util.js");
 const { ModelUnavailableError } = await import("../../src/v1/utils/modelUnavailableError.util.js");
+const { MalformedModelAnswerError } = await import("../../src/v1/utils/malformedModelAnswerError.util.js");
 
 after(async () => {
     await fake.close();
@@ -43,6 +44,17 @@ describe("listInstalledModelsService", () => {
         await assert.rejects(
             listInstalledModelsService({ timeoutMs: 2000 }),
             (error: unknown) => error instanceof ModelUnavailableError
+        );
+    });
+
+    // a connection that closes in the middle of the body is the connection failing, as much as one that never opened: it is
+    // not an answer that is wrong (MalformedModelAnswerError), and the caller must be able to treat it as "away"
+    it("throws ModelUnavailableError, not MalformedModelAnswerError, when the connection closes in the middle of the body", { timeout: 5000 }, async () => {
+        fake.respond("/api/tags", cutResponse);
+
+        await assert.rejects(
+            listInstalledModelsService({ timeoutMs: 2000 }),
+            (error: unknown) => error instanceof ModelUnavailableError && !(error instanceof MalformedModelAnswerError)
         );
     });
 
@@ -91,5 +103,14 @@ describe("listInstalledModelsService", () => {
 
             await assert.rejects(listInstalledModelsService({ timeoutMs: 2000 }), isPlainError, label);
         }
+    });
+
+    it("throws MalformedModelAnswerError, and not ModelUnavailableError, when the whole body arrives and is not JSON", { timeout: 5000 }, async () => {
+        fake.respond("/api/tags", malformedBody);
+
+        await assert.rejects(
+            listInstalledModelsService({ timeoutMs: 2000 }),
+            (error: unknown) => error instanceof MalformedModelAnswerError && !(error instanceof ModelUnavailableError)
+        );
     });
 });

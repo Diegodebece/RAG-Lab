@@ -60,6 +60,14 @@ export const dropConnection: FakeOllamaHandler = (req) => {
     req.socket.destroy();
 };
 
+// Sends the status and the start of a body that claims to be much longer, then closes the connection: a server that
+// crashes or loses its connection in the middle of an answer. The caller gets its response, and fails reading the body.
+export const cutResponse: FakeOllamaHandler = (req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "1000000" });
+    // closed once the bytes have left, so the caller sees a body that stops and not a connection that never opened
+    res.write("{\"embeddings\": [[0.1, 0.2, ", () => req.socket.destroy());
+};
+
 export interface HeldRequest {
     handler: FakeOllamaHandler;
     // resolves when a request reaches the handler
@@ -109,6 +117,8 @@ export interface EmbeddingsOptions {
     zeroVector?: boolean;
     // the answer has no prompt_eval_count
     omitTokenCount?: boolean;
+    // the first number of every vector is this value instead of the usual one, for a number a float4 cannot hold
+    firstValue?: number;
     // runs after the request arrived and before the answer is sent, for a test that changes the database in the middle of a batch
     beforeAnswer?: (input: string[]) => Promise<void> | void;
 }
@@ -129,7 +139,15 @@ export const embeddings = (options: EmbeddingsOptions = {}): FakeOllamaHandler =
         await options.beforeAnswer?.(input);
 
         const dimensions = options.dimensions ?? EMBEDDING_DIMENSIONS;
-        const vectors = input.map((text) => (options.zeroVector ? new Array<number>(dimensions).fill(0) : fakeVectorFor(text, dimensions)));
+        const vectors = input.map((text) => {
+            const vector = options.zeroVector ? new Array<number>(dimensions).fill(0) : fakeVectorFor(text, dimensions);
+
+            if (options.firstValue !== undefined) {
+                vector[0] = options.firstValue;
+            }
+
+            return vector;
+        });
         const answer: Record<string, unknown> = { model, embeddings: vectors };
 
         if (!options.omitTokenCount) {
