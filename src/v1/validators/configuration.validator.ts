@@ -49,7 +49,7 @@ const ruleFor = (key: SettingKey) => {
 // without a trace, so the schema would accept it. This object type looks at the object as it arrived, before Joi copies
 // it, and refuses that key like any other key that is not a setting. It also refuses a value that is not an object
 // here, so the text of an object ("{}") is never parsed into one (Joi's object type does that when it converts).
-const SettingsJoi = Joi.extend((joi) => ({
+const SettingsJoi: Joi.Root = Joi.extend((joi: Joi.Root) => ({
     type: "object",
     base: joi.object(),
     prepare(value: unknown, helpers: Joi.CustomHelpers) {
@@ -62,7 +62,8 @@ const SettingsJoi = Joi.extend((joi) => ({
         }
 
         if (Object.hasOwn(value, "__proto__")) {
-            const state = helpers.state.localize([...helpers.state.path, "__proto__"], []);
+            // localize puts the key in the error's path, as Joi does for the other unknown keys
+            const state = helpers.state.localize?.([...(helpers.state.path ?? []), "__proto__"], []);
             return { value, errors: helpers.error("object.unknown", { child: "__proto__" }, state) };
         }
 

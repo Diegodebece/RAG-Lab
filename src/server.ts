@@ -3,6 +3,7 @@ import { closePoolGracefully, closeServerGracefully } from "./shutdown.js";
 import { pool } from "./v1/config/db.config.js";
 import { getStartupConfigProblems } from "./v1/config/env.config.js";
 import { HOST, PORT } from "./v1/config/server.config.js";
+import { getConfigurationProblemsService } from "./v1/services/configuration.service.js";
 import { setDatabaseReadyService } from "./v1/services/databaseReadiness.service.js";
 import { getDatabaseRoleProblemsService } from "./v1/services/databaseRole.service.js";
 import { getMigrationStateService } from "./v1/services/schema.service.js";
@@ -29,7 +30,8 @@ let stopping = false;
 let retryTimer: NodeJS.Timeout | undefined;
 
 // Refuses to run against a database whose schema is not this checkout's: pending migrations would fail on the
-// first query that needs them, and migrations this checkout does not have mean the wrong database.
+// first query that needs them, and migrations this checkout does not have mean the wrong database. The same goes for
+// configuration data this code cannot use.
 const checkRoleAndSchema = async (): Promise<void> => {
     // The API runs with the least rights it needs: the role rag_lab_api. A connection that can change the schema, create
     // roles or databases, or own the tables is the owner's, and it must not be the API's. The message names the role
@@ -59,6 +61,16 @@ const checkRoleAndSchema = async (): Promise<void> => {
 
     if (schemaProblems.length > 0) {
         console.error(`Cannot start the server:\n- ${schemaProblems.join("\n- ")}`);
+        process.exit(1);
+    }
+
+    // The configuration is data: the default profile every user's settings fall back on, and the stored profiles. Checked
+    // after the schema, because the tables may not exist before it. A default that is missing or outside the caps would
+    // give every question a configuration nobody checked, and profiles at another version cannot be read by this code.
+    const configurationProblems = await getConfigurationProblemsService(pool);
+
+    if (configurationProblems.length > 0) {
+        console.error(`Cannot start the server: the configuration data in the database is not valid:\n- ${configurationProblems.join("\n- ")}`);
         process.exit(1);
     }
 };
