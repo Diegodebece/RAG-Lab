@@ -36,5 +36,5 @@ The per-call records (`calls.jsonl`) and gzip copies of the transcripts are kept
 | #5 `feature/report-currency` | 2026-11-26 16:26 | 15 | 13,581 | 6,772,773 | USD 1.78 | 100 % |
 | #6 `feature/accounts` | 2026-11-26 16:50 | 618 | 783,160 | 96,953,397 | USD 33.03 | 23 % |
 | #7 `feature/configuration` | 2026-11-26 21:58 | 482 | 606,775 | 68,002,425 | USD 27.75 | 29 % |
-| `feature/documents` | 2026-11-27 14:10 | 1 | 356 | 129,449 | USD 0.05 | 100 % |
+| `feature/documents` | 2026-11-27 14:10 | 546 | 852,118 | 99,426,756 | USD 33.37 | 19 % |
 <!-- usage-summary:end -->
