@@ -1,4 +1,5 @@
 import * as limits from "../../../src/v1/config/limits.config.js";
+import * as ollama from "../../../src/v1/config/ollama.config.js";
 
 // Run by test/config/limits.test.ts in a child process: loads the limits the way the app does, from the environment
 // the test gave it, and prints them as JSON. A limit the app refuses to start with throws while the file loads.
@@ -10,5 +11,14 @@ console.log(JSON.stringify({
     FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES: limits.FAILED_LOGINS_PER_EMAIL_PER_15_MINUTES,
     PASSWORD_CHANGES_PER_15_MINUTES: limits.PASSWORD_CHANGES_PER_15_MINUTES,
     USER_CREATIONS_PER_HOUR: limits.USER_CREATIONS_PER_HOUR,
-    MAX_PROFILES_PER_USER: limits.MAX_PROFILES_PER_USER
+    MAX_PROFILES_PER_USER: limits.MAX_PROFILES_PER_USER,
+    MAX_DOCUMENTS_PER_USER: limits.MAX_DOCUMENTS_PER_USER,
+    MAX_DOCUMENT_CHARACTERS: limits.MAX_DOCUMENT_CHARACTERS,
+    UPLOAD_REQUESTS_PER_MINUTE: limits.UPLOAD_REQUESTS_PER_MINUTE,
+    MAX_ACTIVE_INDEX_BUILDS_PER_USER: limits.MAX_ACTIVE_INDEX_BUILDS_PER_USER,
+    MAX_QUEUED_INDEX_BUILDS: limits.MAX_QUEUED_INDEX_BUILDS,
+    MAX_INDEX_BUILDS_PER_DAY: limits.MAX_INDEX_BUILDS_PER_DAY,
+    MAX_INDEX_BUILDS_PER_DAY_TOTAL: limits.MAX_INDEX_BUILDS_PER_DAY_TOTAL,
+    DOCUMENT_BODY_LIMIT: limits.DOCUMENT_BODY_LIMIT,
+    OLLAMA_TIMEOUT_MS: ollama.OLLAMA_TIMEOUT_MS
 }));

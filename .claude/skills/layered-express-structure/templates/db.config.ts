@@ -16,6 +16,13 @@ if (!apiConnectionString) {
 // its request forever. Far above what the API's own queries take; the migration script does not use it.
 const API_QUERY_TIMEOUT_MS = 30_000;
 
+// The keys of the advisory locks the API takes (pg_advisory_xact_lock). One number per lock, and none of them is the
+// migration script's (72617001, in migrate.ts), which runs against the same database.
+export const LOCK_KEYS = {
+    // held by the transaction that accepts a document or an index build, so the global caps are counted one request at a time
+    indexingQueue: 72617002
+} as const;
+
 // One pool for the whole process, as the API role (the migration script makes its own, as the owner and without the
 // query timeout).
 export const pool = createPool({ connectionString: apiConnectionString, queryTimeoutMs: API_QUERY_TIMEOUT_MS });

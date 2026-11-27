@@ -1,12 +1,12 @@
 openapi: 3.1.0
 info:
   title: RAG Lab API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     The API contract of RAG Lab for the frontend. Layer 1 (Foundations) added the health check; layer 2 (Accounts and
     authentication) added login, logout and the user endpoints; layer 3 (Configuration as data) added the
-    configuration and profile endpoints. Every later layer adds its paths here, in the same change that adds them to
-    the code.
+    configuration and profile endpoints; layer 4 (Documents and indexes) added the document and index endpoints.
+    Every later layer adds its paths here, in the same change that adds them to the code.
 
     All paths start with `/v1`. Every response is JSON and carries `Cache-Control: no-store`.
 
@@ -54,6 +54,10 @@ tags:
     description: What each setting accepts, the defaults, and the resolved configuration a question would run with
   - name: Profiles
     description: The signed-in user's own saved configurations
+  - name: Documents
+    description: The signed-in user's own documents, uploaded as text
+  - name: Indexes
+    description: The indexes of a document (one per chunk size and embedding model), built in the background
 paths:
   /v1/health:
     get:
@@ -458,7 +462,8 @@ paths:
       description: |
         Everything a client needs to build a form for the settings: the configuration `version`, the definition of each
         setting in a fixed order (its type, and its allowed values or its range), the `defaults` the database holds
-        right now, and the limits on profiles. Any signed-in user may read it.
+        right now, the limits on profiles, the limits on documents (for an upload form) and the limits on building
+        indexes. Any signed-in user may read it.
 
         Values must be sent exactly as the definition says: numbers are JSON numbers, never text, and a value is never
         rounded or clamped by the server (a number with more decimals than `decimals` is refused, so 0.30000000000000004
@@ -509,6 +514,14 @@ paths:
                   profiles:
                     maxPerUser: 20
                     maxNameLength: 100
+                  documents:
+                    maxPerUser: 3
+                    maxCharacters: 1000000
+                    maxFilenameLength: 255
+                  indexes:
+                    maxActivePerUser: 1
+                    maxBuildsPerDay: 6
+                    maxBuildsPerDayTotal: 100
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -537,6 +550,9 @@ paths:
 
         The body is read up to 16 kB; a bigger one is a 413. A `profileId` that is not a UUID is a 400. A profile that
         does not exist, or is another user's (an admin's too), is a 404.
+
+        It stays a dry run when `overrides` holds index-time settings (`chunkSize`, `embeddingModel`): nothing is
+        indexed. An index is built only by `POST /v1/documents` and `POST /v1/documents/{id}/indexes`.
       requestBody:
         required: false
         content:
@@ -892,6 +908,474 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+  /v1/documents:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      summary: The signed-in user's documents
+      security:
+        - bearerAuth: []
+      description: |
+        The caller's own documents, newest first, each with its indexes (ordered by chunk size, then by model). The
+        text of a document is never returned. A document of another user is never listed, an admin's request
+        included.
+      responses:
+        "200":
+          description: The documents; an empty list when the user has none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentListResponse"
+              example:
+                success: true
+                message: Documents retrieved successfully
+                data:
+                  - id: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                    filename: notes.txt
+                    characterCount: 52340
+                    contentHash: "0000000000000000000000000000000000000000000000000000000000000000"
+                    createdAt: "2026-11-27T12:00:00.000Z"
+                    indexes:
+                      - id: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                        documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                        chunkSize: 1000
+                        embeddingModel: qwen3-embedding:0.6b
+                        status: ready
+                        chunkCount: 62
+                        embeddedCount: 62
+                        embeddingTokens: 14250
+                        attempts: 0
+                        error: null
+                        queuePosition: null
+                        createdAt: "2026-11-27T12:00:00.000Z"
+                        queuedAt: "2026-11-27T12:00:00.000Z"
+                        startedAt: "2026-11-27T12:00:01.000Z"
+                        finishedAt: "2026-11-27T12:00:40.000Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      tags: [Documents]
+      operationId: createDocument
+      summary: Upload a document and queue its first index
+      security:
+        - bearerAuth: []
+      description: |
+        Stores a document and queues its first index; the answer is 202, because the index is built later, in the
+        background. Poll the index (`GET /v1/documents/{id}/indexes/{indexId}`, or this document) every 2 to 3 seconds
+        until its `status` is `ready` or `failed`.
+
+        The client extracts the text: `file.text()` for a `.txt` file, pdf.js for a PDF, mammoth for a DOCX. The
+        server never receives or parses a file, only `{ filename, text }`. `chunkSize` and `embeddingModel` are
+        optional, and a missing one comes from the default profile.
+
+        The text is cleaned before it is stored: invalid UTF-16 halves become U+FFFD, it is normalized to Unicode
+        NFC, line breaks become `\n`, control characters (except tab and line feed) and the byte order mark are
+        removed, and the ends are trimmed. Line breaks stay in the stored text. Invisible characters such as
+        zero-width spaces, direction marks and tag characters are not removed at this point. The length limit
+        (`documents.maxCharacters` of `GET /v1/configuration`, 1,000,000 by default, in UTF-16 units) is checked on the
+        text as sent, and again after cleaning.
+
+        Two uploads of the same cleaned text by the same user are one document: the second is a 409.
+
+        Limits, checked in this order. Per user, 5 uploads per minute by default, every request counted, the refused
+        ones too, before the body is read (429). The body is read up to 3 bytes per allowed character plus 16 kB (413).
+        Then the body is validated (400). Then: the user's documents (`documents.maxPerUser`, 3 by default, 409); the
+        text has some readable text (400); builds in progress for the user (`indexes.maxActivePerUser`, 1 by default,
+        409); builds accepted for the user in the last 24 hours, uploads included, deletions not given back
+        (`indexes.maxBuildsPerDay`, 6 by default, 429); builds accepted from all users in the last 24 hours
+        (`indexes.maxBuildsPerDayTotal`, 100 by default, 429); builds waiting in the queue, all users together (503);
+        a copy of the same text (409). A request over the documents limit is refused before its text is cleaned and cut.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDocumentRequest"
+            example:
+              filename: notes.txt
+              text: The text of the document, extracted by the browser.
+              chunkSize: 1000
+      responses:
+        "202":
+          description: |
+            The document is stored and its first index is queued. `data.indexes` holds that index, with status
+            `queued` (or already `indexing`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentResponse"
+              example:
+                success: true
+                message: Document accepted for indexing
+                data:
+                  id: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  filename: notes.txt
+                  characterCount: 52340
+                  contentHash: "0000000000000000000000000000000000000000000000000000000000000000"
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  indexes:
+                    - id: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                      documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                      chunkSize: 1000
+                      embeddingModel: qwen3-embedding:0.6b
+                      status: queued
+                      chunkCount: 62
+                      embeddedCount: 0
+                      embeddingTokens: 0
+                      attempts: 0
+                      error: null
+                      queuePosition: 1
+                      createdAt: "2026-11-27T12:00:00.000Z"
+                      queuedAt: "2026-11-27T12:00:00.000Z"
+                      startedAt: null
+                      finishedAt: null
+        "400":
+          description: |
+            The body does not pass validation ("Validation error", with `details`: a filename that is empty, too long or
+            has control or text-direction characters, a text that is missing, not a string or too long, a setting
+            outside its cap, an unknown field), or the text has no readable text after cleaning ("The document has no
+            readable text", no `details`), or it is too long after cleaning ("Validation error", with `details`). A body
+            that is not valid JSON is also a 400, with a `message` and no `details`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                validation:
+                  value:
+                    message: Validation error
+                    details:
+                      - Filename cannot be empty
+                noReadableText:
+                  value:
+                    message: The document has no readable text
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: |
+            The user has as many documents as they may keep ("You have reached the maximum number of documents"), has
+            an index queued or being built already ("You have reached the maximum number of index builds in progress;
+            try again when one finishes"), or already has a document with this text ("You already have a document with
+            this text"). Nothing was stored. Delete a document to upload another; wait for the index to finish to
+            start another build.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                documentLimit:
+                  value:
+                    message: You have reached the maximum number of documents
+                buildInProgress:
+                  value:
+                    message: You have reached the maximum number of index builds in progress; try again when one finishes
+                duplicate:
+                  value:
+                    message: You already have a document with this text
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/IndexBuildLimit"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/IndexingServiceUnavailable"
+  /v1/documents/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          The document's id. An id that is not a UUID, an id that does not exist and the id of another user's document
+          (an admin's request included) are the same 404.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      summary: One of the signed-in user's documents
+      security:
+        - bearerAuth: []
+      description: The document with its indexes. The text is never returned.
+      responses:
+        "200":
+          description: The document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentResponse"
+              example:
+                success: true
+                message: Document retrieved successfully
+                data:
+                  id: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  filename: notes.txt
+                  characterCount: 52340
+                  contentHash: "0000000000000000000000000000000000000000000000000000000000000000"
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  indexes: []
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/DocumentNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Delete a document
+      security:
+        - bearerAuth: []
+      description: |
+        Deletes the document with its indexes and their chunks. If one of its indexes is being built, the request to
+        the model server is aborted. The builds it counted stay counted in the daily limits: deleting does not give a
+        build back. This is also how a build is cancelled; there is no `cancelled` status.
+      responses:
+        "200":
+          description: The document was deleted. There is no `data`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+              example:
+                success: true
+                message: Document deleted successfully
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/DocumentNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /v1/documents/{id}/indexes:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The document's id (see `GET /v1/documents/{id}`).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Indexes]
+      operationId: createDocumentIndex
+      summary: Build an index of a document
+      security:
+        - bearerAuth: []
+      description: |
+        Makes sure the document has an index at a chunk size and embedding model; both are optional in the body, and
+        a missing one comes from the default profile. This is the only way to build another index of a document that
+        is already stored.
+
+        - The index does not exist: it is queued, and the answer is 202.
+        - The index is queued, being built or ready: it is returned as it is, and the answer is 200. Nothing is built
+          and no limit on builds is looked at.
+        - The index failed: it is queued again (202, same `id`, `attempts` back to 0) and counts as a build.
+
+        Poll the index every 2 to 3 seconds until its `status` is `ready` or `failed`.
+
+        Limited to 5 requests per user per minute by default, every request counted, the refused ones and the ones
+        that find the index already there too, before the body is read. The counter is separate from the one of
+        uploads. The build limits are those of `POST /v1/documents`: builds in progress (409), builds of the last 24
+        hours per user (429) and in all (429), and the queue (503). The body is read up to 16 kB.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDocumentIndexRequest"
+            example:
+              chunkSize: 500
+      responses:
+        "202":
+          description: The index was queued (a new one, or a failed one queued again).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentIndexResponse"
+              example:
+                success: true
+                message: Index queued for building
+                data:
+                  id: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  chunkSize: 500
+                  embeddingModel: qwen3-embedding:0.6b
+                  status: queued
+                  chunkCount: 120
+                  embeddedCount: 0
+                  embeddingTokens: 0
+                  attempts: 0
+                  error: null
+                  queuePosition: 2
+                  createdAt: "2026-11-27T12:05:00.000Z"
+                  queuedAt: "2026-11-27T12:05:00.000Z"
+                  startedAt: null
+                  finishedAt: null
+        "200":
+          description: The index was already there (queued, being built or ready); it is returned as it is.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentIndexResponse"
+              example:
+                success: true
+                message: Index already exists
+                data:
+                  id: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  chunkSize: 1000
+                  embeddingModel: qwen3-embedding:0.6b
+                  status: ready
+                  chunkCount: 62
+                  embeddedCount: 62
+                  embeddingTokens: 14250
+                  attempts: 0
+                  error: null
+                  queuePosition: null
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  queuedAt: "2026-11-27T12:00:00.000Z"
+                  startedAt: "2026-11-27T12:00:01.000Z"
+                  finishedAt: "2026-11-27T12:00:40.000Z"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/DocumentNotFound"
+        "409":
+          description: |
+            The user has an index queued or being built already ("You have reached the maximum number of index builds in
+            progress; try again when one finishes"), or the failed index changed while it was being queued ("The index
+            changed while it was being queued, please try again"). Nothing was queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                buildInProgress:
+                  value:
+                    message: You have reached the maximum number of index builds in progress; try again when one finishes
+                indexChanged:
+                  value:
+                    message: The index changed while it was being queued, please try again
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/IndexBuildLimit"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/IndexingServiceUnavailable"
+  /v1/documents/{id}/indexes/{indexId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The document's id (see `GET /v1/documents/{id}`).
+        schema:
+          type: string
+          format: uuid
+      - name: indexId
+        in: path
+        required: true
+        description: |
+          The index's id. An id that is not a UUID, an id that does not exist and the id of an index of another
+          document are the same 404 "Index not found". A document that is not the caller's is a 404 "Document not
+          found".
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Indexes]
+      operationId: getDocumentIndex
+      summary: One index of a document
+      security:
+        - bearerAuth: []
+      description: |
+        The state of the build. Poll it every 2 to 3 seconds until `status` is `ready` or `failed`. `embeddedCount`
+        of `chunkCount` is the progress; `queuePosition` is the place in the line of every user's queued indexes (1 is
+        the next one built) and null when the index is not queued.
+      responses:
+        "200":
+          description: The index.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentIndexResponse"
+              example:
+                success: true
+                message: Index retrieved successfully
+                data:
+                  id: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  chunkSize: 1000
+                  embeddingModel: qwen3-embedding:0.6b
+                  status: indexing
+                  chunkCount: 62
+                  embeddedCount: 30
+                  embeddingTokens: 6900
+                  attempts: 0
+                  error: null
+                  queuePosition: null
+                  createdAt: "2026-11-27T12:00:00.000Z"
+                  queuedAt: "2026-11-27T12:00:00.000Z"
+                  startedAt: "2026-11-27T12:00:01.000Z"
+                  finishedAt: null
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/IndexNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      tags: [Indexes]
+      operationId: deleteDocumentIndex
+      summary: Delete an index (cancel a build)
+      security:
+        - bearerAuth: []
+      description: |
+        Deletes the index and its chunks. If it is being built, the request to the model server is aborted. The build
+        it counted stays counted in the daily limits. There is no `cancelled` status: deleting is how a build is
+        cancelled.
+      responses:
+        "200":
+          description: The index was deleted. There is no `data`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+              example:
+                success: true
+                message: Index deleted successfully
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/IndexNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -1212,7 +1696,7 @@ components:
           description: The most decimal places a value may have.
     ConfigurationView:
       type: object
-      required: [version, defaults, settings, profiles]
+      required: [version, defaults, settings, profiles, documents, indexes]
       properties:
         version:
           type: integer
@@ -1233,6 +1717,34 @@ components:
             maxNameLength:
               type: integer
               description: The longest profile name, in characters.
+        documents:
+          type: object
+          description: The limits on documents, for an upload form.
+          required: [maxPerUser, maxCharacters, maxFilenameLength]
+          properties:
+            maxPerUser:
+              type: integer
+              description: The most documents a user may keep. Nothing is deleted automatically; the user deletes one to upload another.
+            maxCharacters:
+              type: integer
+              description: The longest text of a document, in UTF-16 code units (the length of a JavaScript string), counted on the text as sent.
+            maxFilenameLength:
+              type: integer
+              description: The longest filename, in characters.
+        indexes:
+          type: object
+          description: The limits on building indexes. A deleted index or document does not give its build back.
+          required: [maxActivePerUser, maxBuildsPerDay, maxBuildsPerDayTotal]
+          properties:
+            maxActivePerUser:
+              type: integer
+              description: The most index builds a user may have queued or being built at once.
+            maxBuildsPerDay:
+              type: integer
+              description: The most builds a user may start in the last 24 hours, uploads included.
+            maxBuildsPerDayTotal:
+              type: integer
+              description: The most builds all users together may start in the last 24 hours. A user who finds it used up gets a 429 although their own limit is not.
     ConfigurationSnapshot:
       type: object
       description: The configuration a question runs with, complete and checked against the caps.
@@ -1372,6 +1884,182 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Profile"
+    IndexStatus:
+      type: string
+      enum: [queued, indexing, ready, failed]
+      description: |
+        `queued`: waiting in the line. `indexing`: being built. `ready`: every chunk has its vector. `failed`: see
+        `error`; `POST /v1/documents/{id}/indexes` queues it again. A build the user cancels is deleted, so there is no
+        `cancelled` status. While the model server is away, or between two tries after a dropped batch, an index goes
+        back to `queued` with the vectors it already has.
+    DocumentIndex:
+      type: object
+      description: |
+        The text of a document cut in chunks of one size and embedded with one model. Poll it every 2 to 3 seconds
+        until `status` is `ready` or `failed`.
+      required:
+        - id
+        - documentId
+        - chunkSize
+        - embeddingModel
+        - status
+        - chunkCount
+        - embeddedCount
+        - embeddingTokens
+        - attempts
+        - error
+        - queuePosition
+        - createdAt
+        - queuedAt
+        - startedAt
+        - finishedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        documentId:
+          type: string
+          format: uuid
+        chunkSize:
+          type: integer
+          enum: [300, 500, 750, 1000, 2000, 5000]
+          description: In characters. The chunks are whole words, with whitespace collapsed and no overlap.
+        embeddingModel:
+          type: string
+          enum: [qwen3-embedding:0.6b]
+        status:
+          $ref: "#/components/schemas/IndexStatus"
+        chunkCount:
+          type: integer
+          description: How many chunks the text has at this size; fixed when the index is queued.
+        embeddedCount:
+          type: integer
+          description: Chunks that already have a vector; `chunkCount` when ready. Use it with `chunkCount` as a progress bar.
+        embeddingTokens:
+          type: integer
+          description: The tokens the embedding model counted for the chunks embedded so far; a total for the index, not per chunk.
+        attempts:
+          type: integer
+          description: Times the build was tried and a batch kept failing while the model server was up. At 3 the index fails. Not counted while the server is away.
+        error:
+          type:
+            - string
+            - "null"
+          description: Why a failed index failed, in words safe to show; null otherwise.
+        queuePosition:
+          type:
+            - integer
+            - "null"
+          description: The place in the line of every user's queued indexes, 1 being the next one built; null when the index is not queued.
+        createdAt:
+          type: string
+          format: date-time
+        queuedAt:
+          type: string
+          format: date-time
+          description: When it joined the line (again, after a failed build was queued again).
+        startedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        finishedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+    Document:
+      type: object
+      description: A document as the API shows it. The text and the owner's id are never returned.
+      required: [id, filename, characterCount, contentHash, createdAt, indexes]
+      properties:
+        id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: A label only, trimmed and normalized (Unicode NFC). Render it as text, never as HTML.
+        characterCount:
+          type: integer
+          description: The length of the stored (cleaned) text, in UTF-16 code units.
+        contentHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: SHA-256 in lowercase hex of the stored text as UTF-8. The same text uploaded twice by one user is refused (409).
+        createdAt:
+          type: string
+          format: date-time
+        indexes:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentIndex"
+          description: Ordered by chunk size, then by embedding model.
+    CreateDocumentRequest:
+      type: object
+      additionalProperties: false
+      required: [filename, text]
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Trimmed and normalized (Unicode NFC) before it is stored; no control characters or text-direction marks.
+        text:
+          type: string
+          minLength: 1
+          description: |
+            The plain text the browser extracted from the file. At most `documents.maxCharacters` characters (UTF-16
+            units, 1,000,000 by default). It is not trimmed by the validator; the server cleans it before storing it.
+        chunkSize:
+          $ref: "#/components/schemas/Settings/properties/chunkSize"
+        embeddingModel:
+          $ref: "#/components/schemas/Settings/properties/embeddingModel"
+    CreateDocumentIndexRequest:
+      type: object
+      additionalProperties: false
+      description: Both fields are optional; a missing one comes from the default profile. The body may be missing altogether.
+      properties:
+        chunkSize:
+          $ref: "#/components/schemas/Settings/properties/chunkSize"
+        embeddingModel:
+          $ref: "#/components/schemas/Settings/properties/embeddingModel"
+    DocumentResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/Document"
+    DocumentListResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Document"
+    DocumentIndexResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/DocumentIndex"
   responses:
     Unauthorized:
       description: |
@@ -1445,8 +2133,78 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             message: Profile not found
+    DocumentNotFound:
+      description: The document does not exist, is not the caller's (an admin's request included), or the id is not a UUID ("Document not found").
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: Document not found
+    IndexNotFound:
+      description: |
+        The index does not exist, or belongs to another document, or its id is not a UUID ("Index not found"). A
+        document that is not the caller's is a 404 "Document not found" instead.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            index:
+              value:
+                message: Index not found
+            document:
+              value:
+                message: Document not found
+    IndexBuildLimit:
+      description: |
+        Over a limit on uploads or builds. Either the request limit of the route (5 per user per minute by default,
+        `Retry-After` says how long to wait; the message is "Too many requests, please try again later"), or a limit on
+        builds, which no `Retry-After` helps with: the user's builds of the last 24 hours ("You have reached the daily
+        limit of index builds, please try again later") or the builds of all users together ("The daily indexing
+        capacity is used up, please try again tomorrow"). Deleting a document or an index does not give a build back.
+      headers:
+        RateLimit:
+          $ref: "#/components/headers/RateLimit"
+        RateLimit-Policy:
+          $ref: "#/components/headers/RateLimitPolicy"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            requestLimit:
+              value:
+                message: Too many requests, please try again later
+            userDaily:
+              value:
+                message: You have reached the daily limit of index builds, please try again later
+            serverDaily:
+              value:
+                message: The daily indexing capacity is used up, please try again tomorrow
+    IndexingServiceUnavailable:
+      description: |
+        The indexing queue is full ("The indexing queue is full, please try again in a few minutes"): the builds
+        waiting, all users together, are at the limit. Or the database cannot be reached (the usual 503 message). Try
+        again later.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            queueFull:
+              value:
+                message: The indexing queue is full, please try again in a few minutes
+            database:
+              value:
+                message: The database is not available, please try again later
     PayloadTooLarge:
-      description: The body is over 16 kB ("request entity too large"). It is refused before it is parsed.
+      description: |
+        The body is over the limit of its route ("request entity too large"). It is refused before it is parsed. The
+        limit is 16 kB on the configuration, profile and index routes. On `POST /v1/documents` it is 3 bytes per
+        allowed character plus 16 kB (about 3 MB with the default of 1,000,000 characters).
       content:
         application/json:
           schema:
@@ -1467,7 +2225,8 @@ components:
       description: |
         Over a limit. The same body whichever one it is: the per-address floor (300 requests per minute per client
         address, any path), the limit of the route (health checks, logins, failed logins, password changes, account
-        creations) or the per-user limit of protected paths (120 per minute). Wait `Retry-After` seconds.
+        creations) or the per-user limit of protected paths (120 per minute). Wait `Retry-After` seconds. The upload
+        and index-building routes have limits of their own and a few more 429 messages: see `IndexBuildLimit`.
       headers:
         RateLimit:
           $ref: "#/components/headers/RateLimit"

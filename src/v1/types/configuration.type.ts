@@ -26,6 +26,10 @@ export interface ConfigurationView {
     defaults: Record<string, unknown>;
     settings: SettingDefinition[];
     profiles: { maxPerUser: number; maxNameLength: number };
+    // the limits on documents a client needs for an upload form
+    documents: { maxPerUser: number; maxCharacters: number; maxFilenameLength: number };
+    // the limits on building indexes: builds in progress per user, and the builds of the last 24 hours per user and in all
+    indexes: { maxActivePerUser: number; maxBuildsPerDay: number; maxBuildsPerDayTotal: number };
 }
 
 // the configuration a question runs with, stored next to its metrics

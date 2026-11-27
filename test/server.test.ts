@@ -11,8 +11,10 @@ import path from "node:path";
 import jwt from "jsonwebtoken";
 import { cleanChildEnvironment } from "./childEnvironment.js";
 import { SECRET_KEY_PLACEHOLDER } from "./config/placeholder.js";
+import { embeddings, fakeTokenCount, modelList, startFakeOllama } from "./doubles/fakeOllama.js";
 import { startPausableProxy, urlThroughProxy } from "./doubles/pausableProxy.js";
 import type { PausableProxy } from "./doubles/pausableProxy.js";
+import { chunkTexts, readChunks, readIndex, seedDocumentWithIndex, seedUser, waitFor } from "./documentsFixtures.js";
 import { makePasswordHash } from "./routes/testUsers.js";
 
 // These tests start the real src/server.ts in a child process, as `npm run dev` does, and look at what it prints,
@@ -348,6 +350,64 @@ describe("server startup: configuration data", () => {
 
         await waitForOutput(server, "Server running");
         assert.equal((await getHealth(server)).body.data.database, "up");
+    });
+});
+
+// Indexing (layer 4): a build that was running when the API stopped is queued again when it starts, keeps its stored
+// vectors, and is finished by the worker, which only starts once the database has passed the check. The model server
+// is a double in this process, and the server under test is pointed at it.
+describe("server startup: indexing", () => {
+    const fakes: Awaited<ReturnType<typeof startFakeOllama>>[] = [];
+
+    afterEach(async () => {
+        await Promise.all(fakes.splice(0).map((fake) => fake.close()));
+    });
+
+    // a model server double that answers embeddings, and a build of 12 chunks that a stopped server left half done: 4 vectors, 20 tokens
+    const interruptedBuild = async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const fake = await startFakeOllama();
+        fakes.push(fake);
+        fake.respond("/api/embed", embeddings());
+        fake.respond("/api/tags", modelList(["qwen3-embedding:0.6b", "qwen3.5:4b"]));
+        const userId = await seedUser("ana@example.com");
+        // started a moment ago, so only the recovery at startup can queue it again: the rule for stuck builds waits a minute
+        const { index } = await seedDocumentWithIndex(userId, {}, { status: "indexing", chunks: chunkTexts("interrupted", 12), embeddedCount: 4, embeddingTokens: 20, startedAt: new Date() });
+
+        return { fake, index };
+    };
+
+    it("queues an index that a stopped server left in indexing again at startup, and the worker finishes it without sending the chunks that have a vector", { timeout: 60_000 }, async () => {
+        const { fake, index } = await interruptedBuild();
+        const server = await startServer({ OLLAMA_BASE_URL: fake.url });
+
+        await waitForOutput(server, "Server running");
+        const row = await waitFor("the index to be ready", async () => {
+            const current = await readIndex(index.id);
+            return current?.status === "ready" ? current : undefined;
+        }, 30_000);
+
+        assert.equal(row.embeddedCount, 12);
+        assert.equal(row.embeddingTokens, 20 + index.chunks.slice(4).reduce((sum, text) => sum + fakeTokenCount(text), 0), "the tokens it had plus those of the batch sent now");
+        assert.deepEqual(
+            fake.requests.filter((request) => request.path === "/api/embed").flatMap((request) => (request.body as { input: string[] }).input),
+            index.chunks.slice(4),
+            "only the chunks without a vector were sent"
+        );
+        assert.ok((await readChunks(index.id)).every((chunk) => chunk.vector !== null));
+        assert.equal(server.child.exitCode, null, "the server keeps running");
+    });
+
+    it("logs the build by index id and never prints the text of a chunk", { timeout: 60_000 }, async () => {
+        const { fake, index } = await interruptedBuild();
+        const server = await startServer({ OLLAMA_BASE_URL: fake.url });
+
+        await waitForOutput(server, "Server running");
+        await waitFor("the index to be ready", async () => ((await readIndex(index.id))?.status === "ready" ? true : undefined), 30_000);
+
+        assert.ok(allOutput(server).includes(index.id), "the log names the index");
+        assert.ok(!allOutput(server).includes("interrupted chunk"), "no chunk text in the log");
     });
 });
 
@@ -732,6 +792,47 @@ describe("server startup: a database that cannot be reached at first and comes b
         assert.equal(loggedIn.status, 200);
         assert.equal((await getHealth(server)).body.data.database, "up");
         assert.equal(server.child.exitCode, null, "the server kept running");
+    });
+
+    // Recovering the builds and starting the worker need the database, so they wait for the check like every other route: a
+    // build left in indexing stays as it is while the database is away, and is queued again and finished once it is back.
+    it("does not recover or build anything while the database is away, and does both once it is back", { timeout: 90_000 }, async () => {
+        const { resetTestDatabase } = await loadDatabase();
+        await resetTestDatabase();
+        const fake = await startFakeOllama();
+
+        try {
+            fake.respond("/api/embed", embeddings());
+            fake.respond("/api/tags", modelList(["qwen3-embedding:0.6b", "qwen3.5:4b"]));
+            const userId = await seedUser("ana@example.com");
+            const { index } = await seedDocumentWithIndex(userId, {}, { status: "indexing", chunks: chunkTexts("away", 12), embeddedCount: 4, startedAt: new Date() });
+            const port = await getFreePort();
+            assert.ok(process.env.RAG_LAB_TEST_API_DATABASE_URL, "RAG_LAB_TEST_API_DATABASE_URL must be set to run the database tests");
+            const server = await startServer({ DATABASE_URL: urlThroughProxy(process.env.RAG_LAB_TEST_API_DATABASE_URL, port), OLLAMA_BASE_URL: fake.url, ...RELAXED });
+
+            await waitForOutput(server, "Server running");
+            // while the database is away, and for longer than the server takes to try again once
+            await sleep(4000);
+
+            assert.equal((await readIndex(index.id))?.status, "indexing", "nothing recovered it while the database was away");
+            assert.equal(fake.requests.filter((request) => request.path === "/api/embed").length, 0, "nothing was sent to the model server");
+            assert.equal(server.child.exitCode, null, "the server is still running");
+
+            await bringDatabaseBack(port);
+
+            const row = await waitFor("the index to be ready", async () => {
+                const current = await readIndex(index.id);
+                return current?.status === "ready" ? current : undefined;
+            }, 40_000);
+            assert.equal(row.embeddedCount, 12);
+            assert.deepEqual(
+                fake.requests.filter((request) => request.path === "/api/embed").flatMap((request) => (request.body as { input: string[] }).input),
+                index.chunks.slice(4),
+                "the vectors it had were kept"
+            );
+        } finally {
+            await fake.close();
+        }
     });
 
     // The owner's URL gets the same refusal as at a normal startup, only later: the check was not skipped because the

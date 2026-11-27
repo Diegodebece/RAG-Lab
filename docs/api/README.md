@@ -1,6 +1,6 @@
 # API contract
 
-The contract the frontend is built from, as OpenAPI 3.1: [openapi.yaml](openapi.yaml). It is the docs-keeper's job to keep it equal to the validators and controllers: every route, its request and response shapes, status codes and errors. Until the contract is frozen (layer 11 of the [build order](../design.md#13-build-order)), a layer may change what it added before. Current version: 0.3.0 (layer 3).
+The contract the frontend is built from, as OpenAPI 3.1: [openapi.yaml](openapi.yaml). It is the docs-keeper's job to keep it equal to the validators and controllers: every route, its request and response shapes, status codes and errors. Until the contract is frozen (layer 11 of the [build order](../design.md#13-build-order)), a layer may change what it added before. Current version: 0.4.0 (layer 4).
 
 ## Conventions
 
@@ -24,6 +24,18 @@ The contract the frontend is built from, as OpenAPI 3.1: [openapi.yaml](openapi.
 - Another user's profile is a 404 for everyone, admins included. The same 404 answers an id that is not a UUID.
 - Profile bodies are read up to 16 kB; more is a 413 "request entity too large". A user may keep at most `profiles.maxPerUser` profiles (20 by default); the next one is a 409.
 
+## Documents and indexes
+
+- The client extracts the text and sends JSON `{ filename, text }`; the server never receives or parses a file. Use `file.text()` for a `.txt` file, pdf.js for a PDF and mammoth for a DOCX, in the browser. `chunkSize` and `embeddingModel` are optional in the upload, and a missing one comes from the default profile.
+- A document belongs to one user. Another user's document is a 404 "Document not found" for everyone, admins included; so is an id that is not a UUID.
+- `POST /v1/documents` stores the document and queues its first index, and answers 202: the index is built in the background. **Poll the index every 2 to 3 seconds** (`GET /v1/documents/:id/indexes/:indexId`, or `GET /v1/documents/:id`, which has the indexes) until its `status` is `ready` or `failed`. Stop polling when the user leaves the screen.
+- Index `status`: `queued` (in the line; `queuePosition` is its place, 1 being next), `indexing` (`embeddedCount` of `chunkCount` is the progress), `ready`, `failed` (`error` says why). An index can go back from `indexing` to `queued` while the model server is away or between tries; it keeps the vectors it has. After a failure `POST /v1/documents/:id/indexes` queues it again.
+- `POST /v1/documents/:id/indexes` makes sure an index exists at a chunk size and model (both optional, default profile). A new one, or a failed one, answers 202 and counts as a build; one that is already queued, being built or ready answers 200 and nothing is built. There are no other ways to start a build: `POST /v1/configuration/resolve` stays a dry run.
+- To cancel a build, delete the index (`DELETE /v1/documents/:id/indexes/:indexId`) or the document. There is no `cancelled` status. The build still counts in the daily limits.
+- Limits, from `GET /v1/configuration` (`documents` and `indexes`): documents per user (409 over it; nothing is deleted automatically), builds in progress per user (409), builds in the last 24 hours per user and for all users together (429 both, no `Retry-After` helps: say so to the user), and a full queue (503, try again in a few minutes). Uploads, and the build route, are limited to 5 per user per minute each (429 with `Retry-After`). Deleting does not give a build back.
+- The text is stored cleaned: Unicode NFC, `\n` line breaks, control characters removed. Its length limit (`documents.maxCharacters`, in UTF-16 units, so an emoji counts as 2) is checked on the text as sent and again after cleaning. The same text twice by one user is a 409. A body is read up to 3 bytes per allowed character plus 16 kB; more is a 413.
+- A filename is a label, trimmed and normalized. Render it, like any text a user wrote, as text and never as HTML.
+
 ## Authentication
 
 - `POST /v1/auth/login` returns the user and a token (HS256, 1 hour by default). There is no refresh token: when a request answers 401, the user logs in again.
@@ -43,15 +55,24 @@ The contract the frontend is built from, as OpenAPI 3.1: [openapi.yaml](openapi.
 | `PATCH /v1/users/me/password` | Token | Body `{ currentPassword, newPassword }` (new: 8 to 64 characters). `200` `{ success, message: "Password changed successfully", data: User, token }`; `400` validation or "Current password is incorrect"; `409` "The password was changed by another request, please try again"; `429` over 5 attempts per 15 minutes |
 | `POST /v1/users` | Admin | Body `{ email, password, role? }` (`role` is `user` or `admin`, `user` when missing). `201` `{ success, message: "User created successfully", data: User }`; `400`; `403`; `409` "Email is already registered"; `429` over 20 attempts per hour |
 | `PATCH /v1/users/:id` | Admin | Body with `role` and/or `status` (`active` or `disabled`), at least one. `200` `{ success, message: "User updated successfully", data: User }`; `400`; `403`; `404` "User not found"; `409` "You cannot change your own role or status" |
-| `GET /v1/configuration` | Token | `200` `{ success, message: "Configuration retrieved successfully", data: { version, defaults, settings, profiles } }` |
+| `GET /v1/configuration` | Token | `200` `{ success, message: "Configuration retrieved successfully", data: { version, defaults, settings, profiles, documents, indexes } }` |
 | `POST /v1/configuration/resolve` | Token | Optional body `{ profileId?, overrides? }`. `200` `{ success, message: "Configuration resolved successfully", data: { profileId, snapshot, hash } }`; `400` "Validation error" or "The configuration is not valid" (with `details`); `404` "Profile not found"; `413`; `500` for a profile at another configuration version or a default profile that is not valid |
 | `GET /v1/profiles` | Token | `200` `{ success, message: "Profiles retrieved successfully", data: Profile[] }`, oldest first |
 | `POST /v1/profiles` | Token | Body `{ name, settings? }`. `201` `{ success, message: "Profile created successfully", data: Profile }`; `400`; `409` "A profile with that name already exists" or "You have reached the maximum number of profiles"; `413` |
 | `GET /v1/profiles/:id` | Token | `200` `{ success, message: "Profile retrieved successfully", data: Profile }`; `404` "Profile not found" |
 | `PATCH /v1/profiles/:id` | Token | Body with `name` and/or `settings`, at least one. `200` `{ success, message: "Profile updated successfully", data: Profile }`; `400`; `404`; `409` "A profile with that name already exists" or "This profile was saved by another configuration version"; `413` |
 | `DELETE /v1/profiles/:id` | Token | `200` `{ success, message: "Profile deleted successfully" }` (no `data`); `404` |
+| `GET /v1/documents` | Token | `200` `{ success, message: "Documents retrieved successfully", data: Document[] }`, newest first, each with its indexes |
+| `POST /v1/documents` | Token | Body `{ filename, text, chunkSize?, embeddingModel? }`. `202` `{ success, message: "Document accepted for indexing", data: Document }`; `400` validation or "The document has no readable text"; `409` "You have reached the maximum number of documents", "You already have a document with this text" or "You have reached the maximum number of index builds in progress; try again when one finishes"; `413`; `429` over 5 requests per minute, or the daily limit of builds of the user ("You have reached the daily limit of index builds, please try again later") or of all users ("The daily indexing capacity is used up, please try again tomorrow"); `503` "The indexing queue is full, please try again in a few minutes" |
+| `GET /v1/documents/:id` | Token | `200` `{ success, message: "Document retrieved successfully", data: Document }`; `404` "Document not found" |
+| `DELETE /v1/documents/:id` | Token | `200` `{ success, message: "Document deleted successfully" }` (no `data`); `404`. Aborts a build in progress |
+| `POST /v1/documents/:id/indexes` | Token | Optional body `{ chunkSize?, embeddingModel? }`. `202` `{ success, message: "Index queued for building", data: DocumentIndex }` for a new or a failed index; `200` "Index already exists" when it is queued, being built or ready; `400`; `404` "Document not found"; `409` builds in progress, or "The index changed while it was being queued, please try again"; `413`; `429` as for an upload; `503` queue full |
+| `GET /v1/documents/:id/indexes/:indexId` | Token | `200` `{ success, message: "Index retrieved successfully", data: DocumentIndex }`; `404` "Document not found" or "Index not found" |
+| `DELETE /v1/documents/:id/indexes/:indexId` | Token | `200` `{ success, message: "Index deleted successfully" }` (no `data`); `404`. Aborts the build when it is in progress |
 
-`Profile` is `{ id, name, settings, problems, createdAt, updatedAt }`; the owner's id and the configuration version are never returned. `data` of the configuration view holds `version`, `defaults` (the eleven settings as the database has them), `settings` (the definitions) and `profiles` (`maxPerUser`, `maxNameLength`).
+`Document` is `{ id, filename, characterCount, contentHash, createdAt, indexes }`; the text and the owner's id are never returned. `DocumentIndex` is `{ id, documentId, chunkSize, embeddingModel, status, chunkCount, embeddedCount, embeddingTokens, attempts, error, queuePosition, createdAt, queuedAt, startedAt, finishedAt }`; `status` is `queued`, `indexing`, `ready` or `failed`, `error` and `queuePosition` are `null` when they do not apply, and `embeddingTokens` is a total for the index.
+
+`Profile` is `{ id, name, settings, problems, createdAt, updatedAt }`; the owner's id and the configuration version are never returned. `data` of the configuration view holds `version`, `defaults` (the eleven settings as the database has them), `settings` (the definitions), `profiles` (`maxPerUser`, `maxNameLength`), `documents` (`maxPerUser`, `maxCharacters`, `maxFilenameLength`) and `indexes` (`maxActivePerUser`, `maxBuildsPerDay`, `maxBuildsPerDayTotal`).
 
 `User` is `{ id, email, role, status, createdAt }`; the password and the session version are never returned. Emails are trimmed, lowercased and normalized (Unicode NFC), at most 254 characters. Passwords are not trimmed; new ones have 8 to 64 characters. Every endpoint answers `401` without a valid token, except the public ones, and `500` on an unexpected failure.
 

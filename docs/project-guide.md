@@ -6,7 +6,7 @@ How RAG Lab is built and why. [design.md](design.md) is the source of truth for 
 
 RAG Lab is a RAG API built by a team of Claude Code agents: two local models and a router answer questions about uploaded documents, every question is measured (accuracy, latency, tokens), and each signed-in user changes the configuration in a playground to see how precision and token use respond. It reuses the architecture and the evaluated settings of RAG Web (the deployed RAG API) and the evaluation harness of RAG1 (the original command-line app); see design section 1.
 
-The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. Layer 2, Accounts and authentication, is built on top of it (section 6): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. Layer 3, Configuration as data, is built on top of that (section 7): the settings users may change and their caps, the default profile in the database, each user's profiles, and a resolver that gives one complete configuration with a hash. There are no documents or questions yet.
+The work goes in layers, in the order of [design section 13](design.md#13-build-order). Layer 1, Foundations, is built: the app, the health check, the migrations, the middlewares and the test setup. Layer 2, Accounts and authentication, is built on top of it (section 6): accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. Layer 3, Configuration as data, is built on top of that (section 7): the settings users may change and their caps, the default profile in the database, each user's profiles, and a resolver that gives one complete configuration with a hash. Layer 4, Documents and indexes, is built on top of that (section 11): users upload a document as text, and a background queue cuts it in chunks, embeds them with `qwen3-embedding:0.6b` and stores the vectors, one index per chunk size. There is no search and there are no questions yet.
 
 ## 2. Stack
 
@@ -58,7 +58,7 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 ### Migrations and the wrong-database guard
 
-`migrations/` holds numbered SQL files: `001_init.sql` creates the pgvector extension, `002_api_role.sql` gives the API's role its rights and `003_users.sql` creates the `users` table (see "Database roles" below and section 6); `004_default_profile.sql` creates and fills the default profile and `005_profiles.sql` creates the `profiles` table (section 7). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It connects as the owner with `MIGRATION_DATABASE_URL`, with its own pool (made by `createPool` in `pool.config.ts`), without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate. It never imports `db.config.ts`, so it does not need `DATABASE_URL`, and neither URL is a fallback for the other.
+`migrations/` holds numbered SQL files: `001_init.sql` creates the pgvector extension, `002_api_role.sql` gives the API's role its rights and `003_users.sql` creates the `users` table (see "Database roles" below and section 6); `004_default_profile.sql` creates and fills the default profile and `005_profiles.sql` creates the `profiles` table (section 7); `006_documents.sql`, `007_document_indexes.sql` (which also creates `chunks`) and `008_index_build_usage.sql` create the tables of layer 4 (section 11). `npm run migrate` (`src/migrate.ts`) applies the pending ones, each together with its `schema_migrations` record in one transaction, under a PostgreSQL advisory lock so two processes cannot migrate at once. It connects as the owner with `MIGRATION_DATABASE_URL`, with its own pool (made by `createPool` in `pool.config.ts`), without the API's query timeout, because a migration can take longer than any query the API runs and waiting for the lock lasts as long as another process takes to migrate. It never imports `db.config.ts`, so it does not need `DATABASE_URL`, and neither URL is a fallback for the other.
 
 `getMigrationStateService(targetPool)` (`schema.service.ts`) compares the files with the `schema_migrations` table and returns four lists: `applied`, `pending` (only in the files), `unknown` (recorded in the database but missing from the files) and `foreignTables` (tables of the public schema when there is no `schema_migrations` table at all). The pool is always passed: the server gives the API's, the migration script its own. Two of those mean the URL points at the wrong database:
 
@@ -84,11 +84,11 @@ Invisible characters are checked by a test, `test/repository/invisibleCharacters
 
 ### The connection: `pg`
 
-`pool.config.ts` exports `createPool({ connectionString, queryTimeoutMs? })` and `runInTransaction(pool, callback)`; it reads no environment variable, so the migration script can use it without `DATABASE_URL`. `db.config.ts` builds the API's `pool` from `DATABASE_URL` (the module throws at import without it) and exports `withTransaction(callback, targetPool?)`. The API's pool has a 5 s connection timeout, TCP keepAlive and a 30 s query timeout; an idle connection that breaks is logged, not fatal. `withTransaction` runs the callback on one connection in one transaction, and a connection that breaks or fails its `ROLLBACK` is discarded instead of going back to the pool.
+`pool.config.ts` exports `createPool({ connectionString, queryTimeoutMs? })` and `runInTransaction(pool, callback)`; it reads no environment variable, so the migration script can use it without `DATABASE_URL`. `db.config.ts` builds the API's `pool` from `DATABASE_URL` (the module throws at import without it) exports `withTransaction(callback, targetPool?)` and `LOCK_KEYS`, the numbers of the advisory locks the API takes (one today, `indexingQueue`, 72617002; the migration script's lock is 72617001). The API's pool has a 5 s connection timeout, TCP keepAlive and a 30 s query timeout; an idle connection that breaks is logged, not fatal. `withTransaction` runs the callback on one connection in one transaction, and a connection that breaks or fails its `ROLLBACK` is discarded instead of going back to the pool.
 
 ### Database roles
 
-The API connects as `rag_lab_api`; the owner `rag_lab` creates the schema. The owner creates the role once with `scripts/create-api-role.sql` (`CREATE ROLE ... LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, `REVOKE ALL ON DATABASE` from `PUBLIC`, `GRANT CONNECT`) and sets its password by hand with `\password rag_lab_api`; nothing in the repository holds that password. `migrations/002_api_role.sql` fails naming the script when the role is missing, then revokes `CREATE` on `public` from `PUBLIC`, grants `USAGE` on the schema and `SELECT` on `schema_migrations`, and sets default privileges so the tables and sequences the owner creates afterwards (`users`, and the tables of the next layers) are usable by the API without a new grant. The API role can read and change rows and nothing else: it cannot create, alter, drop or truncate anything, and it cannot change `schema_migrations`. Layer 3 narrows the default privileges where a table needs it: migration 004 revokes `INSERT`, `UPDATE` and `DELETE` on `default_profile` from the role, which leaves it `SELECT` only, and migration 005 revokes `UPDATE` on `profiles` and grants it back on four columns only (`name`, `settings`, `version`, `updated_at`), so the API can never change a profile's owner, id or creation time (section 7).
+The API connects as `rag_lab_api`; the owner `rag_lab` creates the schema. The owner creates the role once with `scripts/create-api-role.sql` (`CREATE ROLE ... LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, `REVOKE ALL ON DATABASE` from `PUBLIC`, `GRANT CONNECT`) and sets its password by hand with `\password rag_lab_api`; nothing in the repository holds that password. `migrations/002_api_role.sql` fails naming the script when the role is missing, then revokes `CREATE` on `public` from `PUBLIC`, grants `USAGE` on the schema and `SELECT` on `schema_migrations`, and sets default privileges so the tables and sequences the owner creates afterwards (`users`, and the tables of the next layers) are usable by the API without a new grant. The API role can read and change rows and nothing else: it cannot create, alter, drop or truncate anything, and it cannot change `schema_migrations`. Layer 3 narrows the default privileges where a table needs it: migration 004 revokes `INSERT`, `UPDATE` and `DELETE` on `default_profile` from the role, which leaves it `SELECT` only, and migration 005 revokes `UPDATE` on `profiles` and grants it back on four columns only (`name`, `settings`, `version`, `updated_at`), so the API can never change a profile's owner, id or creation time (section 7). Layer 4 narrows the privileges by what each table is (section 11): `documents` has `UPDATE` revoked and nothing granted back (immutable); `document_indexes` has `UPDATE` only on its state columns (`status`, `embedded_count`, `embedding_tokens`, `attempts`, `error`, `queued_at`, `started_at`, `finished_at`); `chunks` has `UPDATE` only on `embedding` and no `DELETE`, because its rows are removed only by the foreign key's cascade, which runs as the owner; `index_build_usage` is insert-only (`UPDATE` and `DELETE` revoked).
 
 Before it serves anything, the server asks the database what the role it connected as can do (`databaseRole.service.ts`, by capability and not by name) and stops if the role is a superuser, can create roles or databases, can create objects in the database or in `public`, owns relations in `public`, is a member of another role, or acts as another role than the one that logged in (the `role` connection option, or `SET ROLE`, would hide a login with more rights behind a harmless-looking current role).
 
@@ -104,14 +104,16 @@ Before it serves anything, the server asks the database what the role it connect
 > [!NOTE]
 > **Decision:** `npm run migrate` no longer needs `DATABASE_URL` (2026-11-26, decided by the orchestrator after the audit, without asking the owner; the owner can reverse it). The pool code was split into `pool.config.ts` (by the implementer, instead of making the API pool lazy, because the tests import the pool directly) so the migration script uses `MIGRATION_DATABASE_URL` alone and never imports `db.config.ts`, which throws at import without `DATABASE_URL`. Before the split, a shell or a CI job that set only the owner's URL crashed with "DATABASE_URL is not set" instead of migrating; the tests did not show it, because their helper passed the whole environment to the script.
 
-Operational note for layer 13: `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role. The explicit `REVOKE` on `default_profile` and the column grants on `profiles` (layer 3) rely on the same default privileges.
+Operational note for layer 13: `ALTER DEFAULT PRIVILEGES` in migration 002 applies only to objects created by the role that ran it, so migrations must always run as the same owner role. The explicit `REVOKE` on `default_profile` and the column grants on `profiles` (layer 3), and the revokes and column grants of migrations 006 to 008 (layer 4), rely on the same default privileges.
 
 > [!NOTE]
 > **Decision:** timeouts after the audit (2026-11-26). The API pool has a 30 s query timeout and keepAlive; the health probe has a 2 s timeout; `migrate` uses its own pool with no query timeout; shutdown waits at most 6 s for HTTP and 2 s for the pool (`closePoolGracefully`), under Docker's 10 s grace period. Without a query timeout, a connection that is open but no longer answers (a frozen PostgreSQL, a network dropping packets) holds its request forever. `closePoolGracefully` reads pg-pool's private client lists in one commented place (`getCheckedOutClients` in `shutdown.ts`), because the public API cannot list the clients lent out before it is called, and a stuck request is exactly one of those; if those fields ever disappear, it destroys nothing and gives up after one more second, so the process still exits.
 
 ### Shutdown
 
-On SIGTERM (`docker stop`) or SIGINT the server stops accepting connections, closes idle ones, lets the requests in progress finish for up to 6 s (then closes what is left), and then closes the pool, waiting up to 2 s before it destroys the connections still lent out. `closePoolGracefully` never rejects, so the process always exits.
+On SIGTERM (`docker stop`) or SIGINT the server stops the background database check and the indexing worker (the request it has in flight to Ollama is aborted, and its index goes back to the queue with the vectors already stored, to be continued at the next start), stops accepting connections, closes idle ones, lets the requests in progress finish, and then closes the pool, waiting up to 2 s before it destroys the connections still lent out. The worker's stop and the requests in progress share one budget of 6 s: the stop gets what it needs up to that, and the requests get what is left, so a worker stuck on a frozen database cannot take the time of the pool's close. `closePoolGracefully` never rejects, so the process always exits.
+
+The indexing worker starts only after the startup check has passed (section 11, "The worker"), whether the check passed at once or from the background retry; it needs the database like every route does.
 
 ### Configuration
 
@@ -156,7 +158,21 @@ The order in `v1.routes.ts` is: health (public, no database needed) → readines
 
 ### Model calls
 
-`ollama.service.ts` is the only code that calls the model server. Each call has a timeout (`AbortSignal.timeout`); a connection failure is a `ModelUnavailableError` (503), a timeout is a 504 `AppError`, and a non-OK answer, an answer of an unexpected shape or a redirect is a plain error, because retrying will not fix it. Layer 1 uses it for one call, the list of installed models; token counts arrive with the first answer call in layer 6.
+`ollama.service.ts` is the only code that calls the model server. Every call takes a timeout (`AbortSignal.timeout`) and an optional `AbortSignal` of the caller, and refuses redirects (`redirect: "manual"`). The errors are told apart by type, so callers decide by `instanceof` and never by a status:
+
+| Error | When | Status if it reaches a client |
+|---|---|---|
+| `ModelUnavailableError` | the connection fails, or the answer's body is cut in the middle | 503 |
+| `ModelTimeoutError` (an `AppError`) | the server did not answer within the timeout | 504 "The model server did not answer in time" |
+| `RequestCancelledError` (an `AppError`) | the caller's signal aborted (also one aborted before the call, which sends nothing) | 503 "The request was cancelled"; nobody receives it |
+| `MalformedModelAnswerError` (a plain `Error`) | a body that arrived whole and is not JSON, the wrong number of vectors, a vector of the wrong size, a number beyond the float4 range or all zeros, or no token count | 500 |
+| a plain `Error` | a non-OK answer, an answer of an unexpected shape, a redirect. The text of an error answer is added to the message only for a GET (a POST's answer may quote the document) | 500 |
+
+Layer 1 used it for one call, the list of installed models (`listInstalledModelsService`, `GET /api/tags`); layer 4 adds the embed call (`embedTextsService`, `POST /api/embed`) with `truncate: false`, so a text longer than the model's window is an error answer and never a silently shortened vector. It returns one vector of 1024 numbers per text, in order, and the number of tokens Ollama counted (`prompt_eval_count`), which the caller stores. The timeout of an embed batch is `OLLAMA_TIMEOUT_MS` (120000 by default, 1000 to 600000); the check of the installed models after a failed batch has its own 2 s timeout. Token counts of answers arrive in layer 6. `modelTurn.service.ts` makes every request to Ollama wait for its turn, one at a time for the whole API, first come first served (section 11).
+
+### Logging
+
+An unexpected error is logged as `describeError(error)` (`utils/describeError.util.ts`): its name, its code (a PostgreSQL error has one) and its message, and never the whole error object. A database error carries the failing row, the statement and its parameters, and any of them can hold the text of a document; a value that is not an error is logged as its type only. `errorMiddleware`, the indexing queue and the indexing service all log this way. Events about indexes name the index by id and carry no text. `server.ts` keeps its own one-line `describeError` for startup messages, which only ever carry a message.
 
 ### Tests
 
@@ -407,7 +423,7 @@ The 409 answers of a profile are: "A profile with that name already exists", "Yo
 > **Decision:** the hash is the SHA-256, in hexadecimal, of the canonical JSON of `{ version, settings }` (2026-11-27, the owner's decision): keys sorted at every level, no spaces, UTF-8. `profileId` and the timestamps are outside it, so identical settings from two profiles or two users are one configuration. The hash is an identifier, not a security control. Layer 6 adds a `fixed` section (`num_ctx`, `seed`, `think`, the prompt id) with a version bump, and layers 5 and 13 add the model digests.
 
 > [!NOTE]
-> **Decision:** the playground caps of design section 12 are partly decided (2026-11-27, the owner's decision). The value caps are in code. Interim request caps arrive with the first layer that calls a model (5 for question embeddings, 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per user, 60 s per question and 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or measurements: the token budgets (after layer 9), a cap on indexes per document or indexing jobs per user (layer 4), and an exemption or higher caps for the harness account (layer 10).
+> **Decision:** the playground caps of design section 12 are partly decided (2026-11-27, the owner's decision). The value caps are in code. Interim request caps arrive with the first layer that calls a model (5 for question embeddings, 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per user, 60 s per question and 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or measurements: the token budgets (after layer 9), a cap on indexes per document or indexing jobs per user (layer 4; answered in layer 4, section 11), and an exemption or higher caps for the harness account (layer 10).
 
 > [!NOTE]
 > **Decision:** admins have no powers over other users' profiles (2026-11-27, the owner's decision). An admin gets the same 404 as anyone else for a profile that is not theirs, and there is no admin route to profiles.
@@ -420,7 +436,7 @@ The 409 answers of a profile are: "A profile with that name already exists", "Yo
 
 ## 8. Contract for the frontend
 
-The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml) (version 0.3.0), explained in [api/README.md](api/README.md). It holds `GET /v1/health`, the six account endpoints of section 6, the seven configuration and profile endpoints of section 7, the schemas they use, and the shared answers every other `/v1` path gets (401, 403, 404, 429, 503).
+The contract is OpenAPI 3.1 in [api/openapi.yaml](api/openapi.yaml) (version 0.4.0), explained in [api/README.md](api/README.md). It holds `GET /v1/health`, the six account endpoints of section 6, the seven configuration and profile endpoints of section 7, the seven document and index endpoints of section 11, the schemas they use, and the shared answers every other `/v1` path gets (401, 403, 404, 429, 503). The client polls an index every 2 to 3 seconds until it is `ready` or `failed`; there is no live stream yet (layer 11).
 
 > [!NOTE]
 > **Decision:** the API contract is OpenAPI 3.1 YAML in `docs/api/` (2026-11-26). A machine-readable contract lets the frontend be built (and its client generated or checked) without reading the backend code, and it is frozen in layer 11.
@@ -436,7 +452,7 @@ The audits of layer 1 found these; none was exploitable with the layer-1 code, b
 > - ~~Token revocation, `aud` and `iss` claims, and reading a fresh role from the database instead of trusting the one inside the token (layer 2).~~ Done in layer 2 (section 6, "Tokens and revocation").
 > - ~~A per-address limit before authentication, and a length cap on the email used in rate-limit keys (layer 2).~~ Done in layer 2 (section 6, "Limits").
 > - Requiring `CORS_ORIGINS` and `TRUSTED_PROXIES` to be set when the API is exposed (layers 11 and 13).
-> - A size cap on model responses (layer 6, when answers are read).
+> - A size cap on model responses (layer 6, when answers are read). Moved to layer 13 with O3, below (2026-11-27).
 > - Image and model digests (layers 5 and 13).
 
 The audits of layer 2 found these, which wait too:
@@ -460,12 +476,33 @@ The audits of layer 3 found these, which wait too:
 > - Settings within the caps that would make the small model fail every time and force an escalation, for example `minScore` 1 or `maxTokens` 1 in structured mode. Abstain instead of escalating when the user's own settings caused it, and cap escalations per user per day (layer 8).
 > - Logout and login give a fresh per-user rate-limit counter, because its key holds the token version. A second counter by user id only (layer 10).
 > - Never accept a snapshot or a hash from the client, and cache keys must include the user and the document or index ids (layer 5).
-> - Index-time settings in per-request overrides could trigger index builds. Refuse unless the index exists, and cap builds per user (layer 4).
+> - ~~Index-time settings in per-request overrides could trigger index builds. Refuse unless the index exists, and cap builds per user (layer 4).~~ Done in layer 4 (O7, section 11, "Decisions"): builds start only in the document services, and the builds are capped.
 > - CORS is open by default (already deferred to layers 11 and 13).
 > - Model digests in the snapshot (layers 5 and 13); interim consumption caps (layers 5 and 6); the harness exemption (layer 10); a run kind in layer 5, so retrieval-only runs ignore the answer settings.
 > - The startup check does not verify that `rag_lab_api` still has only `SELECT` on `default_profile` (defence in depth).
 > - A top-level unknown field in a body still echoes its key whole (Joi's `"<key>" is not allowed`); only setting keys are cut.
 > - There is no test yet for a default profile moved to another version while the server runs.
+
+The audits of layer 4 found these. Two are done, and the rest wait (see section 11 for what was built):
+
+> [!NOTE]
+> **Decision:** closed by layer 4 (2026-11-27):
+>
+> - ~~O7: index-time overrides could trigger builds.~~ Done: builds start only in `createDocumentService` and `createDocumentIndexService`; `findReadyIndexService` never builds; `POST /v1/configuration/resolve` is a dry run.
+> - ~~RAG Web's F10 (how an indexing job reacts to a failed call to Ollama).~~ Done: after a failed batch the worker asks Ollama what it has installed. If it does not answer, the index goes back to the queue and no attempt is counted; if it answers, the failure counts as an attempt, and the third one fails the index (section 11, "Failure and retry").
+
+> [!NOTE]
+> **Decision:** these findings from the audit of layer 4 wait for the layer that makes them matter (2026-11-27):
+>
+> - **O4, required for layer 6 and the owner's top priority.** The owner said to avoid prompt injection at all costs. The stored text of a document keeps invisible characters (zero-width, bidirectional controls, Unicode tag characters) that can hide instructions. Filtering them when the text is stored would break composed emoji and scripts such as Persian, so layer 6 must do three things when it builds the prompt: filter those characters, fence each chunk as quoted data, and instruct the model that document text is data and never instructions. The layer 6 planner must treat this as a must-have, with tests. It is also in [design section 13](design.md#13-build-order).
+> - I1: a malformed JSON or an unknown key can echo part of the sender's own body back to the sender. It goes to the shared middleware with the contract, in layer 6 or 11.
+> - I2 (layer 10): a new login starts the upload counter from zero, because the counters are keyed by user and token version (related to the per-user limit finding of layer 3, above).
+> - I6 (layer 10): the caps count indexes, not chunks, so a 300-character index costs about 17 times what a 5000-character one does. Layer 10's accounting should weigh the work.
+> - F6 (layer 13): the size of the connection pool.
+> - O3 (layer 13): the answers of Ollama are read with no size limit.
+> - O5 (layer 13): the model is identified by its name, not its digest (already deferred with the image and model digests).
+> - F9 (pending the owner's live test): a 5000-character chunk of dense text (CJK) may exceed the embedding model's context. With `truncate: false` the batch would fail instead of being cut. If it is confirmed, it is an evaluated value and goes through experiment E1.
+> - From the plan: chunk offsets and a `chunker` column (E1); cleanup of old `index_build_usage` rows; the GPU work of deleted builds in layer 10's accounting; queue positions as live events (layer 11); the vector-index measurement, and resolve with a `documentId` (layer 5); the model warm-up (layer 6); the owner's 1-day document lifetime (layer 13).
 
 ## 10. Process metrics
 
@@ -517,3 +554,186 @@ Everything it stores goes to `RAG_LAB_DATA_DIR\usage\`: `calls.jsonl` (one recor
 > **Decision:** path components lose trailing dots and spaces before the hook compares them, and a component with a colon is denied (2026-11-26). This was decided by the orchestrator after the independent review, without asking the owner; the owner can reverse it. Windows reads `name.`, `name ` and `name::$INDEX_ALLOCATION` as the same folder as `name`, and a component such as `.env::$DATA` is an alternate data stream of `.env`, so the old comparison could be bypassed. It also tightens the older rules (`.env`, the lab notebook).
 
 Planned, not built: a chart of usage across loops, once two or three layers have data; and Stryker mutation testing later, which is a new dependency and needs the owner's approval.
+
+## 11. Documents and indexes (layer 4)
+
+Users upload a document as text. The API stores the cleaned text, cuts it in chunks, embeds the chunks with `qwen3-embedding:0.6b` in a background queue, and stores the vectors. One document has one index per chunk size and embedding model. Nothing searches the vectors yet (layer 5). The routes follow the layered pattern (`documents.routes.ts` and its nested `documentIndexes.routes.ts`, their controllers, `documents.service.ts`, `documentIndexes.service.ts`, `indexing.service.ts`, `indexingQueue.service.ts`, `modelTurn.service.ts` and `events.service.ts`, `documents.validator.ts` and `documentIndexes.validator.ts`); the exact bodies, messages and status codes are in the [API contract](api/openapi.yaml). It is numbered 11 so that the numbers of sections 8 to 10, which other documents cite, did not change.
+
+### Endpoints
+
+All are protected (a token), counted in the per-user limit of 120 requests per minute, and only ever show the caller's own documents.
+
+| Method and path | What it does |
+|---|---|
+| `GET /v1/documents` | The caller's documents, newest first, each with its indexes (by chunk size, then model). Never the text |
+| `POST /v1/documents` | Body `{ filename, text, chunkSize?, embeddingModel? }`. Stores the document and queues its first index; `202` |
+| `GET /v1/documents/:id` | One document with its indexes |
+| `DELETE /v1/documents/:id` | Deletes the document, its indexes and their chunks; aborts a build in progress |
+| `POST /v1/documents/:id/indexes` | Body `{ chunkSize?, embeddingModel? }`, optional. A new index: `202`. One already queued, indexing or ready: `200`, nothing built. A failed one: queued again, `202`, counts as a build |
+| `GET /v1/documents/:id/indexes/:indexId` | The state of an index. The client polls it every 2 to 3 seconds |
+| `DELETE /v1/documents/:id/indexes/:indexId` | Deletes the index (this is how a build is cancelled); aborts it when in progress |
+
+A document is `{ id, filename, characterCount, contentHash, createdAt, indexes }`; its text and its owner are never returned. An index is `{ id, documentId, chunkSize, embeddingModel, status, chunkCount, embeddedCount, embeddingTokens, attempts, error, queuePosition, createdAt, queuedAt, startedAt, finishedAt }`. `queuePosition` is the place among the queued indexes of every user in the order the worker takes them (1 is next), and `null` when the index is not queued. A document that is not the caller's, one that does not exist and an id that is not a UUID are the same 404 "Document not found", an admin's request included; an index of another document, or an id that is not a UUID, is a 404 "Index not found".
+
+`GET /v1/configuration` also tells a client the limits it needs for an upload form and a build button: `documents` (`maxPerUser`, `maxCharacters`, `maxFilenameLength`) and `indexes` (`maxActivePerUser`, `maxBuildsPerDay`, `maxBuildsPerDayTotal`).
+
+### Tables
+
+- `documents` (migration 006): `id` (UUID), `user_id` (`ON DELETE CASCADE`), `filename` (1 to 255 characters), `text` (never empty), `character_count` (UTF-16 units), `content_hash` (SHA-256 of the stored text in lowercase hex) and `created_at`. A unique index on `(user_id, content_hash)` makes the same text one document per user. The API role cannot `UPDATE` it at all.
+- `document_indexes` (migration 007): `id` (UUID), `document_id` (`ON DELETE CASCADE`), `chunk_size`, `embedding_model`, `status` (`queued`, `indexing`, `ready` or `failed`), `chunk_count`, `embedded_count`, `embedding_tokens`, `attempts`, `error` (at most 500 characters), `created_at`, `queued_at`, `started_at` and `finished_at`. `UNIQUE (document_id, chunk_size, embedding_model)`, and a check that a ready index has every chunk embedded. The index `(status, queued_at, id)` serves the claim. The API role may `UPDATE` only the state columns.
+- `chunks` (migration 007): `index_id` (`ON DELETE CASCADE`), `chunk_index`, `text` and `embedding vector(1024)`, with `(index_id, chunk_index)` as the primary key. The rows are written, without a vector, in the transaction that queues the index; the build fills the vectors in. The API role may `UPDATE` only `embedding` and cannot `DELETE`: the chunks of a deleted index go with it through the cascade. There is no vector index (HNSW or IVFFlat): the search is exact.
+- `index_build_usage` (migration 008): one row for every build the API accepts (`user_id`, `accepted_at`), with indexes on `(user_id, accepted_at)` and on `accepted_at`. The daily limits count these rows, so deleting a document or an index does not give a build back. The API role can only insert and read.
+
+### The text
+
+The browser extracts the text; the server never receives a file. `sanitizeText` cleans it before anything else uses it: a half of a surrogate pair without its other half becomes U+FFFD, the text is normalized to Unicode NFC, CRLF and CR become LF, control characters except tab and line feed and the byte order mark are removed, and the ends are trimmed. A text with nothing left is a 400 "The document has no readable text". The stored text, its hash and its chunks all come from the cleaned text. The length limit is `MAX_DOCUMENT_CHARACTERS` (1,000,000 by default, at most 5,000,000), in UTF-16 units, checked by the validator on the text as sent and again on the cleaned text (normalization can make a text a few characters longer). The body limit of the upload route is derived: 3 bytes per allowed character plus 16 kB (`DOCUMENT_BODY_LIMIT`), so about 3 MB by default, much more than the 16 kB of the configuration routes. The filename is trimmed and normalized to NFC, has 1 to 255 characters, and refuses control characters and the invisible marks that reverse the direction of text (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
+
+The text is stored with its line breaks. The chunker is RAG Web's `chunkText` as it is: whole words, every run of whitespace (line breaks included) collapsed to one space, no overlap, a word longer than a chunk cut by code point so a pair of surrogates is never split, and a size in characters of at least 2. Each index applies it to the stored text at its own size, so any size can be built later without uploading again.
+
+Invisible characters other than those removed above (zero-width characters, direction controls, Unicode tag characters) stay in the stored text on purpose. See the deferred finding O4 in section 9: layer 6 must filter them when it builds a prompt.
+
+### Index states
+
+| From | To | When |
+|---|---|---|
+| (none) | `queued` | `POST /documents` or `POST /documents/:id/indexes` accepts a new index |
+| `queued` | `indexing` | the worker claims it |
+| `indexing` | `ready` | every chunk has its vector |
+| `indexing` | `failed` | a malformed answer, the model is not installed, the third dropped batch, an error with its own message, or a model that is not allowed any more |
+| `indexing` | `queued` | Ollama is away, a dropped batch with attempts left, the worker is stopping, a restart, or a build stuck for a minute |
+| `failed` | `queued` | `POST /documents/:id/indexes` for the same size and model (counts as a build) |
+| any | (deleted) | `DELETE` of the index or of its document |
+
+- `queued`: in the line. A new or re-queued index joins it with `queued_at` now; the worker takes the oldest first.
+- `indexing`: the worker has claimed it and is embedding its chunks in batches of 10. `embedded_count` counts the chunks that hold a vector and `embedding_tokens` the tokens Ollama reported for them. Each batch is stored before the next one starts.
+- `ready`: every chunk has its vector. The statement that sets it refuses to run while one is missing, so a ready index never has a hole.
+- `failed`: see `error`. A failed index keeps its chunks and the vectors it has; `POST /v1/documents/:id/indexes` queues it again with the same id, attempts back to 0 and a new queue time, and that counts as a build.
+- An index goes from `indexing` back to `queued` (with its vectors and tokens kept) when Ollama is away, when a batch failed and attempts are left, when the worker is stopped, when the server restarts, and when it stays `indexing` for a minute without being the one this process runs.
+- There is no `cancelled` state: deleting the index, or its document, is cancelling.
+
+### The queue and the worker
+
+The queue is the `document_indexes` table, not a second system. `indexingQueue.service.ts` decides which index runs and when; `indexing.service.ts` does the work of one index.
+
+- **The claim.** One `UPDATE ... WHERE id = (SELECT ... WHERE status = 'queued' AND the owner is active ORDER BY queued_at, id LIMIT 1 FOR UPDATE OF di SKIP LOCKED) RETURNING ...` takes the oldest queued index of an active user and marks it `indexing`; it reads the owner in the same statement, for the events. `SKIP LOCKED` keeps two workers, if there ever were two, from taking the same one.
+- **The worker.** One in-process worker, started by `server.ts` after the database check (see "The worker starts after the check" below), builds one index at a time until the queue is empty, an index went back to the queue (so the loop stops until the next round) or it is stopped. Calls made while it runs share the same run, so an index is never built twice in parallel. It polls every 10 s (a timer that does not keep the process alive) to put stuck builds back and to wake itself; a new index wakes it at once.
+- **The wake flag.** `notifyIndexQueuedService` sets a flag every time, whether or not a run is going on, and starts a run only when the worker is started and idle. The loop clears the flag before it looks at the queue and reads it after an empty look, with nothing awaited between that read and the end of the run, so an index queued while the loop was finishing its last look is never left for the poll.
+- **One request at a time.** Each batch of 10 chunks goes to Ollama through `runWithModelTurnService`: one request at a time for the whole API, first come first served. The turn is per batch, so a later question waits for at most one batch, never for a whole document. A caller that no longer needs the turn leaves the line when its signal aborts; the line also supports a maximum wait and tells each waiter its place.
+- **Storing a batch.** `storeBatch` runs in one short transaction after the model call (no transaction is open while the model works): it locks the index row first (`FOR NO KEY UPDATE`, only while the index is `indexing`), fills the vectors of that batch, and sets `embedded_count` from the chunks themselves and adds the tokens. A delete takes the index row and then its chunks through the cascade, so taking the chunks first would deadlock with it; locking in the same order makes the second one wait for the first. If the index is gone, nothing is stored and the build ends quietly. A build continues where it stopped: it reads only the chunks without a vector.
+- **Disabled users.** The claim joins the owner and skips an index whose owner is disabled: it stays queued and unchanged, uses none of the model's time, and is built when the account is active again. It still counts in the queue cap while it waits.
+- **Recovery.** At startup, before the worker, every index left `indexing` by a stopped server goes back to `queued`, keeping its vectors, its tokens and its attempts (an interrupted build is not a failed attempt). While the server runs, an index still `indexing` a minute after it started that is not the one this process runs goes back too: an error after the claim (the database failing in the middle) would otherwise leave it for ever, and its owner could not start another build.
+- **Cancelling.** A delete removes the row first and then calls `abortIndexBuildService`, which aborts the request in flight when it is that index's (or that document's): the worker cannot take the row again in between, and the model server stops working on chunks nobody wants. The aborted build puts the index back quietly, and a deleted one matches nothing. Stopping the worker aborts the same way.
+- **Events.** The worker emits `started`, `progress` (`embeddedCount` of `chunkCount`), `ready` and `failed`, each with the index and its owner and no text, through the observer in `events.service.ts`. Today `server.ts` writes them to the log by index id; the live stream to the owner is layer 11.
+
+### Failure and retry
+
+Only the call to Ollama is guarded: what it throws says something about the model server. What that means:
+
+| What happened | What the worker does | Attempt counted |
+|---|---|---|
+| The caller's signal aborted (a delete, or the worker stopping) | Puts the index back in the queue quietly | no |
+| An `AppError` that is not unavailable or timeout | Fails the index with that error's message | no |
+| A malformed answer (`MalformedModelAnswerError`: a body that is not JSON, the wrong number or size of vectors, a number beyond the float4 range, all zeros, no token count) | Logs it and fails the index at once with "Indexing failed" | no |
+| Ollama unreachable, a timeout, or an error answer | **Probes**: asks Ollama once what it has installed (`GET /api/tags`, 2 s timeout), then see below | see below |
+| The model of the index is not among the allowed models any more | Fails with "The embedding model of this index is no longer allowed", without calling Ollama | no |
+| A database error (reading the chunks, storing a batch) | Goes up as it is: no probe, no attempt, the index is not failed. It stays `indexing` until the stuck-build requeue puts it back | no |
+
+The probe decides:
+
+- It does not answer (the connection fails, or the 2 s timeout): Ollama is away, which is not the index's fault. The index goes back to the queue with its attempts unchanged and the queue stops until its next round.
+- It answers with a list and the model is not in it: the build can never succeed, so it fails at once with "The embedding model is not installed on the model server".
+- It answers with a list that has the model, or answers with something that is not a list (an error status, a body that cannot be read): Ollama is up, so the batch was dropped and counts as an attempt. At 3 attempts (`MAX_INDEXING_ATTEMPTS`) the index fails with "Indexing failed"; before that it goes back to the queue. A server that is up and broken must run out of attempts and not be asked for ever.
+
+A timeout takes the probe path like any other failure (changed in round 2): a request that timed out because Ollama is loading a model must not fail the index or spend the user's daily builds. The messages in `error` are written to be shown; the text of a chunk is never logged or returned.
+
+### Limits
+
+| Limit | Variable (default, range) | Over it | Counts |
+|---|---|---|---|
+| Documents per user | `MAX_DOCUMENTS_PER_USER` (3, 1 to 1000) | 409 | the user's stored documents; nothing is deleted automatically |
+| Upload requests | `UPLOAD_REQUESTS_PER_MINUTE` (5, 1 to 1000) | 429 | per user per minute, every request, before the body is read |
+| Index-creation requests | the same value, a separate counter | 429 | `POST /documents/:id/indexes` per user per minute, every request (also the ones that find the index already there), before the body is read |
+| Builds in progress per user | `MAX_ACTIVE_INDEX_BUILDS_PER_USER` (1, 1 to 100) | 409 | the user's queued and indexing builds, whichever document they belong to |
+| Builds waiting in the queue | `MAX_QUEUED_INDEX_BUILDS` (20, 1 to 1000) | 503 | queued builds of all users together; the build running is not counted |
+| Builds per user per day | `MAX_INDEX_BUILDS_PER_DAY` (6, 1 to 1000) | 429 | the user's rows of `index_build_usage` in the last 24 hours, uploads included; deleting does not give a build back. The default 6 is the number of allowed chunk sizes |
+| Builds per day, all users | `MAX_INDEX_BUILDS_PER_DAY_TOTAL` (100, 1 to 10000) | 429 | every user's rows of the last 24 hours; bounds the GPU time |
+| Document length | `MAX_DOCUMENT_CHARACTERS` (1,000,000, 1 to 5,000,000) | 400 | UTF-16 units, on the text as sent and again after cleaning |
+| Upload body | derived: 3 bytes per character plus 16 kB | 413 | before the body is parsed |
+| One request to Ollama | `OLLAMA_TIMEOUT_MS` (120000, 1000 to 600000) | the probe path above | one batch |
+
+The caps on starting a build are checked in this order, so the same request always gets the same refusal: documents of the user (409, uploads only), builds in progress (409), builds of the user in 24 hours (429), builds in all in 24 hours (429), the queue (503), and a copy of the same text (409, uploads only). An accepted build inserts its row in `index_build_usage` in the same transaction that inserts the index, and the counts above are read under two locks: the user's row (`SELECT ... FOR UPDATE` on `users`, so two requests of one user are served one after the other) and then a transaction advisory lock (`LOCK_KEYS.indexingQueue`), always in that order so two requests cannot wait for each other. The second lock is what keeps two users from both taking the last place of a global cap. Before the locks, `POST /documents` refuses a user already at the documents cap before it cleans, hashes or cuts the text, and `POST /documents/:id/indexes` runs the whole check without a lock before it reads and cuts the text; both are only a guess, and the check under the locks is what decides. Those request counters are in memory and reset when the API restarts.
+
+### Builds start in one place
+
+Only `createDocumentService` and `createDocumentIndexService` spend the build caps and queue an index. `findReadyIndexService(userId, documentId, { chunkSize, embeddingModel })` is what layer 5's search will call: it never builds and never calls the model, and a document whose index at that size and model is missing, queued, being built or failed is a 409 "This document has no ready index for chunk size N". `POST /v1/configuration/resolve` accepts index-time overrides and stays a dry run.
+
+### The worker starts after the check
+
+`server.ts` starts the worker only once the startup check has passed: at once, or from the background retry when the database was down at startup. First it moves the indexes a stopped server left `indexing` back to the queue; a failure of that recovery does not keep the worker from starting, because the worker also puts stuck builds back. A test or a script that imports the app never starts indexing.
+
+### Reused from RAG Web
+
+`chunkText` as it is (the evaluated chunker), the text cleaning (`sanitizeText`, without the literal byte order mark in the source: it is written from its number), and the filename rule. The chunk sizes, the model and the default of 1000 characters are layer 3's settings. No evaluated value changed.
+
+### Tests
+
+The tests use the fake Ollama of `test/doubles/fakeOllama.ts`, which gained the embed endpoint, held requests and a record of what it received, so no model is needed. One integration test, `test/integration/ollamaEmbed.live.test.ts`, talks to a real Ollama and is skipped unless `RAG_LAB_LIVE_OLLAMA_URL` names one; it is how the owner checks F9.
+
+### Decisions
+
+> [!NOTE]
+> **Decision:** the owner approved the plan of layer 4 (2026-11-27), taking the planner's recommendation for each of its open decisions except where a decision below says otherwise.
+
+> [!NOTE]
+> **Decision (D1):** documents belong to one user (2026-11-27, the owner's decision). Only the owner sees them; an admin gets the same 404 as anyone else, as with profiles, and there is no admin route to documents.
+
+> [!NOTE]
+> **Decision (D2):** the transport is JSON `{ filename, text }`, and the client extracts the plain text (2026-11-27, the owner's decision): `file.text()` for a `.txt` file, pdf.js and mammoth in the browser for PDF and DOCX. The server never parses a file and gets no new dependency.
+
+> [!NOTE]
+> **Decision (D3):** `MAX_DOCUMENT_CHARACTERS` is 1,000,000 by default with a maximum of 5,000,000, counted in UTF-16 units before cleaning; the body limit is derived (3 bytes per character plus 16 kB); `FILENAME_MAX_LENGTH` is 255 (2026-11-27, the owner's decision). A derived limit moves with the character cap and cannot disagree with it.
+
+> [!NOTE]
+> **Decision (D4):** the sanitized text is stored in `documents.text` with its line breaks (2026-11-27, the owner's decision), so any chunk size, and later other chunkers, can be built from it without uploading again. The owner would like a 1-day lifetime for documents later (D15).
+
+> [!NOTE]
+> **Decision (D5):** an upload creates the document and its first index and answers 202; a missing `chunkSize` or `embeddingModel` comes from the default profile through the resolver (2026-11-27, the owner's decision). `POST /v1/documents/:id/indexes` answers 202 for a new index, 200 for one that is queued, indexing or ready (nothing is built, no cap is looked at), and 202 for a failed one, which is queued again with the same id and counts as a build.
+
+> [!NOTE]
+> **Decision (D6):** the chunker is RAG Web's `chunkText` as it is (2026-11-27, the owner's decision): whole words, whitespace collapsed, no overlap. No evaluated value changed; paragraph-aware chunking is for experiment E1.
+
+> [!NOTE]
+> **Decision (D7):** the queue is persisted in the `document_indexes` rows, claimed with `FOR UPDATE SKIP LOCKED`, with one in-process worker that `server.ts` starts after the database check (recovery first), and one Ollama request at a time through the model turn (2026-11-27, the owner's decision). A queue in the table survives a restart without a second system, and one GPU does one thing at a time.
+
+> [!NOTE]
+> **Decision (D8):** failure and retry (2026-11-27, the owner's decision; changed in round 2, see O2 below). After a failed batch the worker probes `GET /api/tags` once. Ollama down: the index goes back to the queue and no attempt is counted. Ollama up: attempts + 1, and the index fails after `MAX_INDEXING_ATTEMPTS` = 3. Model missing: it fails with its own message. A malformed answer: it fails at once. This closes RAG Web's F10.
+
+> [!NOTE]
+> **Decision (D9):** cancelling is deleting the index or the document (2026-11-27, the owner's decision). The delete aborts the in-flight request, and there is no `cancelled` state.
+
+> [!NOTE]
+> **Decision (D10):** the build caps (2026-11-27, the owner's decision; they answer the question left open in design section 12). 3 documents per user (409); 5 uploads per minute; 1 build in progress per user (409); 20 builds waiting in the queue, all users together, running builds not counted (503); 6 builds per user in the last 24 hours, uploads included, deleting not giving a build back, the number of allowed chunk sizes (429); and **100 builds for all users together in the last 24 hours (429), a cap the owner asked for to bound GPU time**. `OLLAMA_TIMEOUT_MS` is 120000. The caps are checked under the user-row lock plus an advisory lock; since round 2 a lock-free pre-check also runs before the text is read and chunked, and `POST /documents/:id/indexes` has its own per-user limit with the value of `UPLOAD_REQUESTS_PER_MINUTE`, a separate counter, counted before the body is read. The exemption for the harness account stays in layer 10.
+
+> [!NOTE]
+> **Decision (D11, closes the deferred finding O7):** builds happen only in `createDocumentService` and `createDocumentIndexService` (2026-11-27, the owner's decision). `findReadyIndexService` never builds and answers 409 when the index is not ready. `POST /v1/configuration/resolve` stays a dry run that accepts index-time overrides. A route that reads must not be a way to spend the GPU.
+
+> [!NOTE]
+> **Decision (D12):** there is no vector index (HNSW or IVFFlat) until layer 5 measures (2026-11-27, the owner's decision). The search compares the chunks of one index, a few hundred rows, and is exact.
+
+> [!NOTE]
+> **Decision (D13):** column grants for the API role (2026-11-27, the owner's decision): `documents` immutable; `document_indexes` `UPDATE` on its state columns only; `chunks` `UPDATE` on `embedding` only and no `DELETE` (the cascade runs as the owner); `index_build_usage` insert-only. A flaw in a route cannot rewrite a document, change what an index is, or give a build back.
+
+> [!NOTE]
+> **Decision (D14):** in layer 5 the evaluation harness uploads the evaluation documents through the API as a harness account and reuses them by `contentHash` (2026-11-27, the owner's decision). The same text twice for the same user is a 409, so the harness looks the hash up first.
+
+> [!NOTE]
+> **Decision (D15):** there is no automatic deletion of documents for now (2026-11-27, the owner's decision). The owner wants a 1-day lifetime for (non-admin) users later; it is revisited in layer 13, with hosting.
+
+> [!NOTE]
+> **Decision (D16):** the embedding tokens are stored as a total per index, the sum of the `prompt_eval_count` of the stored batches (2026-11-27, the owner's decision). Per-chunk counts come with layer 9's tokenizer.
+
+> [!NOTE]
+> **Decision:** the audit of layer 4 led to a second round of fixes, and the owner approved the list (2026-11-27). O2: a timeout probes Ollama like any other failure, instead of failing the index at once (this changes D8, with the owner's approval). F2/O1: the lock-free pre-check of the caps and the rate limit of index creation. F1: `storeBatch` locks the index row first, in the order of the delete, so there is no deadlock. F4: a database error is not counted as an Ollama failure (no probe, no attempt, not failed; the index stays `indexing` until the stuck-build requeue), and a non-OK or malformed `/api/tags` answer means "up but broken" (attempts + 1). F3: only a body that arrived whole and is not JSON is a malformed answer; a body cut in the middle counts as unavailable. I3: the indexes of disabled users are skipped and stay queued. F5: vectors must stay inside the float4 range (`FLOAT4_MAX`). F8: the wake flag, so a wake is never lost. F12/I9: logs of unexpected errors carry only name, code and message (`describeError`). I4: a dead export was removed.
+
+> [!NOTE]
+> **Decision:** these details were taken by the AI without asking the owner, and the owner can reverse any of them (2026-11-27). An index whose embedding model is no longer allowed fails with its own message and is never sent anywhere. Deleting takes the row out first and aborts the request after, and a request for an index that already exists answers 200 right after the user's lock. A text that is too long only after cleaning is a 400 "Validation error". `ModelTimeoutError` is a class (still a 504 with the same message) so that background code tells a timeout apart by type and not by status. The probe runs outside the model turn. The migrations have one index beyond the plan, `index_build_usage_accepted_at_idx`, for the daily count of all users.

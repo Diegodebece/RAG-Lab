@@ -2,7 +2,7 @@
 
 Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Building follows the order in
 section 13; layer 1 (Foundations) and layer 2 (Accounts and authentication) were built on 2026-11-26, and layer 3
-(Configuration as data) on 2026-11-27. Every session
+(Configuration as data) and layer 4 (Documents and indexes) on 2026-11-27. Every session
 and agent working on RAG Lab reads this file first. Decisions change only with the owner's approval, and
 each change is recorded here.
 
@@ -79,7 +79,7 @@ user-chosen settings are an unbounded-consumption risk (OWASP LLM Top 10).
 
 | Kind | Examples | Effect of a change |
 |---|---|---|
-| Index time | chunk size, embedding model | Needs a new index. A document can have several indexes, one per chunk size; choosing a missing one starts an indexing job. |
+| Index time | chunk size, embedding model | Needs a new index. A document can have several indexes, one per chunk size and embedding model. Changed on 2026-11-27 (layer 4): an index is chosen by `chunkSize` and `embeddingModel`, and a build starts only from the document endpoints (an upload, or a request for an index of a document); choosing a missing index in a question or in `POST /v1/configuration/resolve` starts nothing. |
 | Question time | top_k, minimum score, neighbor window (±1/±2), retrieval mode (vector, vector with query instruction, hybrid), reranking, router policy and thresholds, model per tier, temperature, max tokens, gpt-oss thinking level, answer language | Free per question |
 
 Every question stores a snapshot of the configuration it used next to its metrics. The harness and the playground
@@ -133,6 +133,12 @@ caps is refused when used (400) and shown with its problems; it is never clamped
 at most 20 profiles by default (`MAX_PROFILES_PER_USER`, 1 to 1000); admins have no powers over other users'
 profiles.
 
+**Built in layer 4 (decided by the owner on 2026-11-27, with the plan).**
+
+- Documents belong to one user; admins get the same 404 as anyone else. Builds start only in the document services (`createDocumentService`, `createDocumentIndexService`); `findReadyIndexService` never builds and answers 409 when the index is not ready; `POST /v1/configuration/resolve` stays a dry run that accepts index-time overrides and starts nothing. This closes the layer 3 finding about index-time overrides triggering builds.
+- An upload creates the document and its first index (202), taking a missing `chunkSize` or `embeddingModel` from the default profile through the resolver. A request for an index that is queued, indexing or ready answers 200; a failed one is queued again (202) and counts as a build.
+- Index builds are capped per user and for the server (section 12). The search is exact, with no vector index (HNSW or IVFFlat) until layer 5 measures.
+
 **The snapshot and its hash.** Resolving a configuration gives `{ version, settings }` with all eleven settings. Its
 hash is the SHA-256 (hex) of its canonical JSON: keys sorted at every level, no spaces, UTF-8. The profile id and the
 dates are outside, so identical settings from two profiles or two users are one configuration. The hash is an
@@ -151,7 +157,7 @@ Per question and per model call:
 - thinking tokens and answer tokens separately (both are inside `eval_count`);
 - the sum over both calls when the cascade escalates.
 
-Per document: embedding tokens of every chunk, per index (chunk size).
+Per document: embedding tokens of every chunk, per index (chunk size). Changed on 2026-11-27 (layer 4): the embedding tokens are built as one total per index (`embedding_tokens`, the sum of the `prompt_eval_count` of the stored batches, in `document_indexes`). Per-chunk counts come with layer 9's tokenizer.
 
 Ollama's `prompt_eval_count`, `eval_count` and the embed endpoint's count are the totals; the split comes from
 tokenizing each part locally. The two must agree within a known margin, and the harness checks it.
@@ -170,7 +176,7 @@ Known facts:
   returned, so neighbors could not recover it.
 - RAG Web embeds the raw question; Qwen3-Embedding is trained with a query instruction
   (`Instruct: <task>\nQuery: <question>`), reported to help by 1–5%, with no re-indexing.
-- RAG Web's chunker collapses all whitespace, so paragraph boundaries are lost.
+- RAG Web's chunker collapses all whitespace, so paragraph boundaries are lost. Layer 4 keeps RAG Web's `chunkText` as it is (whole words, whitespace collapsed, no overlap), so no evaluated value changed, but the stored document text keeps its line breaks (cleaned to NFC and `\n`), so E1 can build paragraph- and sentence-aware indexes from it later without uploading again. Chunk offsets and a `chunker` column for such indexes are for E1.
 
 To measure, retrieval first (cheap, embeddings only), then full answers on the best candidates:
 
@@ -199,6 +205,8 @@ Starts from RAG1's harness and improves it:
    questions, tables and lists.
 
 Evaluation data is private: it stays git-ignored.
+
+Decided on 2026-11-27 (layer 4): the harness uploads the evaluation documents through the API as a harness account, and reuses them by `contentHash` (the SHA-256 of the stored text) instead of uploading them on every run. The same text twice for the same user is a 409, so the harness looks the hash up first.
 
 ## 8. Agent team
 
@@ -405,7 +413,15 @@ The skills were copied from RAG Web unchanged, except for these changes:
 - with layer 3 (2026-11-27) the skills gained the configuration patterns: a read-only default table changed only by
   migrations, settings merged by known keys, strict validation of settings with no conversion or rounding, canonical
   JSON snapshots with a hash, a startup check of configuration data, column grants in a migration, and a small body
-  limit for small bodies.
+  limit for small bodies;
+- with layer 4 (2026-11-27) the skills gained the background-work patterns: tables by what they are (an immutable
+  user table, a job table with column grants, a child table removed only by the cascade, an insert-only usage table), a
+  worker started by `server.ts` after the database check, the index rows as a persisted queue with a wake flag and a
+  claim that skips disabled users, one model request at a time, vectors stored in one short transaction that locks the
+  parent first, a retry that probes the model server (timeouts included, database errors kept apart), build caps under
+  a user lock plus an advisory lock with a lock-free pre-check, `describeError` for logs, an upload limiter before a
+  derived body limit, a nested router, 202 for accepted work and 200 for "ensure", and index-time fields built from
+  the caps.
 
 `CLAUDE.md` is RAG Web's standards with a RAG Lab section on top: the loops, the approval gates, GitHub, private
 data and the hooks.
@@ -418,8 +434,17 @@ data and the hooks.
   code (section 4). Interim request caps arrive with the first layer that calls a model (layer 5 for question
   embeddings, layer 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per
   user, 60 s per question, 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or
-  measurements: the token budgets (after layer 9), a cap on indexes per document or indexing jobs per user (layer 4),
-  and an exemption or higher caps for the harness account (layer 10).
+  measurements: the token budgets (after layer 9), and an exemption or higher caps for the harness account (layer 10).
+  Decided on 2026-11-27 (layer 4): the build caps, all in `.env` with a range: 3 documents per user
+  (`MAX_DOCUMENTS_PER_USER`, 409), 5 uploads per minute per user (`UPLOAD_REQUESTS_PER_MINUTE`, also the limit of
+  `POST /v1/documents/:id/indexes`, with its own counter), 1 index build in progress per user
+  (`MAX_ACTIVE_INDEX_BUILDS_PER_USER`, 409), 20 builds waiting in the queue, all users together
+  (`MAX_QUEUED_INDEX_BUILDS`, 503; running builds are not counted), 6 builds per user in the last 24 hours, uploads
+  included, a deletion not giving a build back (`MAX_INDEX_BUILDS_PER_DAY`, 429; the default is the number of allowed
+  chunk sizes), and 100 builds for all users together in the last 24 hours (`MAX_INDEX_BUILDS_PER_DAY_TOTAL`, 429;
+  the owner asked for this cap to bound GPU time). Also `OLLAMA_TIMEOUT_MS`, 120000. The exemption for the harness
+  account stays in layer 10. No document is deleted automatically for now; the owner wants a 1-day lifetime for
+  (non-admin) users later, to be revisited in layer 13 with hosting.
 - Hosting and domain for RAG Lab (RAG Web uses a Cloudflare tunnel).
 
 ## 13. Build order
@@ -432,10 +457,10 @@ goes through the experiment loop once the layers before it exist.
 | 1 | Foundations | App, health check, migrations, middlewares, test setup |
 | 2 | Accounts and authentication | Users, login, tokens |
 | 3 | Configuration as data | Caps, default profile, user profiles, the snapshot of a question's configuration |
-| 4 | Documents and indexes | One index per chunk size; the indexing queue |
+| 4 | Documents and indexes | One index per chunk size; the indexing queue. Built 2026-11-27 |
 | 5 | Retrieval endpoint | The runs table and the retrieval-only harness |
 | E1 | Retrieval sweeps | Chunk size, chunking, retrieval mode, top_k, neighbors |
-| 6 | Questions | Answers with the small model |
+| 6 | Questions | Answers with the small model. Must include the defences against prompt injection from document text (below), with tests |
 | 7 | Answer harness | Scorer, LLM judge, paired statistics |
 | E2 | Baseline answers | Judge agreement, Spanish |
 | 8 | Router | Big tier, cascade and rules |
@@ -445,6 +470,8 @@ goes through the experiment loop once the layers before it exist.
 | 11 | Live events (SSE) | And the API contract freeze |
 | 12+ | Retrieval improvements | Through the experiment loop |
 | 13 | Deployment and hosting | Docker for the API, tunnel, image and model digests |
+
+**Layer 6 requirement (O4, stated by the owner on 2026-11-27): avoid prompt injection at all costs.** The stored text of a document keeps invisible characters (zero-width, bidirectional controls, Unicode tag characters) that can hide instructions from a person who reads the text but not from the model. Filtering them when the text is stored would break composed emoji and scripts such as Persian, so layer 4 does not. When layer 6 builds the prompt it must do three things: filter those characters out of what goes into it, fence each chunk as quoted data, and tell the model that document text is data and never instructions. The layer 6 planner treats this as a must-have, with tests.
 
 ## 14. Process metrics
 

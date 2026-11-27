@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { inspect } from "node:util";
 import express from "express";
 import type { Request, Response } from "express";
 import request from "supertest";
@@ -59,6 +60,49 @@ describe("errorMiddleware", () => {
         assert.equal(response.status, 500);
         assert.deepEqual(response.body, { message: "Internal server error" });
         assert.equal(consoleError.mock.callCount(), 1);
+    });
+
+    // A PostgreSQL error carries the failing row (detail), the statement (query), its parameters and the place it came from
+    // (where): any of them can hold the text of a document. The log gets what says what went wrong, and nothing else.
+    it("logs an unexpected error by its name, code and message only: the fields a database error carries (detail, where, query, parameters) are not written", async (t) => {
+        const consoleError = t.mock.method(console, "error", () => {});
+        const databaseError = Object.assign(new Error("duplicate key value violates unique constraint"), {
+            name: "DatabaseError",
+            code: "23505",
+            detail: "Key (text)=(DETAIL-MARKER invented document text) already exists.",
+            where: "WHERE-MARKER invented document text",
+            query: "INSERT INTO documents (text) VALUES ('QUERY-MARKER invented document text')",
+            parameters: ["PARAMETERS-MARKER invented document text"],
+            constraint: "documents_user_id_content_hash_unique"
+        });
+
+        const response = await request(buildApp(databaseError)).get("/fail");
+
+        assert.equal(response.status, 500);
+        assert.equal(consoleError.mock.callCount(), 1, "it is logged once");
+
+        const written = consoleError.mock.calls[0].arguments.map((argument) => (typeof argument === "string" ? argument : inspect(argument, { depth: 6 }))).join(" ");
+
+        for (const marker of ["DETAIL-MARKER", "WHERE-MARKER", "QUERY-MARKER", "PARAMETERS-MARKER"]) {
+            assert.ok(!written.includes(marker), `${marker} reached the log: ${written}`);
+        }
+
+        assert.ok(written.includes("DatabaseError"), "the name is logged");
+        assert.ok(written.includes("23505"), "the code is logged");
+        assert.ok(written.includes("duplicate key value violates unique constraint"), "the message is logged");
+    });
+
+    it("logs an unexpected error that has no code by its name and message", async (t) => {
+        const consoleError = t.mock.method(console, "error", () => {});
+        const failure = Object.assign(new TypeError("Cannot read properties of undefined"), { detail: "DETAIL-MARKER invented document text" });
+
+        await request(buildApp(failure)).get("/fail");
+
+        const written = consoleError.mock.calls[0].arguments.map((argument) => (typeof argument === "string" ? argument : inspect(argument, { depth: 6 }))).join(" ");
+
+        assert.ok(!written.includes("DETAIL-MARKER"), `the detail reached the log: ${written}`);
+        assert.ok(written.includes("TypeError"));
+        assert.ok(written.includes("Cannot read properties of undefined"));
     });
 
     it("also handles values that are not errors", async (t) => {

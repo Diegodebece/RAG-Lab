@@ -4,13 +4,13 @@ A RAG API built by a team of Claude Code agents. It answers questions about uplo
 
 The design, with every decision and its reason, is in [docs/design.md](docs/design.md); the architecture and the decisions taken while building are in [docs/project-guide.md](docs/project-guide.md).
 
-> **Status:** layer 3 of 13, Configuration as data, is built on top of layer 2 (Accounts and authentication) and layer 1 (Foundations): the settings users may change with their caps, a default profile in the database, each user's own profiles, and a resolver that turns them into one configuration with a hash. Layer 2 gave accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There are no documents or questions yet. The order of the layers is in the [design](docs/design.md#13-build-order).
+> **Status:** layer 4 of 13, Documents and indexes, is built on top of layer 3 (Configuration as data), layer 2 (Accounts and authentication) and layer 1 (Foundations): a user uploads a document as text, and the API cuts it in chunks, embeds them with `qwen3-embedding:0.6b` in a background queue and stores the vectors, one index per chunk size. Layer 3 gave the settings users may change with their caps, a default profile in the database, each user's own profiles, and a resolver that turns them into one configuration with a hash. Layer 2 gave accounts created by an admin, login and logout, tokens that can be revoked, the low-privilege database role of the API and the limits of the account routes. There is no search or questions yet. The order of the layers is in the [design](docs/design.md#13-build-order).
 
 ## Requirements
 
 - Node.js 22.18 or later
 - Docker Desktop (runs PostgreSQL 17 with pgvector)
-- Ollama with `qwen3.5:4b` and `qwen3-embedding:0.6b` (`gpt-oss:20b` joins in layer 8)
+- Ollama with `qwen3.5:4b` and `qwen3-embedding:0.6b` (`gpt-oss:20b` joins in layer 8). Indexing a document uses the embedding model `qwen3-embedding:0.6b`; without it (or without Ollama running) an uploaded document's index fails or waits
 
 ## Setup
 
@@ -120,6 +120,10 @@ The server stops at startup if `DATABASE_URL` still connects as the owner, and s
 
 Run `npm run migrate` (step 9). Migration `004_default_profile.sql` creates and fills the default profile, and `005_profiles.sql` creates the profiles table. The server refuses to start while they are pending, and when the default profile in the database is missing or outside the caps, or a stored profile is at another configuration version.
 
+### An existing checkout (after layer 4 is merged)
+
+Run `npm run migrate` (step 9). It applies `006_documents.sql`, `007_document_indexes.sql` and `008_index_build_usage.sql`: the tables of documents, indexes, chunks and the count of index builds. The new variables are optional and have defaults (see Configuration and `.env.example`). There are no new roles and no new scripts. The server refuses to start while the migrations are pending. When it starts, it puts the indexes that a stopped server left half built back in the queue and starts the indexing worker.
+
 ## Scripts
 
 | Script | What it does |
@@ -166,13 +170,20 @@ All paths start with `/v1`. Protected endpoints need the header `Authorization: 
 | `PATCH /users/me/password` | Token | Body `{ currentPassword, newPassword }` (8 to 64 characters); answers with a new `token`, and the old ones stop working. 5 attempts per 15 minutes |
 | `POST /users` | Admin | Creates an account: `{ email, password, role? }`; answers `201`. 20 attempts per hour |
 | `PATCH /users/:id` | Admin | Changes another account's `role` and/or `status` (`active` or `disabled`); never your own |
-| `GET /configuration` | Token | What each setting accepts (type, allowed values or range), the defaults the database holds, and the limits on profiles |
+| `GET /configuration` | Token | What each setting accepts (type, allowed values or range), the defaults the database holds, and the limits on profiles, documents and index builds |
 | `POST /configuration/resolve` | Token | Body `{ profileId?, overrides? }`, both optional; answers the complete configuration a question would run with, and its hash. A dry run: it calls no model |
 | `GET /profiles` | Token | The caller's profiles, oldest first, each with its `problems` |
 | `POST /profiles` | Token | Body `{ name, settings? }`; answers `201`. `409` over `MAX_PROFILES_PER_USER` or for a name the user already has |
 | `GET /profiles/:id` | Token | One of the caller's profiles; another user's is a `404`, an admin's too |
 | `PATCH /profiles/:id` | Token | Body with `name` and/or `settings`, at least one; the settings sent replace the stored ones |
 | `DELETE /profiles/:id` | Token | Deletes the profile |
+| `GET /documents` | Token | The caller's documents, newest first, each with its indexes; never the text |
+| `POST /documents` | Token | Body `{ filename, text, chunkSize?, embeddingModel? }` (the client extracts the text; the server never parses a file); answers `202`, because the first index is built in the background. `409` over `MAX_DOCUMENTS_PER_USER`, for a text the user already has, or while another build is in progress; `429` over `UPLOAD_REQUESTS_PER_MINUTE` or the daily build limits; `503` when the queue is full |
+| `GET /documents/:id` | Token | One of the caller's documents; another user's is a `404`, an admin's too |
+| `DELETE /documents/:id` | Token | Deletes the document, its indexes and its chunks, and aborts a build in progress |
+| `POST /documents/:id/indexes` | Token | Body `{ chunkSize?, embeddingModel? }`, both optional; queues an index (`202`), or returns the one already queued, being built or ready (`200`). A failed one is queued again (`202`) |
+| `GET /documents/:id/indexes/:indexId` | Token | The state of an index: `status` (`queued`, `indexing`, `ready`, `failed`), progress, tokens, place in the queue. Poll it every 2 to 3 seconds |
+| `DELETE /documents/:id/indexes/:indexId` | Token | Deletes the index (this is how a build is cancelled) |
 
 Numbers in settings must be JSON numbers, never text, and a value outside its cap is refused, never rounded or clamped. Successful responses look like `{ success: true, message, data }`; errors look like `{ message }`, with `details` for validation errors. While the database cannot be reached, every endpoint except `GET /health` answers `503`.
 
@@ -184,6 +195,8 @@ Every variable is in [.env.example](.env.example), with its default and range. A
 
 A user may keep at most `MAX_PROFILES_PER_USER` profiles (default 20, range 1 to 1000). The values the settings may take (chunk size, models, top K and the rest) are capped in the code, in `src/v1/config/configuration.config.ts`, not in `.env`; the defaults are the row of the `default_profile` table, which only a migration changes. At startup the server also refuses a default profile that is missing or outside the caps, and a stored profile at another configuration version.
 
+Documents and indexes (layer 4) have their own limits, all optional and each with a range (the two request limits are counted in memory and reset when the API restarts; the others are counted in the database): `MAX_DOCUMENTS_PER_USER` (3), `MAX_DOCUMENT_CHARACTERS` (1,000,000, at most 5,000,000; the upload body limit follows from it, 3 bytes per character plus 16 kB), `UPLOAD_REQUESTS_PER_MINUTE` (5, also the limit of `POST /documents/:id/indexes`, with its own counter), `MAX_ACTIVE_INDEX_BUILDS_PER_USER` (1), `MAX_QUEUED_INDEX_BUILDS` (20, counts the builds waiting, all users together), `MAX_INDEX_BUILDS_PER_DAY` (6 per user, over the last 24 hours, uploads included; deleting does not give a build back), `MAX_INDEX_BUILDS_PER_DAY_TOTAL` (100, all users together) and `OLLAMA_TIMEOUT_MS` (120000, how long one request to Ollama may take). The indexing worker runs inside the API process, started by `server.ts` once the database check has passed, and builds one index at a time; nothing is deleted automatically.
+
 ## Project structure
 
 ```
@@ -193,7 +206,7 @@ A user may keep at most `MAX_PROFILES_PER_USER` profiles (default 20, range 1 to
 ├── scripts/               # SQL the owner runs by hand: create-api-role.sql
 ├── src/
 │   ├── app.ts             # builds the Express app
-│   ├── server.ts          # checks the config, the role and the schema, listens, shuts down gracefully
+│   ├── server.ts          # checks the config, the role and the schema, starts the indexing worker, listens, shuts down gracefully
 │   ├── shutdown.ts        # closeServerGracefully and closePoolGracefully
 │   ├── migrate.ts         # the migration runner (as the owner)
 │   ├── createAdmin.ts     # npm run create-admin: the first admin

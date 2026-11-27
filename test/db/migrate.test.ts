@@ -25,9 +25,17 @@ const isScriptFailure = (error: unknown): error is ScriptFailure =>
 // Everything below inspects the database as its owner: the API role has no rights on a schema the migrations have
 // not given it, so through its pool a table would simply not be there to see.
 const publicTables = async (): Promise<string[]> => {
-    const { rows } = await ownerPool.query<{ tablename: string }>("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename");
-    return rows.map((row) => row.tablename);
+    const { rows } = await ownerPool.query<{ tablename: string }>("SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
+    // sorted here and not by the database: its collation decides where "document_indexes" goes next to "documents"
+    return rows.map((row) => row.tablename).sort();
 };
+
+const ALL_MIGRATIONS = [
+    "001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql",
+    "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql"
+];
+
+const ALL_TABLES = ["chunks", "default_profile", "document_indexes", "documents", "index_build_usage", "profiles", "schema_migrations", "users"];
 
 // closes both pools once, after every suite in this file
 after(closeTestPools);
@@ -43,11 +51,14 @@ describe("migrate script", () => {
         assert.match(output, /Applied 003_users\.sql/);
         assert.match(output, /Applied 004_default_profile\.sql/);
         assert.match(output, /Applied 005_profiles\.sql/);
+        assert.match(output, /Applied 006_documents\.sql/);
+        assert.match(output, /Applied 007_document_indexes\.sql/);
+        assert.match(output, /Applied 008_index_build_usage\.sql/);
 
         const { rows } = await ownerPool.query<{ table_name: string }>(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
         );
-        assert.deepEqual(rows.map((row) => row.table_name), ["default_profile", "profiles", "schema_migrations", "users"]);
+        assert.deepEqual(rows.map((row) => row.table_name).sort(), ALL_TABLES);
     });
 
     it("enables pgvector, with cosine distance on 1024-dimension vectors", async () => {
@@ -67,7 +78,7 @@ describe("migrate script", () => {
         assert.match(output, /Database is up to date/);
 
         const { rows } = await ownerPool.query<{ version: string }>("SELECT version FROM schema_migrations ORDER BY version");
-        assert.deepEqual(rows.map((row) => row.version), ["001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql"]);
+        assert.deepEqual(rows.map((row) => row.version), ALL_MIGRATIONS);
     });
 });
 
@@ -139,7 +150,8 @@ describe("migrate script with only MIGRATION_DATABASE_URL", () => {
         assert.match(outcome.stdout, /Applied 001_init\.sql/);
         assert.match(outcome.stdout, /Applied 003_users\.sql/);
         assert.match(outcome.stdout, /Applied 005_profiles\.sql/);
-        assert.deepEqual(await publicTables(), ["default_profile", "profiles", "schema_migrations", "users"]);
+        assert.match(outcome.stdout, /Applied 008_index_build_usage\.sql/);
+        assert.deepEqual(await publicTables(), ALL_TABLES);
     });
 });
 
