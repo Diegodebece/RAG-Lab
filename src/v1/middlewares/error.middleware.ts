@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { AppError } from "../utils/appError.util.js";
 import { DATABASE_UNAVAILABLE_MESSAGE, isDatabaseUnreachableError } from "../utils/databaseError.util.js";
+import { describeError } from "../utils/describeError.util.js";
 
 // Errors raised by libraries for bad client input carry a 4xx status: malformed JSON from body-parser, or a path
 // parameter the router cannot decode (a URIError). The status is the answer; the message is shown only when the
@@ -12,7 +13,7 @@ const getClientErrorStatus = (err: unknown): number | null =>
 
 const isExposed = (err: unknown): boolean => err instanceof Error && "expose" in err && err.expose === true;
 
-export const errorMiddleware = (err: unknown, req: Request, res: Response, next: NextFunction) => {
+export const errorMiddleware =(err: unknown, req: Request, res: Response, next: NextFunction) => {
     // Part of the response is already out (for example a stream): another status or body cannot be sent.
     // Express default handler closes the connection instead.
     if (res.headersSent) {
@@ -33,7 +34,8 @@ export const errorMiddleware = (err: unknown, req: Request, res: Response, next:
         return res.status(clientErrorStatus).json({ message: isExposed(err) && err instanceof Error ? err.message : "Invalid request" });
     }
 
-    console.error(err);
+    // only the name, the code and the message: never the whole object
+    console.error(describeError(err));
 
     // A database that cannot be reached is the server's problem and may pass: the client is told to try again, and
     // nothing about the connection (the address, the driver's message) leaves the server.

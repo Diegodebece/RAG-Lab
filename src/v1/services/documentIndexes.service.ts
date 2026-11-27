@@ -76,7 +76,7 @@ export const lockIndexingQueueService = async (client: PoolClient): Promise<void
     await client.query("SELECT pg_advisory_xact_lock($1)", [LOCK_KEYS.indexingQueue]);
 };
 
-const countOf = async (client: PoolClient, sql: string, values: unknown[] = []): Promise<number> => {
+const countOf = async (client: Queryable, sql: string, values: unknown[] = []): Promise<number> => {
     const { rows } = await client.query<{ count: number }>(sql, values);
 
     return rows[0].count;
@@ -86,9 +86,10 @@ const countOf = async (client: PoolClient, sql: string, values: unknown[] = []):
 // progress (409), the user's builds of the last 24 hours (429), everybody's builds of the last 24 hours (429) and the
 // queue (503). The documents a user may keep is the upload's own cap and is checked before these. Called with both locks held
 // (lockUserBuildsService, then lockIndexingQueueService), so the counts are not out of date by the time the build is
-// inserted. Counts the queued and the indexing builds of the user, whichever document they belong to; the builds of the day
+// inserted; called with the pool and no lock, it is a quick refusal that is only a guess (see createDocumentIndexService).
+// Counts the queued and the indexing builds of the user, whichever document they belong to; the builds of the day
 // come from index_build_usage, which a deleted index or document does not give back.
-export const assertBuildCapacityService = async (client: PoolClient, userId: string): Promise<void> => {
+export const assertBuildCapacityService = async (client: Queryable, userId: string): Promise<void> => {
     const active = await countOf(
         client,
         `SELECT count(*)::int AS count FROM document_indexes di JOIN documents d ON d.id = di.document_id
@@ -142,14 +143,6 @@ export const insertQueuedIndexService = async (client: PoolClient, userId: strin
     await recordBuildUsage(client, userId);
 
     return indexId;
-};
-
-// Checks the caps and then queues an index of the document: the whole of a build that is accepted. The caller holds the
-// locks (see assertBuildCapacityService) and is inside the transaction that made or found the document.
-export const queueIndexBuildService = async (client: PoolClient, userId: string, documentId: string, build: IndexBuild): Promise<string> => {
-    await assertBuildCapacityService(client, userId);
-
-    return insertQueuedIndexService(client, userId, documentId, build);
 };
 
 const readIndex = async (queryable: Queryable, indexId: string): Promise<DocumentIndex> => {
@@ -228,6 +221,11 @@ export const createDocumentIndexService = async (userId: string, documentId: str
     if (existing && existing.status !== "failed") {
         return { index: await readIndex(pool, existing.id), created: false };
     }
+
+    // A request that is going to be refused for a cap does not pay for reading and cutting a text that may be a million
+    // characters: the caps are looked at first, without a lock. Only a guess (another request may take the last place a
+    // moment later), so they are checked again under the locks below, which is what decides.
+    await assertBuildCapacityService(pool, userId);
 
     // cut before the transaction, so the locks are not held while a long text is chunked; a failed index already has its chunks
     const chunks = existing ? null : await chunkDocument(pool, userId, documentId, chunkSize);

@@ -5,6 +5,9 @@
 // changing the embedding model for one with other dimensions needs a migration
 export const EMBEDDING_DIMENSIONS = 1024;
 
+// the largest number a float4 holds (the type pgvector stores each dimension in); a vector with a larger one cannot be stored
+export const FLOAT4_MAX = 3.4028234663852886e38;
+
 // chunks sent to the embedding model in one request; each answer is stored before the next batch starts, so a
 // stopped build keeps what it embedded
 export const EMBEDDING_BATCH_SIZE = 10;

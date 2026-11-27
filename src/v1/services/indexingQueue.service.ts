@@ -1,6 +1,7 @@
 import { pool } from "../config/db.config.js";
 import { INDEXING_POLL_INTERVAL_MS, STUCK_INDEX_BUILD_SECONDS } from "../config/indexing.config.js";
 import type { ClaimedIndex } from "../types/documentIndexes.type.js";
+import { describeError } from "../utils/describeError.util.js";
 import { runIndexBuildService } from "./indexing.service.js";
 
 // The indexing queue: the rows of document_indexes with the status "queued" are the line, and one worker builds one index at
@@ -24,16 +25,25 @@ let running: RunningBuild | null = null;
 let draining: Promise<void> | null = null;
 let stopRequested = false;
 let workerStarted = false;
+// Set by every call to notifyIndexQueuedService, whether or not a run is going on. The loop clears it before it looks at the
+// queue and reads it before it goes idle, so an index queued while the loop was finishing its last, empty look is not left
+// waiting for the poll.
+let wakeRequested = false;
 let pollTimer: NodeJS.Timeout | null = null;
 
-// Takes the index that has waited longest and marks it as indexing. SKIP LOCKED keeps two workers (if there ever were two)
-// from taking the same index. The owner is read in the same statement, for the events.
+// Takes the index that has waited longest, among those of active users, and marks it as indexing. An account that was
+// disabled while its indexes waited does not use the model server's time: its indexes stay queued and unchanged, and the
+// worker builds them once the account is active again. SKIP LOCKED keeps two workers (if there ever were two) from taking the
+// same index. The owner is read in the same statement, for the events.
 const claimNextIndex = async (): Promise<ClaimedIndex | null> => {
     const { rows } = await pool.query<ClaimedIndex>(
         `UPDATE document_indexes SET status = 'indexing', started_at = now()
          WHERE id = (
-             SELECT id FROM document_indexes WHERE status = 'queued'
-             ORDER BY queued_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+             SELECT di.id FROM document_indexes di
+             JOIN documents d ON d.id = di.document_id
+             JOIN users u ON u.id = d.user_id
+             WHERE di.status = 'queued' AND u.status = 'active'
+             ORDER BY di.queued_at, di.id LIMIT 1 FOR UPDATE OF di SKIP LOCKED
          )
          RETURNING id, document_id AS "documentId",
                    (SELECT user_id FROM documents WHERE documents.id = document_indexes.document_id) AS "userId",
@@ -61,9 +71,18 @@ export const processQueuedIndexesService = async (): Promise<void> => {
                 running = slot;
 
                 try {
+                    // a wake that comes from here on is about an index that the claim below may not have seen
+                    wakeRequested = false;
+
                     const claimed = await claimNextIndex();
 
                     if (!claimed) {
+                        // an index was queued while the queue was being looked at: look again. Nothing is awaited between
+                        // this check and the end of the run, so a wake that comes after it starts a new run.
+                        if (wakeRequested) {
+                            continue;
+                        }
+
                         return;
                     }
 
@@ -93,13 +112,15 @@ const runQueueInBackground = async (): Promise<void> => {
     try {
         await processQueuedIndexesService();
     } catch (error) {
-        console.error(`The indexing queue stopped: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`The indexing queue stopped: ${describeError(error)}`);
     }
 };
 
 // Called after an index was queued. An idle worker takes it at once; while it is busy, or before server.ts starts the
 // worker, the index waits. Tests and scripts that import the app never start indexing on their own.
 export const notifyIndexQueuedService = (): void => {
+    wakeRequested = true;
+
     if (workerStarted && !draining) {
         void runQueueInBackground();
     }
@@ -143,7 +164,7 @@ const pollQueue = async (): Promise<void> => {
             console.log(`Requeued ${requeued} stuck index build(s)`);
         }
     } catch (error) {
-        console.error(`Could not look for stuck index builds: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`Could not look for stuck index builds: ${describeError(error)}`);
     }
 
     notifyIndexQueuedService();

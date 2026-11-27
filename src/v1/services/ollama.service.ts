@@ -1,7 +1,7 @@
-import { EMBEDDING_DIMENSIONS } from "../config/indexing.config.js";
+import { EMBEDDING_DIMENSIONS, FLOAT4_MAX } from "../config/indexing.config.js";
 import { OLLAMA_BASE_URL } from "../config/ollama.config.js";
-import { AppError } from "../utils/appError.util.js";
 import { MalformedModelAnswerError } from "../utils/malformedModelAnswerError.util.js";
+import { ModelTimeoutError } from "../utils/modelTimeoutError.util.js";
 import { ModelUnavailableError } from "../utils/modelUnavailableError.util.js";
 import { RequestCancelledError } from "../utils/requestCancelledError.util.js";
 
@@ -35,9 +35,10 @@ const isModelList = (value: unknown): value is { models: { name: string }[] } =>
 
 // Sends one request to Ollama and returns its JSON body. Expected failures are errors with messages that are safe to
 // show: RequestCancelledError when the caller's signal aborted (also one that was aborted before the call, which sends
-// nothing), ModelUnavailableError (503) when Ollama cannot be reached (the caller may retry later), 504 when it does not
-// answer in time. A non-OK answer is a plain Error: it means a model or version mismatch that retrying will not fix, and
-// a body that is not JSON is a MalformedModelAnswerError, which is a plain Error too.
+// nothing), ModelUnavailableError (503) when Ollama cannot be reached or its answer is cut in the middle of the body (the
+// caller may retry later), ModelTimeoutError (504) when it does not answer in time. A non-OK answer is a plain Error: it
+// means a model or version mismatch that retrying will not fix, and a body that arrives whole and is not JSON is a
+// MalformedModelAnswerError, which is a plain Error too.
 const requestOllama = async ({ method, path, body }: OllamaRequest, { timeoutMs, signal }: RequestOptions): Promise<unknown> => {
     if (signal?.aborted) {
         throw new RequestCancelledError();
@@ -65,12 +66,18 @@ const requestOllama = async ({ method, path, body }: OllamaRequest, { timeoutMs,
         try {
             return await response.json();
         } catch (error) {
-            // a read cut short by the timeout or the caller is handled below; a body that is not JSON is not
+            // a read cut short by the timeout or the caller is handled below
             if (signal?.aborted || timeout.aborted) {
                 throw error;
             }
 
-            throw new MalformedModelAnswerError("Ollama answered with a body that is not JSON");
+            // only a body that arrived whole and is not JSON is an answer that is wrong; a body that could not be read to
+            // its end (the connection closed in the middle) is the connection failing, like one that never opened
+            if (error instanceof SyntaxError) {
+                throw new MalformedModelAnswerError("Ollama answered with a body that is not JSON");
+            }
+
+            throw new ModelUnavailableError();
         }
     } catch (error) {
         if (signal?.aborted) {
@@ -78,7 +85,7 @@ const requestOllama = async ({ method, path, body }: OllamaRequest, { timeoutMs,
         }
 
         if (timeout.aborted) {
-            throw new AppError(504, "The model server did not answer in time");
+            throw new ModelTimeoutError();
         }
 
         // fetch rejects with a TypeError when the connection fails; anything else is not a connection problem
@@ -105,7 +112,9 @@ export const listInstalledModelsService = async (options: RequestOptions): Promi
 const isVector = (value: unknown): value is number[] =>
     Array.isArray(value)
     && value.length === EMBEDDING_DIMENSIONS
-    && value.every((item: unknown) => typeof item === "number" && Number.isFinite(item))
+    // pgvector stores float4: a number beyond its range (Infinity included) would be refused by the database, which is the
+    // model's fault and not the database's
+    && value.every((item: unknown) => typeof item === "number" && Number.isFinite(item) && Math.abs(item) <= FLOAT4_MAX)
     // a vector of zeros has no direction: cosine similarity with it is undefined, and it means the model failed
     && value.some((item: number) => item !== 0);
 
