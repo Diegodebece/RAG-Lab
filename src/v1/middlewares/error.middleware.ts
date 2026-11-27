@@ -13,7 +13,7 @@ const getClientErrorStatus = (err: unknown): number | null =>
 
 const isExposed = (err: unknown): boolean => err instanceof Error && "expose" in err && err.expose === true;
 
-export const errorMiddleware =(err: unknown, req: Request, res: Response, next: NextFunction) => {
+export const errorMiddleware = (err: unknown, req: Request, res: Response, next: NextFunction) => {
     // Part of the response is already out (for example a stream): another status or body cannot be sent.
     // Express default handler closes the connection instead.
     if (res.headersSent) {
