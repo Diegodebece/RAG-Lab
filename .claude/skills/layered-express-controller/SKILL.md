@@ -22,6 +22,8 @@ description: How to write Express controllers. Use when creating or editing any 
 
 [templates/requireUserId.util.ts](templates/requireUserId.util.ts) — goes in `utils/`
 
+[templates/documentIndexes.controller.ts](templates/documentIndexes.controller.ts) — a 202 for accepted background work and a 200 for "ensure" semantics, with the params of a nested route
+
 ## 4. Rules
 
 - Signature is always `export const name = async (req: Request, res: Response, next: NextFunction) => { ... };`, with `import type { Request, Response, NextFunction } from "express";`. Let TypeScript infer the return type.
@@ -35,6 +37,7 @@ description: How to write Express controllers. Use when creating or editing any 
 - A streaming endpoint (Server-Sent Events) is the one exception to the JSON response: it checks what can refuse the request (limits) before sending the headers, so a refusal gets the usual error body; then sets `text/event-stream`, calls `res.flushHeaders()`, writes messages over time, and cleans up its timers and subscriptions in `res.on("close")`. Errors after the headers are handled by `errorMiddleware`'s `res.headersSent` check.
 - Always `return res.status(<code>).json({ success: true, message, data })`:
   - 200 for get/update/delete, 201 for create.
+  - 202 when the request was accepted and the work finishes later, such as a document whose index is built in the background: the body is the thing as it is now (its `status` says how far the work is) and the client polls it. A create route with "ensure" semantics answers 202 when the service says it queued something (`created: true`) and 200 when the thing was already there (`created: false`), with its own message each ("Index queued for building", "Index already exists"). The controller picks the status from what the service returned; the service never knows about HTTP.
   - `message` is a short English sentence: "Product created successfully".
   - `delete` responds without `data`.
   - Extra top-level fields (e.g. `token` for login and a password change, with the user in `data`) only when the client needs them outside `data`.

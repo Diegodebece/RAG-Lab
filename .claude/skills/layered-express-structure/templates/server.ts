@@ -6,6 +6,8 @@ import { HOST, PORT } from "./v1/config/server.config.js";
 import { getConfigurationProblemsService } from "./v1/services/configuration.service.js";
 import { setDatabaseReadyService } from "./v1/services/databaseReadiness.service.js";
 import { getDatabaseRoleProblemsService } from "./v1/services/databaseRole.service.js";
+import { subscribeToEvents } from "./v1/services/events.service.js";
+import { recoverIndexBuildsService, startIndexingWorkerService, stopIndexingWorkerService } from "./v1/services/indexingQueue.service.js";
 import { getMigrationStateService } from "./v1/services/schema.service.js";
 import { isDatabaseUnreachableError } from "./v1/utils/databaseError.util.js";
 
@@ -105,6 +107,41 @@ const checkDatabase = async (): Promise<boolean> => {
     }
 };
 
+// The indexing worker needs the database like every route does, so it starts only once the check has passed (at once, or
+// from the retry below). An index that was being built when the last server stopped goes back to the queue first, keeping
+// its vectors, so the worker finishes it. A recovery that fails does not keep the worker from starting: the worker also
+// puts back builds that stay in "indexing" for over a minute.
+const startIndexing = async (): Promise<void> => {
+    if (stopping) {
+        return;
+    }
+
+    try {
+        const recovered = await recoverIndexBuildsService();
+
+        if (recovered > 0) {
+            console.log(`Queued ${recovered} index build(s) that a stopped server left running`);
+        }
+    } catch (error) {
+        console.error(`Could not queue the interrupted index builds again: ${describeError(error)}`);
+    }
+
+    if (!stopping) {
+        startIndexingWorkerService();
+    }
+};
+
+// What happens to indexes goes to the log by index id and message: never the text of a document or a chunk.
+subscribeToEvents((event) => {
+    if (event.type === "progress") {
+        console.log(`Index ${event.indexId}: ${event.embeddedCount} of ${event.chunkCount} chunks embedded`);
+    } else if (event.type === "failed") {
+        console.log(`Index ${event.indexId}: failed (${event.error})`);
+    } else {
+        console.log(`Index ${event.indexId}: ${event.type}`);
+    }
+});
+
 // Repeats the check until it passes, then lets the routes through. The next check starts DATABASE_RETRY_INTERVAL_MS
 // after the last one ended, so two never overlap. The timer does not keep the process alive, and shutDown stops it.
 const retryDatabaseCheck = (): void => {
@@ -114,6 +151,7 @@ const retryDatabaseCheck = (): void => {
         if (await checkDatabase()) {
             setDatabaseReadyService(true);
             console.log("The database answers and passed the check: the API serves requests");
+            await startIndexing();
             return;
         }
 
@@ -130,6 +168,8 @@ if (!(await checkDatabase())) {
     setDatabaseReadyService(false);
     console.warn("Warning: the database cannot be reached; the API starts and GET /v1/health reports it as down. The role and the migrations are checked again until the database answers; until then the other routes answer 503");
     retryDatabaseCheck();
+} else {
+    await startIndexing();
 }
 
 // Express 5 calls the callback with the error when listening fails (the port is in use, for example), so
@@ -143,15 +183,33 @@ const server = app.listen(PORT, HOST, (error?: Error) => {
     console.log(`Server running on http://${HOST}:${PORT}`);
 });
 
-// On docker stop (SIGTERM) or Ctrl+C (SIGINT): stop the background check, let the requests in progress finish, then
-// close the database. Pass a function that ends long-lived responses (event streams), if the API has any.
+// On docker stop (SIGTERM) or Ctrl+C (SIGINT): stop the background check and the indexing worker (the request it has in
+// flight is aborted and its index goes back to the queue, to be continued at the next start), let the requests in progress
+// finish, then close the database. There are no streams yet. Stopping the worker is part of the same budget of
+// SHUTDOWN_TIMEOUT_MS as waiting for the requests: it gets what is left of it, so a worker stuck on a frozen database
+// cannot take the time of the pool's close.
 const shutDown = async (signal: string): Promise<void> => {
     console.log(`${signal} received: finishing the requests in progress`);
     stopping = true;
     clearTimeout(retryTimer);
 
     try {
-        await closeServerGracefully(server, () => {}, SHUTDOWN_TIMEOUT_MS);
+        const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+        let workerTimer: NodeJS.Timeout | undefined;
+
+        try {
+            await Promise.race([
+                stopIndexingWorkerService(),
+                new Promise<void>((resolve) => {
+                    workerTimer = setTimeout(resolve, SHUTDOWN_TIMEOUT_MS);
+                })
+            ]);
+        } finally {
+            clearTimeout(workerTimer);
+        }
+
+        // pass a function that ends long-lived responses (event streams) instead of the empty one, if the API has any
+        await closeServerGracefully(server, () => {}, Math.max(deadline - Date.now(), 0));
         await closePoolGracefully(pool, POOL_CLOSE_TIMEOUT_MS);
         console.log("Server stopped");
         process.exit(0);

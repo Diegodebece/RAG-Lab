@@ -19,7 +19,7 @@ description: How to write Express middlewares, including the core set every proj
 
 Core set, copy into every new project:
 
-- [templates/error.middleware.ts](templates/error.middleware.ts) — the only place that writes error responses
+- [templates/error.middleware.ts](templates/error.middleware.ts) — the only place that writes error responses; logs with `describeError` (template in `layered-express-service`, goes in `utils/`)
 - [templates/notFound.middleware.ts](templates/notFound.middleware.ts)
 - [templates/validateBody.middleware.ts](templates/validateBody.middleware.ts)
 - [templates/authenticate.middleware.ts](templates/authenticate.middleware.ts) — token only, sets `req.decoded`; needs the files below
@@ -49,7 +49,7 @@ When the project needs request limits:
 - Async middlewares wrap their body in `try/catch → next(error)`, same as controllers.
 - `errorMiddleware` answers library errors that carry a 4xx `status` (malformed JSON from body-parser, a path parameter the router cannot decode) with that status, and shows their message only when the library sets `expose`; otherwise the message is a generic "Invalid request". They are client mistakes: never logged as server errors, never a 500.
 - `errorMiddleware` first checks `res.headersSent`: when part of the response is already out (a stream), it calls `next(err)` and lets Express close the connection instead of sending a second response.
-- `errorMiddleware` keeps the 4-argument signature `(err: unknown, req: Request, res: Response, next: NextFunction)`, is registered last, logs unexpected errors and never leaks their message (generic 500). It narrows `err` with `instanceof AppError` or a type guard, never with `any`.
+- `errorMiddleware` keeps the 4-argument signature `(err: unknown, req: Request, res: Response, next: NextFunction)`, is registered last, logs unexpected errors as `describeError(err)` (name, code and message) and never as the whole object, and never leaks their message (generic 500). A database error carries the failing row, the statement and its parameters, and any of them can hold the text of a document or a secret; `console.error(err)` would write them to the log. It narrows `err` with `instanceof AppError` or a type guard, never with `any`.
 - `authenticateMiddleware` reads `Authorization: Bearer <token>` with one pattern (`/^bearer (\S+)$/i`): the scheme name is case-insensitive (RFC 9110), and anything after the token, an empty token or a second space makes the header invalid (401 "Authentication token is missing").
 - Required config (e.g. `SECRET_KEY`, read through `getSecretKey()` from `config/auth.config.ts`) is checked before use; if it is missing, call `next(new Error("<NAME> is not set"))` so `errorMiddleware` answers 500. Do not cast it with `as string`.
 - `validateBodyMiddleware` validates `req.body ?? {}`: Express 5 leaves `req.body` undefined for a request without a body, and Joi accepts undefined for an object schema.
