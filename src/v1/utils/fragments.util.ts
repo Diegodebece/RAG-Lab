@@ -19,7 +19,7 @@ const neighborPositionsOf = (chunkIndex: number, window: number): number[] => {
 
 // Chunk positions within `window` of each match that are not matches themselves, once each, in the order of their first
 // appearance. Positions past the end of the document are not filtered here; looking them up simply finds nothing.
-export const getNeighborIndexes = (matches: ScoredChunk[], window: number): number[] => {
+export const getNeighborIndexes = (matches: Pick<ChunkText, "chunkIndex">[], window: number): number[] => {
     const matchIndexes = new Set(matches.map((match) => match.chunkIndex));
     const neighborIndexes = new Set<number>();
 
