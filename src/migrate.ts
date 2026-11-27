@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Pool } from "pg";
 import { createPool, runInTransaction } from "./v1/config/pool.config.js";
 import { getMigrationStateService, MIGRATIONS_DIR } from "./v1/services/schema.service.js";
+import { describeError } from "./v1/utils/describeError.util.js";
 
 // Any number works; it only has to be the same for every process that runs migrations.
 const MIGRATIONS_LOCK_ID = 72617001;
@@ -95,7 +96,10 @@ if (!migrationUrl) {
     try {
         await migrate(migrationPool);
     } catch (error) {
-        console.error(error);
+        // a failed migration wraps the database's error as its cause: both are written as name, code and message, never as
+        // the objects, because the detail of a database error can carry the rows a data migration was reading
+        const cause = error instanceof Error && error.cause !== undefined ? ` (${describeError(error.cause)})` : "";
+        console.error(`${describeError(error)}${cause}`);
         process.exitCode = 1;
     } finally {
         await migrationPool.end();
