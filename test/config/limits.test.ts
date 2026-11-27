@@ -95,6 +95,49 @@ const ACCOUNT_LIMITS: [name: string, defaultValue: number][] = [
     ["MAX_INDEX_BUILDS_PER_DAY_TOTAL", 100]
 ];
 
+// The limits of questions (layer 5), with the same three checks as the limits above: the default, a custom value that changes only its
+// own setting, and a value that stops the app at startup. They are in a list of their own so that the tests above do not depend on them.
+const QUESTION_LIMITS: [name: string, defaultValue: number][] = [
+    ["QUESTIONS_PER_MINUTE", 10],
+    ["MAX_QUESTIONS_PER_DAY", 30],
+    ["MAX_QUESTION_SECONDS", 60],
+    ["MAX_WAITING_QUESTIONS", 20]
+];
+
+describe("the limits of questions", () => {
+    it("have the agreed defaults when the settings are not set", { timeout: 30_000 }, async () => {
+        const loaded = await loadLimits(Object.fromEntries(QUESTION_LIMITS.map(([name]) => [name, undefined])));
+
+        assert.equal(loaded.code, 0, loaded.stderr);
+        assert.deepEqual(
+            Object.fromEntries(QUESTION_LIMITS.map(([name]) => [name, JSON.parse(loaded.stdout)[name]])),
+            Object.fromEntries(QUESTION_LIMITS)
+        );
+    });
+
+    for (const [name] of QUESTION_LIMITS) {
+        it(`${name} takes a custom value, and only that setting changes`, { timeout: 30_000 }, async () => {
+            const loaded = await loadLimits({ ...Object.fromEntries(QUESTION_LIMITS.map(([other]) => [other, undefined])), [name]: "7" });
+
+            assert.equal(loaded.code, 0, loaded.stderr);
+
+            for (const [other, defaultValue] of QUESTION_LIMITS) {
+                assert.equal(JSON.parse(loaded.stdout)[other], other === name ? 7 : defaultValue, other);
+            }
+        });
+
+        it(`${name} stops the app at startup on zero or a malformed value, instead of switching the limit off`, { timeout: 60_000 }, async () => {
+            for (const value of ["0", "-1", "1e3", "0x10", "5.5", "ten"]) {
+                const loaded = await loadLimits({ [name]: value });
+
+                assert.notEqual(loaded.code, 0, `${value}: it loaded`);
+                assert.match(loaded.stderr, new RegExp(`${name} must be a whole number`), value);
+                assert.equal(loaded.stdout, "", `${value}: nothing was used`);
+            }
+        });
+    }
+});
+
 describe("the limits of the account routes", () => {
     it("have the agreed defaults when the settings are not set", { timeout: 30_000 }, async () => {
         const loaded = await loadLimits(Object.fromEntries(ACCOUNT_LIMITS.map(([name]) => [name, undefined])));
@@ -166,10 +209,15 @@ const DOCUMENT_LIMIT_RANGES: [name: string, max: number][] = [
     ["MAX_ACTIVE_INDEX_BUILDS_PER_USER", 100],
     ["MAX_QUEUED_INDEX_BUILDS", 1000],
     ["MAX_INDEX_BUILDS_PER_DAY", 1000],
-    ["MAX_INDEX_BUILDS_PER_DAY_TOTAL", 10_000]
+    ["MAX_INDEX_BUILDS_PER_DAY_TOTAL", 10_000],
+    // questions (layer 5): MAX_QUESTION_SECONDS tops at 90 because Cloudflare cuts a response at 100 seconds
+    ["QUESTIONS_PER_MINUTE", 1000],
+    ["MAX_QUESTIONS_PER_DAY", 100_000],
+    ["MAX_QUESTION_SECONDS", 90],
+    ["MAX_WAITING_QUESTIONS", 1000]
 ];
 
-describe("the ranges of the limits on documents and indexes", () => {
+describe("the ranges of the limits on documents, indexes and questions", () => {
     for (const [name, max] of DOCUMENT_LIMIT_RANGES) {
         it(`${name} accepts 1 and ${max}, the ends of its range`, { timeout: 30_000 }, async () => {
             for (const value of ["1", String(max)]) {
@@ -225,6 +273,26 @@ describe("DOCUMENT_BODY_LIMIT", () => {
 
         assert.equal(loaded.code, 0, loaded.stderr);
         assert.equal(JSON.parse(loaded.stdout).DOCUMENT_BODY_LIMIT, 60_000 + 16384);
+    });
+});
+
+// The two constants of questions that are not settings: the window of the per-minute counter, and the longest question (RAG Web's
+// MAX_QUESTION_CHARS). An environment variable of the same name changes nothing.
+describe("the constants of questions", () => {
+    it("QUESTION_WINDOW_MS is one minute and QUESTION_MAX_CHARACTERS is 1000", { timeout: 30_000 }, async () => {
+        const loaded = await loadLimits({});
+
+        assert.equal(loaded.code, 0, loaded.stderr);
+        assert.equal(JSON.parse(loaded.stdout).QUESTION_WINDOW_MS, 60_000);
+        assert.equal(JSON.parse(loaded.stdout).QUESTION_MAX_CHARACTERS, 1000);
+    });
+
+    it("are not settings: a QUESTION_WINDOW_MS or QUESTION_MAX_CHARACTERS in the environment changes nothing", { timeout: 30_000 }, async () => {
+        const loaded = await loadLimits({ QUESTION_WINDOW_MS: "5", QUESTION_MAX_CHARACTERS: "5" });
+
+        assert.equal(loaded.code, 0, loaded.stderr);
+        assert.equal(JSON.parse(loaded.stdout).QUESTION_WINDOW_MS, 60_000);
+        assert.equal(JSON.parse(loaded.stdout).QUESTION_MAX_CHARACTERS, 1000);
     });
 });
 

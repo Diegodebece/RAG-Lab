@@ -607,6 +607,88 @@ describe("POST /v1/documents/:id/indexes: the limits", () => {
     });
 });
 
+// The queue cap (MAX_QUEUED_INDEX_BUILDS, 6 here) bounds the wait for the model server, and the builds of a disabled user use none of
+// it: the worker skips them until the account is active again. Counting them would keep their places for ever (an admin cannot delete
+// another user's documents), and their place in the line would overstate the wait of everyone behind them (decision D9 of layer 5).
+describe("POST /v1/documents/:id/indexes: the queued builds of a disabled user", () => {
+    // 6 queued builds of a disabled user, each on a document of its own
+    const queueOfDisabledUser = async (): Promise<{ id: string }> => {
+        const dora = await createTestUser({ email: "dora@example.com", status: "disabled" });
+
+        for (let index = 0; index < 6; index++) {
+            await seedIndex((await seedLongDocument(dora.id, `dora ${index}`)).id, { status: "queued" });
+        }
+
+        return dora;
+    };
+
+    it("does not count them toward the queue: six queued builds of a disabled user do not fill a queue of six", { timeout: 30_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedLongDocument(ana.id);
+        await queueOfDisabledUser();
+
+        const response = await build(ana.auth, document.id, { chunkSize: 500 });
+
+        assert.equal(response.status, 202, JSON.stringify(response.body));
+        assert.equal(response.body.data.status, "queued");
+    });
+
+    it("still counts the queued builds of active users: the same six, from an active user, fill the queue", { timeout: 30_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedLongDocument(ana.id);
+        const dora = await createTestUser({ email: "dora@example.com" });
+
+        for (let index = 0; index < 6; index++) {
+            await seedIndex((await seedLongDocument(dora.id, `dora ${index}`)).id, { status: "queued" });
+        }
+
+        const response = await build(ana.auth, document.id, { chunkSize: 500 });
+
+        assert.equal(response.status, 503);
+        assert.deepEqual(response.body, QUEUE_FULL);
+    });
+
+    it("leaves them out of the queue position: the place of an index is counted over the builds of active users only", { timeout: 30_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const bob = await createTestUser({ email: "bob@example.com" });
+        const dora = await createTestUser({ email: "dora@example.com", status: "disabled" });
+        const anas = await seedLongDocument(ana.id);
+        const now = Date.now();
+        const at = (secondsAgo: number): Date => new Date(now - secondsAgo * 1000);
+
+        await seedIndex((await seedLongDocument(dora.id)).id, { status: "queued", queuedAt: at(60) });
+        const anasIndex = await seedIndex(anas.id, { chunkSize: 500, queuedAt: at(30) });
+
+        assert.equal((await getIndex(ana.auth, anas.id, anasIndex.id)).body.data.queuePosition, 1, "only the disabled user's build is ahead, and it does not count");
+
+        await seedIndex((await seedLongDocument(bob.id)).id, { status: "queued", queuedAt: at(50) });
+
+        assert.equal((await getIndex(ana.auth, anas.id, anasIndex.id)).body.data.queuePosition, 2, "an active user's build ahead does");
+    });
+
+    // The trade-off, written down: when the account is enabled again its builds count again at once, and the cap may be over until
+    // the queue drains (by at most the active builds that user may have, one by default).
+    it("counts them again when the user is enabled again, so the next build is refused with 503 until the queue drains", { timeout: 40_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const cara = await createTestUser({ email: "cara@example.com" });
+        const anas = await seedLongDocument(ana.id);
+        const caras = await seedLongDocument(cara.id);
+        const dora = await queueOfDisabledUser();
+
+        assert.equal((await build(ana.auth, anas.id, { chunkSize: 500 })).status, 202, "while she is disabled, her builds are not in the way");
+
+        await ownerPool.query("UPDATE users SET status = 'active' WHERE id = $1", [dora.id]);
+
+        const refused = await build(cara.auth, caras.id, { chunkSize: 500 });
+        assert.equal(refused.status, 503, "six of hers and one of ana's make the queue over its cap");
+        assert.deepEqual(refused.body, QUEUE_FULL);
+
+        await ownerPool.query("UPDATE document_indexes SET status = 'ready', embedded_count = chunk_count WHERE status = 'queued'");
+
+        assert.equal((await build(cara.auth, caras.id, { chunkSize: 500 })).status, 202, "the queue drained");
+    });
+});
+
 // The text of a document can be a million characters, and cutting it takes the server's time: a request that is going to be
 // refused for a cap must not pay for it. There is no way to spy on the function that cuts the text (an ES module's export
 // cannot be replaced), so the test watches the one thing that comes before it: the API's own pool reading the text column of

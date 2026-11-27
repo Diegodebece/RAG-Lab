@@ -1,6 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { cutResponse, dropConnection, embeddings, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, modelList, neverAnswer, redirectTo, startFakeOllama, waitForRequests } from "./fakeOllama.js";
+import { cutResponse, dropConnection, embeddings, embeddingsFor, fakeTokenCount, fakeVectorFor, holdRequest, httpError, jsonBody, malformedBody, modelList, neverAnswer, padVector, redirectTo, startFakeOllama, waitForRequests } from "./fakeOllama.js";
 
 // The double itself: every other test that uses it trusts these behaviors.
 const fake = await startFakeOllama();
@@ -19,6 +19,15 @@ describe("fake Ollama", () => {
         assert.equal(response.status, 200);
         assert.deepEqual(await response.json(), { models: [{ name: "a:1" }, { name: "b:2" }] });
         assert.deepEqual(fake.requests.at(-1), { method: "GET", path: "/api/tags", body: null });
+    });
+
+    it("modelList() reports a digest for a model given with one, and none for a model given as a plain name", { timeout: 5000 }, async () => {
+        fake.respond("/api/tags", modelList([{ name: "a:1", digest: "sha256:abc" }, "b:2", { name: "c:3" }]));
+
+        const answer = await (await fetch(`${fake.url}/api/tags`)).json();
+
+        assert.deepEqual(answer, { models: [{ name: "a:1", digest: "sha256:abc" }, { name: "b:2" }, { name: "c:3" }] });
+        assert.equal(Object.hasOwn((answer as { models: object[] }).models[1], "digest"), false, "no digest key at all, not an undefined one");
     });
 
     it("answers a path nobody set up with a 404", { timeout: 5000 }, async () => {
@@ -144,6 +153,40 @@ describe("fake Ollama: the embed endpoint", () => {
 
         assert.deepEqual(answer.embeddings.map((vector) => vector[0]), [1e39, 1e39]);
         assert.deepEqual(answer.embeddings[0].slice(1), fakeVectorFor("a").slice(1), "the rest of the vector is the usual one");
+    });
+
+    it("padVector() fills a vector with zeros up to 1024 numbers, or up to the dimensions asked for, and refuses one that does not fit", () => {
+        const padded = padVector([3, 4]);
+
+        assert.equal(padded.length, 1024);
+        assert.deepEqual(padded.slice(0, 4), [3, 4, 0, 0]);
+        assert.ok(padded.slice(2).every((value) => value === 0));
+        assert.deepEqual(padVector([1], 3), [1, 0, 0]);
+        assert.throws(() => padVector([1, 2, 3, 4], 3));
+    });
+
+    it("embeddingsFor() answers the mapped vector, padded with zeros, for a text that is a key, and the usual vector for any other text", { timeout: 5000 }, async () => {
+        fake.respond("/api/embed", embeddingsFor({ "the question": [1, 0], "a chunk": [3, 4] }));
+
+        const response = await embed({ model: "m:1", input: ["the question", "a chunk", "something else"], truncate: false });
+        const answer = await response.json() as { embeddings: number[][]; prompt_eval_count: number };
+
+        assert.equal(response.status, 200);
+        assert.deepEqual(answer.embeddings[0], padVector([1, 0]));
+        assert.deepEqual(answer.embeddings[1], padVector([3, 4]));
+        assert.deepEqual(answer.embeddings[2], fakeVectorFor("something else"));
+        assert.equal(answer.prompt_eval_count, fakeTokenCount("the question") + fakeTokenCount("a chunk") + fakeTokenCount("something else"), "the token count is the usual one");
+    });
+
+    it("embeddingsFor() keeps the other options, such as the dimensions asked for and the code that runs before the answer", { timeout: 5000 }, async () => {
+        let seen: string[] = [];
+        fake.respond("/api/embed", embeddingsFor({ x: [5, 6] }, { dimensions: 4, beforeAnswer: (input) => { seen = input; } }));
+
+        const answer = await (await embed({ model: "m:1", input: ["x", "y"] })).json() as { embeddings: number[][] };
+
+        assert.deepEqual(answer.embeddings[0], [5, 6, 0, 0]);
+        assert.equal(answer.embeddings[1].length, 4);
+        assert.deepEqual(seen, ["x", "y"]);
     });
 
     it("embeddings() answers 400 when the body has no list of inputs", { timeout: 5000 }, async () => {

@@ -32,10 +32,10 @@ const publicTables = async (): Promise<string[]> => {
 
 const ALL_MIGRATIONS = [
     "001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql",
-    "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql"
+    "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql", "009_runs.sql"
 ];
 
-const ALL_TABLES = ["chunks", "default_profile", "document_indexes", "documents", "index_build_usage", "profiles", "schema_migrations", "users"];
+const ALL_TABLES = ["chunks", "default_profile", "document_indexes", "documents", "index_build_usage", "profiles", "runs", "schema_migrations", "users"];
 
 // closes both pools once, after every suite in this file
 after(closeTestPools);
@@ -54,6 +54,7 @@ describe("migrate script", () => {
         assert.match(output, /Applied 006_documents\.sql/);
         assert.match(output, /Applied 007_document_indexes\.sql/);
         assert.match(output, /Applied 008_index_build_usage\.sql/);
+        assert.match(output, /Applied 009_runs\.sql/);
 
         const { rows } = await ownerPool.query<{ table_name: string }>(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"

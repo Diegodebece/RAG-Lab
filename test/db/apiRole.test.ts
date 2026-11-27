@@ -81,6 +81,11 @@ const FIXED_INDEX_COLUMNS = ["chunk_count", "chunk_size", "created_at", "documen
 const DOCUMENT_COLUMNS = ["character_count", "content_hash", "created_at", "filename", "id", "text", "user_id"];
 const CHUNK_COLUMNS = ["chunk_index", "embedding", "index_id", "text"];
 const USAGE_COLUMNS = ["accepted_at", "id", "user_id"];
+// The table of layer 5: a run is written once, by the search, and never changed or given back. The columns, in alphabetical order.
+const RUN_COLUMNS = [
+    "configuration", "configuration_hash", "created_at", "document_id", "embedding_ms", "embedding_tokens", "fragments", "id", "index_id", "kind",
+    "profile_id", "question_characters", "question_hash", "retrieval_ms", "status", "total_ms", "user_id", "wait_ms"
+];
 
 // the columns of a table the API role may update, in alphabetical order, and the columns the table has
 const updatableColumnsOf = async (table: string): Promise<{ all: string[]; updatable: string[] }> => {
@@ -131,10 +136,11 @@ const readProbe = async (probe: DocumentProbe): Promise<unknown[]> => [
     (await ownerPool.query("SELECT * FROM index_build_usage WHERE user_id = $1", [probe.userId])).rows
 ];
 
-const NEW_TABLES = ["documents", "document_indexes", "chunks", "index_build_usage"];
+// the tables of layers 4 and 5, each with rights of its own
+const NEW_TABLES = ["documents", "document_indexes", "chunks", "index_build_usage", "runs"];
 
 const checkTheRights = (): void => {
-    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile, profiles and the four tables of documents and indexes, and nothing more", async () => {
+    it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile, profiles and the tables of documents, indexes and runs, and nothing more", async () => {
         const tables = (await publicTables()).filter((table) => !["schema_migrations", "default_profile", "profiles", ...NEW_TABLES].includes(table));
 
         assert.ok(tables.includes("users"), "the users table is among them");
@@ -266,6 +272,43 @@ const checkTheRights = (): void => {
     it("holds only SELECT and INSERT on index_build_usage, and no UPDATE on any column of it", async () => {
         assert.deepEqual(await privilegesOn("index_build_usage"), ["SELECT", "INSERT"]);
         assert.deepEqual(await updatableColumnsOf("index_build_usage"), { all: USAGE_COLUMNS, updatable: [] });
+    });
+
+    it("holds only SELECT and INSERT on runs, and no UPDATE on any column of it", async () => {
+        assert.deepEqual(await privilegesOn("runs"), ["SELECT", "INSERT"]);
+        assert.deepEqual(await updatableColumnsOf("runs"), { all: RUN_COLUMNS, updatable: [] });
+    });
+
+    it("is refused UPDATE and DELETE on runs (42501), so a question cannot be given back and the day's count cannot be rewritten, and the rows are unchanged", async () => {
+        const { rows: users } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('runs.probe@example.com', 'x') RETURNING id");
+        const userId = users[0].id;
+
+        try {
+            await ownerPool.query(
+                `INSERT INTO runs (user_id, kind, status, configuration, configuration_hash, question_hash, question_characters, fragments, embedding_tokens, wait_ms, embedding_ms, retrieval_ms, total_ms)
+                 VALUES ($1, 'retrieval', 'matched', '{"kind": "retrieval"}'::jsonb, repeat('a', 64), repeat('b', 64), 5, '[]'::jsonb, 1, 0, 0, 0, 0)`,
+                [userId]
+            );
+            const read = async () => (await ownerPool.query("SELECT * FROM runs WHERE user_id = $1", [userId])).rows;
+            const before = await read();
+            const statements: Record<string, string> = {
+                "UPDATE of created_at": `UPDATE runs SET created_at = now() - interval '2 days' WHERE user_id = '${userId}'`,
+                "UPDATE of status": `UPDATE runs SET status = 'no_match' WHERE user_id = '${userId}'`,
+                "UPDATE of user_id": "UPDATE runs SET user_id = user_id",
+                "DELETE of one user's runs": `DELETE FROM runs WHERE user_id = '${userId}'`,
+                "DELETE of every run": "DELETE FROM runs"
+            };
+
+            assert.equal(before.length, 1);
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await read(), before, "the rows are as they were");
+        } finally {
+            await ownerPool.query("DELETE FROM users WHERE id = $1", [userId]);
+        }
     });
 
     it("is refused an UPDATE of any column of documents (42501), the owner included, and the rows are unchanged", async () => {
@@ -582,7 +625,7 @@ describe("the API role", () => {
 
         assert.deepEqual(rows.map((row) => row.version), [
             "001_init.sql", "002_api_role.sql", "003_users.sql", "004_default_profile.sql", "005_profiles.sql",
-            "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql"
+            "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql", "009_runs.sql"
         ]);
     });
 
