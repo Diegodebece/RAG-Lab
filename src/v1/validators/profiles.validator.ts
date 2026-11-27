@@ -18,7 +18,7 @@ export interface UpdateProfileInput {
 // that draw nothing but are none of those: the Hangul fillers (U+3164, U+115F, U+1160, U+FFA0), the combining grapheme
 // joiner (U+034F) and the braille blank (U+2800). The zero-width joiner is a format character, so a joined emoji
 // sequence is refused too (the cost of refusing all of them); a variation selector after an emoji is a mark, and stays.
-const INVISIBLE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}ㅤᅟᅠﾠ͏⠀]/u;
+const INVISIBLE_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u3164\u115F\u1160\uFFA0\u034F\u2800]/u;
 
 // Every space of category Zs (the no-break space, the em space, the ideographic space...) inside a name is a plain
 // space once stored, so "a b" with another kind of space is the same name as "a b".
