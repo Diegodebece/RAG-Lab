@@ -79,6 +79,27 @@ export const MAX_INDEX_BUILDS_PER_DAY_TOTAL = readIntegerSetting("MAX_INDEX_BUIL
 // the text: 16 kB is the room for those. It follows MAX_DOCUMENT_CHARACTERS and is not a setting of its own.
 export const DOCUMENT_BODY_LIMIT = 3 * MAX_DOCUMENT_CHARACTERS + 16 * 1024;
 
+// Questions (layer 5, the first route that calls a model while a request waits; layer 6 reuses the same limits). Each setting has a
+// top as well as a bottom, like the ones above.
+
+// questions per user per minute; counted before the body is read, and separate from the upload and index counters
+export const QUESTIONS_PER_MINUTE = readIntegerSetting("QUESTIONS_PER_MINUTE", 10, 1, 1000);
+
+export const QUESTION_WINDOW_MS = MINUTE_MS;
+
+// questions one user may have answered in the last 24 hours, counted from the runs table
+export const MAX_QUESTIONS_PER_DAY = readIntegerSetting("MAX_QUESTIONS_PER_DAY", 30, 1, 100_000);
+
+// how long one question may take in all, waiting for the model's turn included. Cloudflare cuts a response at 100 seconds,
+// so the top is 90.
+export const MAX_QUESTION_SECONDS = readIntegerSetting("MAX_QUESTION_SECONDS", 60, 1, 90);
+
+// questions waiting for the model's turn, every user together; over it the API answers 503. The indexing batches have their own cap.
+export const MAX_WAITING_QUESTIONS = readIntegerSetting("MAX_WAITING_QUESTIONS", 20, 1, 1000);
+
+// the longest question, in characters (RAG Web's MAX_QUESTION_CHARS)
+export const QUESTION_MAX_CHARACTERS = 1000;
+
 // health checks per client address per minute; the endpoint is public
 export const HEALTH_CHECKS_PER_MINUTE = readIntegerSetting("HEALTH_CHECKS_PER_MINUTE", 30);
 
