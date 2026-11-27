@@ -6,7 +6,7 @@ import {
     MAX_INDEX_BUILDS_PER_DAY_TOTAL,
     MAX_QUEUED_INDEX_BUILDS
 } from "../config/limits.config.js";
-import type { ConfigurationSettings } from "../types/configuration.type.js";
+import type { ConfigurationSettings, IndexState } from "../types/configuration.type.js";
 import type { DocumentIndex } from "../types/documentIndexes.type.js";
 import { AppError } from "../utils/appError.util.js";
 import { chunkText } from "../utils/chunkText.util.js";
@@ -317,6 +317,16 @@ export const deleteDocumentIndexService = async (userId: string, documentId: str
     }
 
     abortIndexBuildService({ indexId });
+};
+
+// The index the caller's document has at a chunk size and model, in any state, or null when it has none: what the dry run of a
+// configuration reports. It reads and builds nothing. A document that is not the caller's is the usual 404.
+export const findIndexStateService = async (userId: string, documentId: string, settings: { chunkSize: number; embeddingModel: string }): Promise<IndexState | null> => {
+    await assertDocumentOwned(userId, documentId);
+
+    const existing = await findExistingIndex(pool, documentId, settings.chunkSize, settings.embeddingModel);
+
+    return existing ? { id: existing.id, status: existing.status } : null;
 };
 
 // The ready index of the caller's document at a chunk size and model, for the routes that answer from an index. It never

@@ -1,4 +1,5 @@
 import type { SETTING_CAPS, SETTING_KEYS } from "../config/configuration.config.js";
+import type { IndexStatus } from "./documentIndexes.type.js";
 
 export type SettingKey = (typeof SETTING_KEYS)[number];
 
@@ -30,6 +31,8 @@ export interface ConfigurationView {
     documents: { maxPerUser: number; maxCharacters: number; maxFilenameLength: number };
     // the limits on building indexes: builds in progress per user, and the builds of the last 24 hours per user and in all
     indexes: { maxActivePerUser: number; maxBuildsPerDay: number; maxBuildsPerDayTotal: number };
+    // the limits on questions: per minute, per day (24 hours), the seconds one may take and the characters it may have
+    questions: { perMinute: number; maxPerDay: number; maxSeconds: number; maxCharacters: number };
 }
 
 // the configuration a question runs with, stored next to its metrics
@@ -45,4 +48,20 @@ export interface ResolvedConfiguration {
     snapshot: Readonly<ConfigurationSnapshot>;
     snapshotText: string;
     hash: string;
+}
+
+// the index a document has at the size and model a configuration resolves to
+export interface IndexState {
+    id: string;
+    status: IndexStatus;
+}
+
+// what POST /v1/configuration/resolve answers: the resolved configuration without its canonical text, and, when the body names
+// a document, the index it would use (null when the document has none at that size and model). Without a document there is no
+// `index` key at all.
+export interface ConfigurationPreview {
+    profileId: string | null;
+    snapshot: Readonly<ConfigurationSnapshot>;
+    hash: string;
+    index?: IndexState | null;
 }
