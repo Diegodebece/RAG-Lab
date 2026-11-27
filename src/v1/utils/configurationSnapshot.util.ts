@@ -8,7 +8,7 @@ const isPlainObject = (value: object): value is Record<string, unknown> => {
 
 // The text of a value as JSON with the keys sorted at every level and no spaces, so the same configuration always gives
 // the same text (and the same hash) whatever order its keys arrived in. Only what JSON can hold is accepted: a value
-// that JSON.stringify would silently drop or turn into null (undefined, a function, NaN, an infinity) is an error here,
+// that JSON.stringify would silently drop or turn into null (undefined, a function, NaN, an infinity, a hole in an array) is an error here,
 // because a snapshot that lost a value would hash like one that never had it.
 export const toCanonicalJson = (value: unknown): string => {
     if (value === null) {
@@ -27,6 +27,13 @@ export const toCanonicalJson = (value: unknown): string => {
             return JSON.stringify(value);
         case "object": {
             if (Array.isArray(value)) {
+                // a hole is not a value JSON can hold: map would skip it and the join would write nothing in its place
+                for (let index = 0; index < value.length; index += 1) {
+                    if (!Object.hasOwn(value, index)) {
+                        throw new TypeError("A configuration snapshot cannot hold an array with holes");
+                    }
+                }
+
                 return `[${value.map(toCanonicalJson).join(",")}]`;
             }
 

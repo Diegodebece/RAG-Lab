@@ -21,6 +21,7 @@ interface ProfileRow {
 
 const NOT_FOUND_MESSAGE = "Profile not found";
 const NAME_TAKEN_MESSAGE = "A profile with that name already exists";
+const OTHER_VERSION_MESSAGE = "This profile was saved by another configuration version";
 const LIMIT_REACHED_MESSAGE = "You have reached the maximum number of profiles";
 
 // The stored settings are shown as they are, with what is wrong with them today: a profile saved before a cap changed
@@ -103,17 +104,25 @@ export const createProfileService = async (userId: string, profileData: CreatePr
     });
 
 // The name and the settings are each optional, but one of them is there (the validator checks it). The settings sent
-// replace the stored ones as a whole. The name is checked against the user's other profiles only: renaming a profile to
-// its own name in another capitalization is allowed.
+// replace the stored ones as a whole, and only then is the version written: it says which definition of the settings the
+// stored ones were written for, so a rename leaves it alone. A profile saved by another configuration version is not
+// this code's to rewrite (saving it would mark settings of another shape as current): it is a 409 and nothing changes;
+// the user can still read it and delete it. The name is checked against the user's other profiles only: renaming a
+// profile to its own name in another capitalization is allowed. The role of the API may update only the columns written
+// here (migration 005).
 export const updateProfileService = async (userId: string, id: string, profileData: UpdateProfileInput): Promise<Profile> => {
     if (!isUuid(id)) {
         throw new AppError(404, NOT_FOUND_MESSAGE);
     }
 
-    const { rows: owned } = await pool.query("SELECT 1 FROM profiles WHERE id = $1 AND user_id = $2", [id, userId]);
+    const { rows: owned } = await pool.query<{ version: number }>("SELECT version FROM profiles WHERE id = $1 AND user_id = $2", [id, userId]);
 
     if (owned.length === 0) {
         throw new AppError(404, NOT_FOUND_MESSAGE);
+    }
+
+    if (owned[0].version !== CONFIGURATION_VERSION) {
+        throw new AppError(409, OTHER_VERSION_MESSAGE);
     }
 
     if (profileData.name !== undefined) {
@@ -132,7 +141,7 @@ export const updateProfileService = async (userId: string, id: string, profileDa
             `UPDATE profiles SET
                  name = COALESCE($3::text, name),
                  settings = COALESCE($4::jsonb, settings),
-                 version = $5,
+                 version = CASE WHEN $4::jsonb IS NULL THEN version ELSE $5::integer END,
                  updated_at = now()
              WHERE id = $1 AND user_id = $2
              RETURNING ${PROFILE_COLUMNS}`,

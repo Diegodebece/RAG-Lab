@@ -5,6 +5,7 @@ import { MAX_PROFILES_PER_USER } from "../config/limits.config.js";
 import type { ConfigurationSettings, ConfigurationView, ResolvedConfiguration, SettingDefinition } from "../types/configuration.type.js";
 import { AppError } from "../utils/appError.util.js";
 import { freezeSnapshot, hashSnapshotText, toCanonicalJson } from "../utils/configurationSnapshot.util.js";
+import { unknownSettingMessage } from "../utils/unknownSetting.util.js";
 import { isUuid } from "../utils/uuid.util.js";
 import { completeSettingsSchema } from "../validators/configuration.validator.js";
 import type { ResolveConfigurationInput } from "../validators/configuration.validator.js";
@@ -16,9 +17,28 @@ interface DefaultProfileRow {
 
 const isSettingKey = (key: string): boolean => (SETTING_KEYS as readonly string[]).includes(key);
 
-// "Unknown setting: <key>" for each key of a stored or given object that is not a setting of this version
+// "Unknown setting: <key>" for each key of a stored or given object that is not a setting of this version (a key longer
+// than 64 characters is cut). Object.keys lists an own "__proto__" key too, which is how it is found here.
 const unknownKeyProblems = (settings: object): string[] =>
-    Object.keys(settings).filter((key) => !isSettingKey(key)).map((key) => `Unknown setting: ${key}`);
+    Object.keys(settings).filter((key) => !isSettingKey(key)).map(unknownSettingMessage);
+
+// What is wrong with the row of default_profile, as sentences: its version, and its settings (all eleven, inside their
+// caps, and nothing else). Empty when the default is one this code can use.
+const getDefaultProfileProblems = (row: DefaultProfileRow): string[] => {
+    const problems: string[] = [];
+
+    if (row.version !== CONFIGURATION_VERSION) {
+        problems.push(`The default profile is at configuration version ${row.version}, and this server reads version ${CONFIGURATION_VERSION}`);
+    }
+
+    const { error } = completeSettingsSchema.validate(row.settings, { abortEarly: false });
+
+    if (error) {
+        problems.push(...error.details.map((detail) => detail.message));
+    }
+
+    return problems;
+};
 
 // the one row of default_profile; a database without it is not one this code can run on, so it is a plain Error (500),
 // and the server does not start on it (getConfigurationProblemsService)
@@ -55,8 +75,11 @@ export const getConfigurationService = async (): Promise<ConfigurationView> => {
 // model and holds no transaction. A key is looked up as an own property, never read through the prototype and never
 // copied from one object into another, so a key like "__proto__" is not a way to reach the result.
 // A profile of another user is the same 404 as one that does not exist. Anything outside the caps, in a profile stored
-// before a cap changed or in the default itself, is a 400 with every problem listed: nothing is clamped, so the
-// snapshot always matches what ran.
+// before a cap changed or in the overrides, is a 400 with every problem listed: nothing is clamped, so the snapshot always
+// matches what ran. What is not the client's doing is a plain Error, which errorMiddleware answers with the generic 500:
+// a profile of the caller saved by another configuration version (this code cannot read it) and a default profile that
+// is not valid (the server checked it at startup, so someone changed it while the server ran). The default is checked on
+// its own first, so its problems are never mixed with the caller's.
 export const resolveConfigurationService = async (userId: string, input: ResolveConfigurationInput = {}): Promise<ResolvedConfiguration> => {
     const { profileId, overrides } = input;
     let stored: Record<string, unknown> = {};
@@ -66,8 +89,8 @@ export const resolveConfigurationService = async (userId: string, input: Resolve
             throw new AppError(404, "Profile not found");
         }
 
-        const { rows } = await pool.query<{ settings: Record<string, unknown> }>(
-            "SELECT settings FROM profiles WHERE id = $1 AND user_id = $2",
+        const { rows } = await pool.query<{ settings: Record<string, unknown>; version: number }>(
+            "SELECT settings, version FROM profiles WHERE id = $1 AND user_id = $2",
             [profileId, userId]
         );
 
@@ -75,10 +98,22 @@ export const resolveConfigurationService = async (userId: string, input: Resolve
             throw new AppError(404, "Profile not found");
         }
 
+        if (rows[0].version !== CONFIGURATION_VERSION) {
+            throw new Error(`A stored profile is at configuration version ${rows[0].version}, and this server reads version ${CONFIGURATION_VERSION}`);
+        }
+
         stored = rows[0].settings;
     }
 
-    const defaults = (await readDefaultProfile(pool)).settings;
+    const defaultRow = await readDefaultProfile(pool);
+    const defaultProblems = getDefaultProfileProblems(defaultRow);
+
+    if (defaultProblems.length > 0) {
+        console.error(`The default profile in the database is not valid:\n- ${defaultProblems.join("\n- ")}`);
+        throw new Error("The default profile in the database is not valid");
+    }
+
+    const defaults = defaultRow.settings;
     const chosen: Record<string, unknown> = overrides ?? {};
     const merged: Record<string, unknown> = {};
 
@@ -121,15 +156,7 @@ export const getConfigurationProblemsService = async (targetPool: Pool = pool): 
     if (defaults.length === 0) {
         problems.push("The default profile is missing from the default_profile table");
     } else {
-        if (defaults[0].version !== CONFIGURATION_VERSION) {
-            problems.push(`The default profile is at configuration version ${defaults[0].version}, and this server reads version ${CONFIGURATION_VERSION}`);
-        }
-
-        const { error } = completeSettingsSchema.validate(defaults[0].settings, { abortEarly: false });
-
-        if (error) {
-            problems.push(...error.details.map((detail) => detail.message));
-        }
+        problems.push(...getDefaultProfileProblems(defaults[0]));
     }
 
     const { rows: stale } = await targetPool.query<{ count: number }>("SELECT count(*)::int AS count FROM profiles WHERE version <> $1", [CONFIGURATION_VERSION]);
