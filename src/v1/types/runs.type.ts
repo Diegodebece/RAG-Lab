@@ -26,7 +26,7 @@ export interface Fragment {
 
 // milliseconds, written with two decimals
 export interface RunTimings {
-    // waiting for the model's turn (and for the daily count)
+    // waiting for the model's turn, measured after the question was admitted
     waitMs: number;
     embeddingMs: number;
     retrievalMs: number;
