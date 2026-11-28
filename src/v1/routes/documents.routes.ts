@@ -31,12 +31,12 @@ documentsRouter.post(
 documentsRouter.delete("/:id", deleteDocument);
 
 // A search costs the model server an embedding, so every request counts, the refused ones too, and the count comes before the body
-// is read. It has a counter of its own (QUESTIONS_PER_MINUTE, per user and token version, in memory; the daily count is in the
-// database, from the runs). The body is a question and at most six small settings, so it is read with the small limit of the
+// is read. It has a counter of its own (QUESTIONS_PER_MINUTE, per user id alone, so a logout and a login do not start it again; in
+// memory; the daily count is in the database, from question_usage). The body is a question and at most six small settings, so it is read with the small limit of the
 // configuration routes. Before the nested router, so /:id/search is never taken for something under /:id/indexes.
 documentsRouter.post(
     "/:id/search",
-    rateLimitMiddleware({ limit: QUESTIONS_PER_MINUTE, windowMs: QUESTION_WINDOW_MS, keyBy: "user" }),
+    rateLimitMiddleware({ limit: QUESTIONS_PER_MINUTE, windowMs: QUESTION_WINDOW_MS, keyBy: "userId" }),
     express.json({ limit: CONFIGURATION_BODY_LIMIT }),
     validateBodyMiddleware(searchDocumentSchema),
     searchDocument

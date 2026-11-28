@@ -8,8 +8,9 @@ interface RateLimitOptions {
     limit: number;
     windowMs: number;
     // "ip": one counter per client address; "emailAndIp": one counter per email in the request body and address;
-    // "user": one counter per logged-in user, for routes behind authenticateMiddleware
-    keyBy: "ip" | "emailAndIp" | "user";
+    // "user": one counter per logged-in user and token version, for routes behind authenticateMiddleware;
+    // "userId": one counter per logged-in user whatever the token version (see userIdKey)
+    keyBy: "ip" | "emailAndIp" | "user" | "userId";
     // count only requests that end in an error response, such as failed logins
     onlyFailures?: boolean;
     // count only requests that succeed, such as accounts actually created
@@ -48,10 +49,17 @@ const emailAndIpKey = (req: Request): string => {
 // address is the key, so the limit still applies.
 const userKey = (req: Request): string => (req.decoded ? `user:${req.decoded.id}:v${req.decoded.tokenVersion}` : clientAddressKey(req));
 
+// A user keeps one counter whatever the version of the token, for the limits that guard a cost: a logout raises the version and a
+// login gives a new token, so with the version in the key the counter would start again and the limit could be spent over and over.
+// The cost of keying by the id alone is the one explained above: whoever holds an old token of the account shares the account's
+// counter, and the owner of the account is the one who can revoke it. Without a token, the address is the key.
+const userIdKey = (req: Request): string => (req.decoded ? `userId:${req.decoded.id}` : clientAddressKey(req));
+
 const KEY_GENERATORS: Record<RateLimitOptions["keyBy"], (req: Request) => string> = {
     ip: clientAddressKey,
     emailAndIp: emailAndIpKey,
-    user: userKey
+    user: userKey,
+    userId: userIdKey
 };
 
 // Counters live in memory: they reset when the API restarts, which is acceptable for short windows.
