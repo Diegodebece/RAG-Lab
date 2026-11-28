@@ -81,6 +81,8 @@ const FIXED_INDEX_COLUMNS = ["chunk_count", "chunk_size", "created_at", "documen
 const DOCUMENT_COLUMNS = ["character_count", "content_hash", "created_at", "filename", "id", "text", "user_id"];
 const CHUNK_COLUMNS = ["chunk_index", "embedding", "index_id", "text"];
 const USAGE_COLUMNS = ["accepted_at", "id", "user_id"];
+// The count of the day's questions (layer 5, round 2): written once for every embedding done for a question, and only ever counted.
+const QUESTION_USAGE_COLUMNS = ["id", "used_at", "user_id"];
 // The table of layer 5: a run is written once, by the search, and never changed or given back. The columns, in alphabetical order.
 const RUN_COLUMNS = [
     "configuration", "configuration_hash", "created_at", "document_id", "embedding_ms", "embedding_tokens", "fragments", "id", "index_id", "kind",
@@ -137,7 +139,7 @@ const readProbe = async (probe: DocumentProbe): Promise<unknown[]> => [
 ];
 
 // the tables of layers 4 and 5, each with rights of its own
-const NEW_TABLES = ["documents", "document_indexes", "chunks", "index_build_usage", "runs"];
+const NEW_TABLES = ["documents", "document_indexes", "chunks", "index_build_usage", "runs", "question_usage"];
 
 const checkTheRights = (): void => {
     it("holds SELECT, INSERT, UPDATE and DELETE on every table of the schema except schema_migrations, default_profile, profiles and the tables of documents, indexes and runs, and nothing more", async () => {
@@ -277,6 +279,38 @@ const checkTheRights = (): void => {
     it("holds only SELECT and INSERT on runs, and no UPDATE on any column of it", async () => {
         assert.deepEqual(await privilegesOn("runs"), ["SELECT", "INSERT"]);
         assert.deepEqual(await updatableColumnsOf("runs"), { all: RUN_COLUMNS, updatable: [] });
+    });
+
+    it("holds only SELECT and INSERT on question_usage, and no UPDATE on any column of it", async () => {
+        assert.deepEqual(await privilegesOn("question_usage"), ["SELECT", "INSERT"]);
+        assert.deepEqual(await updatableColumnsOf("question_usage"), { all: QUESTION_USAGE_COLUMNS, updatable: [] });
+    });
+
+    it("is refused UPDATE and DELETE on question_usage (42501), so a question cannot be given back, and the rows are unchanged", async () => {
+        const { rows: users } = await ownerPool.query<{ id: string }>("INSERT INTO users (email, password_hash) VALUES ('question.usage.probe@example.com', 'x') RETURNING id");
+        const userId = users[0].id;
+
+        try {
+            await pool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [userId]);
+            const read = async () => (await ownerPool.query("SELECT * FROM question_usage WHERE user_id = $1", [userId])).rows;
+            const before = await read();
+            const statements: Record<string, string> = {
+                "UPDATE of used_at": `UPDATE question_usage SET used_at = now() - interval '2 days' WHERE user_id = '${userId}'`,
+                "UPDATE of user_id": "UPDATE question_usage SET user_id = user_id",
+                "DELETE of one user's rows": `DELETE FROM question_usage WHERE user_id = '${userId}'`,
+                "DELETE of every row": "DELETE FROM question_usage"
+            };
+
+            assert.equal(before.length, 1);
+
+            for (const [label, statement] of Object.entries(statements)) {
+                assert.equal(await failureCodeOf(statement), "42501", label);
+            }
+
+            assert.deepEqual(await read(), before, "the rows are as they were");
+        } finally {
+            await ownerPool.query("DELETE FROM users WHERE id = $1", [userId]);
+        }
     });
 
     it("is refused UPDATE and DELETE on runs (42501), so a question cannot be given back and the day's count cannot be rewritten, and the rows are unchanged", async () => {

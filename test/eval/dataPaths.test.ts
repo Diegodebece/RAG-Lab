@@ -1,6 +1,6 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -26,13 +26,24 @@ import {
 //   createSweepFolder(dataDirectory, setName, startedAt): Promise<string>  <data>/results/retrieval/<yyyymmddThhmmssZ>-<set>, made now,
 //                                                                          and a rejection (nothing overwritten) when it already exists
 // Every folder is made in os.tmpdir(): the tests never touch RAG_LAB_DATA_DIR.
+//
+// Round 2 (the audit's findings F1 and F2), the contracts these tests pick:
+//   assertDataDirectory also refuses a data folder that is inside ANY git checkout, not only the repository it was given: it walks up
+//     from the real path of the folder, itself included, and refuses the first folder that holds `.git`, whether a folder (a checkout)
+//     or a file (a worktree). A name that only starts like it (.github, .gitignore) is not a checkout.
+//   createSweepFolder(dataDirectory, setName, startedAt) takes the real path assertDataDirectory returned. After each folder it makes
+//     (results, retrieval, the sweep's own) it takes the real path of the folder and refuses, with a rejection, when it is not inside
+//     the data folder: a link in the data folder that points out of it (a junction or a symlink) is never followed into a place where
+//     something is written. Nothing at all is made inside the place a link points to: the folders above the link are the last ones made.
+//     A link that points to another place inside the data folder is fine.
 
 let work = "";
 let repository = "";
 let outside = "";
 
 before(async () => {
-    work = await mkdtemp(path.join(tmpdir(), "rag-lab-datapaths-"));
+    // the real path of the temporary folder, so that what the tests compare is not a short name or a link of this computer
+    work = await realpath(await mkdtemp(path.join(tmpdir(), "rag-lab-datapaths-")));
     repository = path.join(work, "repo");
     outside = path.join(work, "data");
     await mkdir(path.join(repository, "src"), { recursive: true });
@@ -76,6 +87,61 @@ describe("assertDataDirectory", () => {
         await assert.rejects(assertDataDirectory(file, repository));
     });
 
+    // F1: the repository the harness is told about is the one it runs from, which can be a worktree under the main checkout (the
+    // checkout's own .claude/worktrees/<name>): a data folder in the main checkout is outside the worktree, and still in a repository
+    it("refuses a folder inside a git checkout that is not the repository it was given: an ancestor holds a .git folder", async () => {
+        const checkout = path.join(work, "another-checkout");
+        await mkdir(path.join(checkout, ".git"), { recursive: true });
+        await mkdir(path.join(checkout, "private", "deeper"), { recursive: true });
+
+        await assert.rejects(assertDataDirectory(path.join(checkout, "private"), repository), "a folder of the checkout");
+        await assert.rejects(assertDataDirectory(path.join(checkout, "private", "deeper"), repository), "a folder deeper in it");
+    });
+
+    it("refuses a folder in the main checkout when the repository given is a worktree under it, whose .git is a file", async () => {
+        const main = path.join(work, "main-checkout");
+        const worktree = path.join(main, ".claude", "worktrees", "w");
+        await mkdir(path.join(main, ".git"), { recursive: true });
+        await mkdir(worktree, { recursive: true });
+        await writeFile(path.join(worktree, ".git"), "gitdir: ../../../.git/worktrees/w\n");
+        await mkdir(path.join(main, "private"), { recursive: true });
+
+        await assert.rejects(assertDataDirectory(path.join(main, "private"), worktree), "main/private, with the worktree as the repository");
+    });
+
+    it("refuses a folder inside a worktree on its own: an ancestor holds a .git that is a file", async () => {
+        const worktree = path.join(work, "lonely-worktree");
+        await mkdir(path.join(worktree, "private"), { recursive: true });
+        await writeFile(path.join(worktree, ".git"), "gitdir: /somewhere/else/.git/worktrees/lonely\n");
+
+        await assert.rejects(assertDataDirectory(path.join(worktree, "private"), repository));
+    });
+
+    it("refuses a data folder that itself holds a .git", async () => {
+        const data = path.join(work, "data-with-git");
+        await mkdir(path.join(data, ".git"), { recursive: true });
+
+        await assert.rejects(assertDataDirectory(data, repository));
+    });
+
+    it("refuses a link to a folder inside a git checkout: the real path is the one that is checked", async () => {
+        const checkout = path.join(work, "linked-checkout");
+        await mkdir(path.join(checkout, ".git"), { recursive: true });
+        await mkdir(path.join(checkout, "private"), { recursive: true });
+        const link = path.join(work, "link-to-private");
+        await symlink(path.join(checkout, "private"), link, "junction");
+
+        await assert.rejects(assertDataDirectory(link, repository));
+    });
+
+    it("does not take a folder or a file that only starts like .git (.github, .gitignore) for a checkout", async () => {
+        const parent = path.join(work, "not-a-checkout");
+        await mkdir(path.join(parent, ".github"), { recursive: true });
+        await writeFile(path.join(parent, ".gitignore"), "node_modules\n");
+        await mkdir(path.join(parent, "private"), { recursive: true });
+
+        assert.equal(path.resolve(await assertDataDirectory(path.join(parent, "private"), repository)), path.join(parent, "private"));
+    });
 });
 
 describe("assertSafeName", () => {
@@ -177,5 +243,64 @@ describe("createSweepFolder", () => {
         for (const setName of ["..", "../x", "a/b", "C:x", ""]) {
             await assert.rejects(createSweepFolder(outside, setName, new Date(Date.UTC(2030, 0, 1))), JSON.stringify(setName));
         }
+    });
+});
+
+// F2: the data folder is checked once, and what is inside it is not: a link there (a junction or a symlink, made by the owner, by a
+// tool, or by someone with access to the folder) can point into the repository, and the sweep would write its results there.
+describe("createSweepFolder: a link inside the data folder that points out of it (F2)", () => {
+    const startedAt = new Date(Date.UTC(2026, 10, 27, 9, 5, 3));
+
+    // a fake repository to point at, with the folder the link goes to; and a data folder of its own, checked as the entry point does
+    const makeScene = async (name: string) => {
+        const fakeRepository = path.join(work, `${name}-repository`);
+        const target = path.join(fakeRepository, "inside");
+        await mkdir(path.join(fakeRepository, ".git"), { recursive: true });
+        await mkdir(target, { recursive: true });
+        const data = path.join(work, `${name}-data`);
+        await mkdir(data, { recursive: true });
+
+        return { target, data, realData: await assertDataDirectory(data, repository) };
+    };
+
+    it("rejects, and makes nothing inside the folder the link points to, when results is a link out of the data folder", async () => {
+        const { target, data, realData } = await makeScene("results-link");
+        await symlink(target, path.join(data, "results"), "junction");
+
+        await assert.rejects(createSweepFolder(realData, "invented", startedAt));
+
+        assert.deepEqual(await readdir(target), [], "nothing was made where the link points");
+    });
+
+    it("rejects, and makes nothing inside the folder the link points to, when results/retrieval is a link out of the data folder", async () => {
+        const { target, data, realData } = await makeScene("retrieval-link");
+        await mkdir(path.join(data, "results"), { recursive: true });
+        await symlink(target, path.join(data, "results", "retrieval"), "junction");
+
+        await assert.rejects(createSweepFolder(realData, "invented", startedAt));
+
+        assert.deepEqual(await readdir(target), [], "nothing was made where the link points");
+    });
+
+    it("rejects when the folder of the sweep itself is a link out of the data folder, which was put there first", async () => {
+        const { target, data, realData } = await makeScene("sweep-link");
+        await mkdir(path.join(data, "results", "retrieval"), { recursive: true });
+        await symlink(target, path.join(data, "results", "retrieval", "20261127T090503Z-invented"), "junction");
+
+        await assert.rejects(createSweepFolder(realData, "invented", startedAt));
+
+        assert.deepEqual(await readdir(target), [], "nothing was written where the link points");
+    });
+
+    it("still makes the folder when a link points to another place inside the data folder: only a way out is refused", async () => {
+        const { data, realData } = await makeScene("inside-link");
+        const elsewhere = path.join(data, "elsewhere");
+        await mkdir(elsewhere, { recursive: true });
+        await symlink(elsewhere, path.join(data, "results"), "junction");
+
+        const folder = await createSweepFolder(realData, "invented", startedAt);
+
+        assert.equal((await readdir(path.join(elsewhere, "retrieval"))).length, 1, "the sweep folder is where the link leads, inside the data folder");
+        assert.equal(path.basename(folder), "20261127T090503Z-invented");
     });
 });

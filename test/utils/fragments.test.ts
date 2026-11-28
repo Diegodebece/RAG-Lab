@@ -159,3 +159,25 @@ describe("buildFragments at window 2", () => {
         assert.deepEqual(fragments.map((fragment) => fragment.chunkIndex), [5, 4, 6], "the chunks two away are not used at window 1");
     });
 });
+
+// Findings F3 and T5: a score that is not a number must never become a fragment. JSON writes NaN and Infinity as null, so a match with
+// such a score would be answered, and stored, as a match with no score at all.
+describe("buildFragments: a score that is not a finite number", () => {
+    for (const [label, score] of [["NaN", Number.NaN], ["Infinity", Number.POSITIVE_INFINITY], ["-Infinity", Number.NEGATIVE_INFINITY]] as const) {
+        it(`throws for a match with a score of ${label}, at either window`, () => {
+            assert.throws(() => buildFragments([match(5, 0.9), match(7, score)], [chunk(4), chunk(6)], 1), Error);
+            assert.throws(() => buildFragments([match(7, score)], [], 2), Error);
+        });
+    }
+
+    it("throws when only one of several scores is not finite, wherever it is in the list", () => {
+        assert.throws(() => buildFragments([match(1, Number.NaN), match(2, 0.5), match(3, 0.4)], [], 1), Error);
+        assert.throws(() => buildFragments([match(1, 0.9), match(2, 0.5), match(3, Number.NaN)], [], 1), Error);
+    });
+
+    it("accepts scores of 0, a negative number and 1: a finite score is never refused", () => {
+        const fragments = buildFragments([match(1, 1), match(2, 0), match(3, -0.5)], [], 1);
+
+        assert.deepEqual(fragments.map((fragment) => fragment.score), [1, 0, -0.5]);
+    });
+});

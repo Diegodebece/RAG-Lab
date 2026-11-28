@@ -19,7 +19,9 @@ import { createApiClient } from "../../src/eval/apiClient.js";
 //       401: logs in again, once, and sends the request again; a second 401 is returned as it is
 //       429 with an entry of the RateLimit header that has r=0: sleeps that entry's t seconds (sleep(ms)) and sends it again
 //       any other 429 (the daily limit): rejects with an Error whose message has the server's own message; nothing is sent again
-//       503 or 504: sends it again, at most 3 more times, and then returns the 503 or 504 as it is
+//       503: sends it again, at most 3 more times, and then returns the 503 as it is
+//       504 (round 2, finding I5): is returned at once, with no retry. The server's own 504 means the question took all the time it had
+//         (the model server did not answer in time); asking again would spend another question of the day on the same slow model
 //       any other status is returned at once
 //     a rejection never has the password or the token in its message
 //   sleep is an injected function, so the tests do not wait
@@ -233,20 +235,32 @@ describe("the API client: the daily limit", () => {
 });
 
 describe("the API client: a server that is busy or too slow", () => {
-    for (const status of [503, 504]) {
-        it(`sends a request that was answered with ${status} again, at most three more times, and then returns the ${status}`, { timeout: 15_000 }, async () => {
-            const sleeps: number[] = [];
-            const api = await startFakeApi(withLogin(() => ({ status, body: { message: "The server is busy, please try again in a few minutes" } })));
-            const client = makeClient(api.url, sleeps);
+    it("sends a request that was answered with 503 again, at most three more times, and then returns the 503", { timeout: 15_000 }, async () => {
+        const sleeps: number[] = [];
+        const api = await startFakeApi(withLogin(() => ({ status: 503, body: { message: "The server is busy, please try again in a few minutes" } })));
+        const client = makeClient(api.url, sleeps);
 
-            const response = await client.send({ method: "POST", path: "/v1/documents/abc/search", body: { question: "Q?" } });
+        const response = await client.send({ method: "POST", path: "/v1/documents/abc/search", body: { question: "Q?" } });
 
-            assert.equal(response.status, status);
-            assert.equal(response.attempts, 4, "the request and three more");
-            assert.equal(requestsTo(api.calls, "/v1/documents/abc/search").length, 4);
-            assert.equal(sleeps.length, 3, "it waited between the tries");
-        });
-    }
+        assert.equal(response.status, 503);
+        assert.equal(response.attempts, 4, "the request and three more");
+        assert.equal(requestsTo(api.calls, "/v1/documents/abc/search").length, 4);
+        assert.equal(sleeps.length, 3, "it waited between the tries");
+    });
+
+    it("does not send a request again that was answered with 504: it is seen once and returned as it is, without waiting (finding I5)", { timeout: 15_000 }, async () => {
+        const sleeps: number[] = [];
+        const api = await startFakeApi(withLogin(() => ({ status: 504, body: { message: "The model server did not answer in time" } })));
+        const client = makeClient(api.url, sleeps);
+
+        const response = await client.send({ method: "POST", path: "/v1/documents/abc/search", body: { question: "Q?" } });
+
+        assert.equal(response.status, 504);
+        assert.deepEqual(response.body, { message: "The model server did not answer in time" });
+        assert.equal(response.attempts, 1, "one request, no retry");
+        assert.equal(requestsTo(api.calls, "/v1/documents/abc/search").length, 1);
+        assert.deepEqual(sleeps, [], "it did not wait for a retry");
+    });
 
     it("stops trying when the server answers: two 503 and then a 200 is a 200 after three requests", { timeout: 15_000 }, async () => {
         const api = await startFakeApi(withLogin((_call, number) => (number <= 3 ? { status: 503, body: {} } : { status: 200, body: { ok: true } })));
@@ -257,8 +271,8 @@ describe("the API client: a server that is busy or too slow", () => {
         assert.equal(response.attempts, 3);
     });
 
-    it("does not try again a status that is not 503 or 504: 400, 404, 409 and 500 come back at once", { timeout: 15_000 }, async () => {
-        for (const status of [400, 404, 409, 500]) {
+    it("does not try again a status that is not 503: 400, 404, 409, 500 and 504 come back at once", { timeout: 15_000 }, async () => {
+        for (const status of [400, 404, 409, 500, 504]) {
             const api = await startFakeApi(withLogin(() => ({ status, body: { message: "no" } })));
 
             const response = await makeClient(api.url).send({ method: "GET", path: "/v1/documents" });

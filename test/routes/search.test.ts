@@ -1,9 +1,10 @@
 import "./relaxedLimits.js";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import request from "supertest";
-import { dropConnection, embeddings, embeddingsFor, fakeTokenCount, startFakeOllama } from "../doubles/fakeOllama.js";
+import { dropConnection, embeddings, embeddingsFor, fakeTokenCount, startFakeOllama, waitForRequests } from "../doubles/fakeOllama.js";
 
 // POST /v1/documents/:id/search (layer 5): the first route that calls a model while the request waits. It resolves the caller's
 // configuration, finds the READY index of the document for the chunk size and model, embeds the question with the fake Ollama,
@@ -19,6 +20,17 @@ const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/tes
 const { createTestUser } = await import("./testUsers.js");
 const { DEFAULT_EMBEDDING_MODEL, countRows, readRuns, seedDocument, seedIndex, sha256Of } = await import("../documentsFixtures.js");
 const { DEFAULT_SETTINGS, canonicalText, sha256Hex } = await import("../configurationFixtures.js");
+const { pool } = await import("../../src/v1/config/db.config.js");
+
+// Round 2 (the audit's findings), the contracts these tests pick where the plan left them open:
+//   - the stored question_hash is an HMAC-SHA-256 of the trimmed question as UTF-8, keyed by createHmac("sha256", SECRET_KEY)
+//     .update("rag-lab:question-hash:v1").digest() (F11 / O4), not the plain SHA-256 any reader of the table could compute
+//   - a usage row (question_usage) is written for every embedding that came back, whether or not the run is stored (F6)
+//   - the INSERT INTO runs goes through the app's pool.query, so a test can make it fail once with SQLSTATE 23503 (F4, T2)
+//   - a search whose index or document is gone when the matches come back empty answers what it would have answered before the
+//     embedding: 404 "Document not found", 409 "This document has no ready index for chunk size N", and stores no run (F4)
+//   - a prompt_eval_count of 2 ** 31 is a malformed model answer, refused before anything is stored: the generic 500 like every other
+//     malformed answer (the plan said 502, but a malformed answer is a plain Error that errorMiddleware answers with a 500) (O5)
 
 before(resetTestDatabase);
 
@@ -49,6 +61,30 @@ const CHUNK_VECTORS = [[0, 1], [3, 4], [4, 3], [1, 0], [0, 1], [0, 0, 1]];
 const search = (auth: Auth, documentId: string, body: unknown) => request(app).post(`/v1/documents/${documentId}/search`).set(...auth).send(body as object);
 
 const embedRequests = () => fake.requests.filter((entry) => entry.path === "/api/embed");
+
+// fails instead of waiting for ever
+const within = async <T>(milliseconds: number, what: string, promise: Promise<T>): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${what} did not happen within ${milliseconds} ms`)), milliseconds);
+            })
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+};
+
+// what the table keeps of a question: an HMAC, keyed from the server's secret, so the hash of a guessed question cannot be computed
+// by anyone who only holds the table
+const questionHashOf = (question: string): string => {
+    const key = createHmac("sha256", process.env.SECRET_KEY ?? "").update("rag-lab:question-hash:v1").digest();
+
+    return createHmac("sha256", key).update(question, "utf8").digest("hex");
+};
 
 // a user with a document that has a ready index of the default size and model, with the chunks above
 const seedSearchable = async (email: string, options: { chunkSize?: number; chunks?: string[]; vectors?: number[][]; filename?: string } = {}) => {
@@ -167,7 +203,7 @@ describe("POST /v1/documents/:id/search: a search that finds something", () => {
         assert.equal(row.profileId, null);
         assert.deepEqual(row.configuration, body.configuration);
         assert.equal(row.configurationHash, body.configurationHash);
-        assert.equal(row.questionHash, sha256Of(asked), "the SHA-256 of the trimmed question as UTF-8");
+        assert.equal(row.questionHash, questionHashOf(asked), "the HMAC of the trimmed question as UTF-8");
         assert.equal(row.questionCharacters, asked.length);
         assert.equal(row.embeddingTokens, body.tokens.embedding);
         assert.deepEqual([row.waitMs, row.embeddingMs, row.retrievalMs, row.totalMs], [body.timings.waitMs, body.timings.embeddingMs, body.timings.retrievalMs, body.timings.totalMs]);
@@ -322,6 +358,294 @@ describe("POST /v1/documents/:id/search: a search that finds nothing", () => {
         assert.equal(runs[0].status, "no_match");
         assert.deepEqual(runs[0].fragments, []);
         assert.equal(runs[0].embeddingTokens, fakeTokenCount(QUESTION));
+    });
+});
+
+describe("POST /v1/documents/:id/search: the question hash (F11 / O4) and the usage row (F6)", () => {
+    it("stores an HMAC of the trimmed question, keyed from SECRET_KEY, and not its plain SHA-256: the stored hash differs from sha256(question)", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com");
+
+        const response = await search(user.auth, document.id, { question: `  ${QUESTION}\n` });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        const [run] = await readRuns();
+
+        assert.notEqual(run.questionHash, sha256Of(QUESTION), "anyone with the table could compute the plain SHA-256 of a guessed question");
+        assert.equal(run.questionHash, questionHashOf(QUESTION));
+        assert.match(run.questionHash, /^[0-9a-f]{64}$/);
+    });
+
+    it("gives the same question the same hash in two runs and another question another hash: the hash still pairs questions", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com");
+
+        await search(user.auth, document.id, { question: QUESTION });
+        await search(user.auth, document.id, { question: ` ${QUESTION} ` });
+        await search(user.auth, document.id, { question: "Another question?" });
+
+        const hashes = (await readRuns()).map((run) => run.questionHash);
+
+        assert.equal(hashes.length, 3);
+        assert.equal(hashes[0], hashes[1]);
+        assert.notEqual(hashes[0], hashes[2]);
+    });
+
+    it("writes one question_usage row for the question when the embedding is back, for a search that matched and for one that matched nothing", { timeout: 20_000 }, async () => {
+        const matching = await seedSearchable("ana@example.com");
+        const nothing = await seedSearchable("bob@example.com", { vectors: [[0, 1], [0, 1], [0, 1], [0, 1], [0, 1], [0, 1]] });
+
+        assert.equal((await search(matching.user.auth, matching.document.id, { question: QUESTION })).body.data.status, "matched");
+        assert.equal((await search(nothing.user.auth, nothing.document.id, { question: QUESTION })).body.data.status, "no_match");
+
+        assert.equal(await countRows("question_usage", "user_id = $1", [matching.user.id]), 1);
+        assert.equal(await countRows("question_usage", "user_id = $1", [nothing.user.id]), 1);
+    });
+
+    it("writes no question_usage row when the model server is not available: the question did not use the model", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com");
+        fake.respond("/api/embed", dropConnection);
+
+        assert.equal((await search(user.auth, document.id, { question: QUESTION })).status, 503);
+
+        assert.equal(await countRows("question_usage"), 0);
+    });
+});
+
+// Findings F4 and T2: a search that races a deletion. The index (or the document) is found before the question is admitted, and then
+// the embedding takes the time it takes: if the owner deletes it meanwhile, the search finds no chunks, and "nothing found" would be
+// stored and answered as a run that matched nothing, against an index that is not there. When no chunk comes back the index is
+// looked at again, and a document or an index that is gone (or not ready any more) is answered as it would have been before the
+// embedding: 404 or 409, and no run is stored. The embedding was done, so the question is counted.
+describe("POST /v1/documents/:id/search: a search that races a deletion (F4, T2)", () => {
+    // holds the embedding at the double until the test lets it go; the release is called in `finally`, whatever happens
+    const holdingTheEmbedding = async (during: (release: () => void) => Promise<void>): Promise<void> => {
+        let release: () => void = () => {};
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        fake.respond("/api/embed", embeddingsFor(VECTORS, { beforeAnswer: async () => { await gate; } }));
+
+        try {
+            await during(release);
+        } finally {
+            release();
+        }
+    };
+
+    it("answers 409 'no ready index' and stores no run when the index is deleted while the question is being embedded", { timeout: 30_000 }, async () => {
+        const { user, document, index } = await seedSearchable("ana@example.com");
+
+        await holdingTheEmbedding(async (release) => {
+            const pending = Promise.resolve(search(user.auth, document.id, { question: QUESTION }));
+            await waitForRequests(fake, "/api/embed", 1);
+            await ownerPool.query("DELETE FROM document_indexes WHERE id = $1", [index.id]);
+            release();
+
+            const response = await within(15_000, "the answer", pending);
+
+            assert.equal(response.status, 409, JSON.stringify(response.body));
+            assert.deepEqual(response.body, { message: "This document has no ready index for chunk size 1000" });
+        });
+
+        assert.equal(await countRows("runs"), 0, "no run against an index that is gone");
+        assert.equal(await countRows("question_usage"), 1, "the model did the work, so the question is counted");
+    });
+
+    it("answers 404 'Document not found' and stores no run when the document is deleted while the question is being embedded", { timeout: 30_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com");
+
+        await holdingTheEmbedding(async (release) => {
+            const pending = Promise.resolve(search(user.auth, document.id, { question: QUESTION }));
+            await waitForRequests(fake, "/api/embed", 1);
+            await ownerPool.query("DELETE FROM documents WHERE id = $1", [document.id]);
+            release();
+
+            const response = await within(15_000, "the answer", pending);
+
+            assert.equal(response.status, 404, JSON.stringify(response.body));
+            assert.deepEqual(response.body, { message: "Document not found" });
+        });
+
+        assert.equal(await countRows("runs"), 0);
+        assert.equal(await countRows("question_usage"), 1);
+    });
+
+    it("answers 409 when the index is not ready any more (its build failed) by the time the matches come back, and stores no run", { timeout: 30_000 }, async () => {
+        const { user, document, index } = await seedSearchable("ana@example.com");
+
+        await holdingTheEmbedding(async (release) => {
+            const pending = Promise.resolve(search(user.auth, document.id, { question: QUESTION }));
+            await waitForRequests(fake, "/api/embed", 1);
+            await ownerPool.query("UPDATE document_indexes SET status = 'failed' WHERE id = $1", [index.id]);
+            release();
+
+            const response = await within(15_000, "the answer", pending);
+
+            assert.equal(response.status, 409, JSON.stringify(response.body));
+            assert.deepEqual(response.body, { message: "This document has no ready index for chunk size 1000" });
+        });
+
+        assert.equal(await countRows("runs"), 0);
+    });
+
+    it("still answers 200 no_match, and stores the run, when the index is there and nothing in it is close enough: only a missing index is refused", { timeout: 30_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com", { vectors: [[0, 1], [0, 1], [0, 1], [0, 1], [0, 1], [0, 1]] });
+
+        await holdingTheEmbedding(async (release) => {
+            const pending = Promise.resolve(search(user.auth, document.id, { question: QUESTION }));
+            await waitForRequests(fake, "/api/embed", 1);
+            release();
+
+            const response = await within(15_000, "the answer", pending);
+
+            assert.equal(response.status, 200, JSON.stringify(response.body));
+            assert.equal(response.body.data.status, "no_match");
+        });
+
+        assert.equal(await countRows("runs"), 1);
+    });
+});
+
+// Finding F4 (the retry in insertRun): the run is inserted through subqueries that give NULL for a row deleted since it was read, and an
+// insert that still fails on a foreign key (the row went between the subquery and the check) is tried once more, and then the error is
+// the caller's. The failure is provoked by wrapping the app's pool.query: the first INSERT INTO runs is refused with SQLSTATE 23503.
+describe("POST /v1/documents/:id/search: the insert of the run and a foreign key that fails", () => {
+    interface InsertWatch {
+        attempts: () => number;
+    }
+
+    // makes the first `failures` inserts of a run fail with a foreign key violation, then lets the real ones through
+    const failInsertsOfRuns = (t: TestContext, failures: number): InsertWatch => {
+        const query = pool.query.bind(pool) as (...args: unknown[]) => Promise<unknown>;
+        let attempts = 0;
+
+        t.mock.method(pool, "query", (async (...args: unknown[]) => {
+            if (typeof args[0] === "string" && args[0].includes("INSERT INTO runs")) {
+                attempts += 1;
+
+                if (attempts <= failures) {
+                    throw Object.assign(new Error("insert or update on table \"runs\" violates foreign key constraint \"runs_index_id_fkey\""), { code: "23503" });
+                }
+            }
+
+            return query(...args);
+        }) as never);
+
+        return { attempts: () => attempts };
+    };
+
+    it("tries the insert once more after a foreign key violation, and answers 200 with the run stored once", { timeout: 20_000 }, async (t) => {
+        const { user, document } = await seedSearchable("ana@example.com");
+        const watch = failInsertsOfRuns(t, 1);
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(watch.attempts(), 2, "the insert that failed and the one that worked");
+        const runs = await readRuns();
+        assert.equal(runs.length, 1);
+        assert.equal(runs[0].id, response.body.data.id);
+    });
+
+    it("gives up after the second failure: the error is the caller's (the generic 500), no run is stored and the insert was tried exactly twice", { timeout: 20_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const { user, document } = await seedSearchable("ana@example.com");
+        const watch = failInsertsOfRuns(t, 2);
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 500, JSON.stringify(response.body));
+        assert.deepEqual(response.body, { message: "Internal server error" });
+        assert.equal(watch.attempts(), 2, "once more, and no more than once");
+        assert.equal(await countRows("runs"), 0);
+        assert.equal(await countRows("question_usage"), 1, "the embedding was done, so the question is counted though the run was lost");
+    });
+
+    it("does not try again an insert that fails for another reason: a check violation is tried once", { timeout: 20_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const { user, document } = await seedSearchable("ana@example.com");
+        const query = pool.query.bind(pool) as (...args: unknown[]) => Promise<unknown>;
+        let attempts = 0;
+        t.mock.method(pool, "query", (async (...args: unknown[]) => {
+            if (typeof args[0] === "string" && args[0].includes("INSERT INTO runs")) {
+                attempts += 1;
+                throw Object.assign(new Error("new row for relation \"runs\" violates check constraint"), { code: "23514" });
+            }
+
+            return query(...args);
+        }) as never);
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 500);
+        assert.equal(attempts, 1);
+    });
+});
+
+// Findings F3 and T5: a chunk whose score is NaN. PostgreSQL sorts NaN above every number, so "NaN >= minScore" is true and the chunk
+// was returned as a match with a score of null in the JSON. The matches are guarded in the SQL. Here the stored vector (0, 1e-30)
+// has a norm that underflows float4: its cosine with the question (1, 0) is 0 / 0, which is NaN (found by running it against the
+// test database's pgvector; the same happens when a norm overflows).
+describe("POST /v1/documents/:id/search: a chunk whose score is not a number (F3, T5)", () => {
+    it("never returns it as a match, and no fragment of the answer or of the stored run has a score that is null or not finite", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com", {
+            chunks: ["alpha chunk", "bravo chunk", "charlie chunk", "delta chunk", "echo chunk"],
+            vectors: [[3, 4], [0, 1], [0, 1], [0, 1], [0, 1e-30]]
+        });
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.deepEqual(response.body.data.fragments, [
+            { id: "F1", chunkIndex: 0, text: "alpha chunk", retrieval: "match", score: 0.6 },
+            { id: "F2", chunkIndex: 1, text: "bravo chunk", retrieval: "neighbor" }
+        ]);
+        assert.ok(!JSON.stringify(response.body).includes("\"score\":null"), "no score is null");
+
+        const [run] = await readRuns();
+        assert.deepEqual(run.fragments, [{ chunkIndex: 0, retrieval: "match", score: 0.6 }, { chunkIndex: 1, retrieval: "neighbor" }]);
+    });
+
+    it("answers no_match, and not a match with no score, when the only chunk that 'scores' is the NaN one", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com", {
+            chunks: ["alpha chunk", "bravo chunk", "charlie chunk"],
+            vectors: [[0, 1], [0, 1], [0, 1e-30]]
+        });
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.status, "no_match");
+        assert.deepEqual(response.body.data.fragments, []);
+    });
+});
+
+// Finding O5 (the cheap part): prompt_eval_count is stored in an integer column, so a count above 2147483647 would be refused by the
+// database after the work was done. It is checked where the answer is read: out of range is a malformed model answer (the service's
+// own test is in test/services/ollamaEmbed.test.ts). Here nothing may be stored. This test already passed before the fix, by the
+// database's own refusal, so it covers the behavior and the service test is the one that shows the fix.
+describe("POST /v1/documents/:id/search: an embedding whose token count does not fit an integer (O5)", () => {
+    it("answers the generic 500 and stores no run, and the fake saw one embedding", { timeout: 20_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const { user, document } = await seedSearchable("ana@example.com");
+        fake.respond("/api/embed", embeddingsFor(VECTORS, { promptTokens: 2 ** 31 }));
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 500, JSON.stringify(response.body));
+        assert.deepEqual(response.body, { message: "Internal server error" });
+        assert.equal(await countRows("runs"), 0);
+        assert.equal(embedRequests().length, 1);
+    });
+
+    it("accepts the largest count an integer column holds, 2147483647, and stores it", { timeout: 20_000 }, async () => {
+        const { user, document } = await seedSearchable("ana@example.com");
+        fake.respond("/api/embed", embeddingsFor(VECTORS, { promptTokens: 2_147_483_647 }));
+
+        const response = await search(user.auth, document.id, { question: QUESTION });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.tokens.embedding, 2_147_483_647);
+        assert.equal((await readRuns())[0].embeddingTokens, 2_147_483_647);
     });
 });
 

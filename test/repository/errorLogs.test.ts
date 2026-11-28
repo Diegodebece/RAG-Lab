@@ -8,7 +8,8 @@ import path from "node:path";
 // the failing statement, its parameters and the row (which can be the text of a document) in its fields. What the log gets is a
 // string: written out, or made by describeError(error), which is the name, the code and the message of the error and nothing more.
 //
-// The rule, for every call of console.error, console.warn, console.log and console.info in the .ts files of src/: it takes exactly one
+// The rule, for every call of console.error, console.warn, console.log, console.info, console.debug, console.trace, console.dir,
+// process.stdout.write and process.stderr.write in the .ts files of src/: it takes exactly one
 // argument, and that argument is a string literal, a template literal, a describeError(...) call, or several of those joined with +.
 // (A template literal may interpolate whatever it likes: it is already text.) A reference to one of the four that is not a call, such
 // as `.catch(console.error)`, is refused too: it would hand the error object to the log. And describeError is defined in one place,
@@ -215,13 +216,17 @@ interface Problem {
     reason: string;
 }
 
-// every use of console.error, console.warn, console.log and console.info in the source that breaks the rule, and how many calls there were
+// Everything that writes to the log or to the terminal (finding T3 of round 2): the four console methods of the rule, the other ones that
+// print what they are given (debug, trace, dir) and a direct write to the standard output or error. All of them follow the same rule.
+const LOG_CALL = /\b(?:console\.(?:error|warn|log|info|debug|trace|dir)|process\.(?:stdout|stderr)\.write)\b/g;
+
+// every use of those in the source that breaks the rule, and how many calls there were
 const checkSource = (original: string): { problems: Problem[]; calls: number } => {
     const source = blankComments(original);
     const problems: Problem[] = [];
     let calls = 0;
 
-    for (const found of source.matchAll(/\bconsole\.(error|warn|log|info)\b/g)) {
+    for (const found of source.matchAll(LOG_CALL)) {
         const line = source.slice(0, found.index).split("\n").length;
         const after = found.index + found[0].length;
         const next = source.slice(after).match(/^\s*\(/);
@@ -305,6 +310,36 @@ describe("the scan for error objects in the log: the scan itself", () => {
         assert.deepEqual(checkSource(source), { problems: [], calls: 1 });
     });
 
+    // T3: the scan used to read four console methods only, so a debug, a trace, a dir or a direct write to a stream could print an error object
+    it("reads console.debug, console.trace, console.dir, process.stdout.write and process.stderr.write like the other four", () => {
+        const accepted = [
+            "console.debug(\"text\");",
+            "console.trace(`text ${describeError(error)}`);",
+            "console.dir(describeError(error));",
+            "process.stdout.write(\"a line\\n\");",
+            "process.stderr.write(`text ${a}\\n`);"
+        ].join("\n");
+
+        assert.deepEqual(checkSource(accepted), { problems: [], calls: 5 });
+
+        const { problems, calls } = checkSource([
+            "console.debug(error);",
+            "console.trace(\"a\", error);",
+            "console.dir(error, { depth: 5 });",
+            "process.stdout.write(JSON.stringify(error));",
+            "process.stderr.write(error.stack);",
+            "stream.on(\"error\", process.stderr.write);"
+        ].join("\n"));
+
+        assert.equal(calls, 5, "the sixth is not a call");
+        assert.deepEqual(problems.map((problem) => problem.line), [1, 2, 3, 4, 5, 6]);
+        assert.match(problems[5].reason, /without calling it/);
+    });
+
+    it("does not take a longer name that starts like one of them for a call: console.debugging, process.stdout.writer, and a stream of its own", () => {
+        assert.deepEqual(checkSource("mylogger.console.debugging(x);\nthing.process.stdout.writer(y);\nconst out = streams.stdout.write(z);"), { problems: [], calls: 0 });
+    });
+
     it("tells the line of each problem", () => {
         const { problems } = checkSource("const a = 1;\n\nconsole.error(\"fine\");\nconsole.error(\"bad\", error);\n");
 
@@ -313,7 +348,7 @@ describe("the scan for error objects in the log: the scan itself", () => {
 });
 
 describe("the log", () => {
-    it("never gets an error object: every console.error, warn, log and info call in src/ takes one argument that is text", async () => {
+    it("never gets an error object: every console call (error, warn, log, info, debug, trace, dir) and every write to stdout or stderr in src/ takes one argument that is text", async () => {
         const files = await listSourceFiles(path.join(ROOT, "src"));
         const problems: string[] = [];
         let calls = 0;

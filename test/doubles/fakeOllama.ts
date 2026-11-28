@@ -134,6 +134,8 @@ export interface EmbeddingsOptions {
     zeroVector?: boolean;
     // the answer has no prompt_eval_count
     omitTokenCount?: boolean;
+    // the answer reports this prompt_eval_count instead of the sum of fakeTokenCount of the inputs, for a count that is out of range
+    promptTokens?: number;
     // the first number of every vector is this value instead of the usual one, for a number a float4 cannot hold
     firstValue?: number;
     // the vector of each text that is a key, padded with zeros to the dimensions; any other text gets the usual vector
@@ -171,7 +173,7 @@ export const embeddings = (options: EmbeddingsOptions = {}): FakeOllamaHandler =
         const answer: Record<string, unknown> = { model, embeddings: vectors };
 
         if (!options.omitTokenCount) {
-            answer.prompt_eval_count = input.reduce((sum, text) => sum + fakeTokenCount(text), 0);
+            answer.prompt_eval_count = options.promptTokens ?? input.reduce((sum, text) => sum + fakeTokenCount(text), 0);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(answer));

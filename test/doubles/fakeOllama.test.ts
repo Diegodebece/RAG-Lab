@@ -146,6 +146,17 @@ describe("fake Ollama: the embed endpoint", () => {
         assert.deepEqual(seen, ["x", "y"]);
     });
 
+    it("embeddings() can report a chosen prompt_eval_count instead of the sum of the inputs' counts", { timeout: 5000 }, async () => {
+        fake.respond("/api/embed", embeddings({ promptTokens: 2 ** 31 }));
+
+        const answer = await (await embed({ model: "m:1", input: ["a", "b"] })).json() as { prompt_eval_count: number };
+
+        assert.equal(answer.prompt_eval_count, 2 ** 31);
+
+        fake.respond("/api/embed", embeddings({ promptTokens: 0 }));
+        assert.equal(((await (await embed({ model: "m:1", input: ["a"] })).json()) as { prompt_eval_count: number }).prompt_eval_count, 0, "0 is a count, not 'no option'");
+    });
+
     it("embeddings() can put a chosen number first in every vector", { timeout: 5000 }, async () => {
         fake.respond("/api/embed", embeddings({ firstValue: 1e39 }));
 

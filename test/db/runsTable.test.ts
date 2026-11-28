@@ -325,6 +325,82 @@ describe("the runs table: what the API role may do with it", () => {
     });
 });
 
+// The count of the day's questions (round 2, finding F6): one row of question_usage for every embedding that was done for a question,
+// written whether or not the run was stored afterwards (a client that hangs up during the embedding still used the model). Like
+// index_build_usage (migration 008): written once and only ever counted, and it goes with its user. It is part of migration 009,
+// which was not merged yet, so there is no migration of its own.
+describe("the question_usage table", () => {
+    const usageCount = async (): Promise<number> => (await ownerPool.query<{ count: number }>("SELECT count(*)::int AS count FROM question_usage")).rows[0].count;
+
+    it("has an identity id, the user and the time, and defaults the time to now", async () => {
+        const { rows } = await ownerPool.query(
+            "SELECT column_name, data_type, is_nullable, is_identity, identity_generation FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'question_usage' ORDER BY column_name"
+        );
+
+        assert.deepEqual(rows, [
+            { column_name: "id", data_type: "bigint", is_nullable: "NO", is_identity: "YES", identity_generation: "ALWAYS" },
+            { column_name: "used_at", data_type: "timestamp with time zone", is_nullable: "NO", is_identity: "NO", identity_generation: null },
+            { column_name: "user_id", data_type: "uuid", is_nullable: "NO", is_identity: "NO", identity_generation: null }
+        ]);
+
+        const userId = await seedUser("ana@example.com");
+        await ownerPool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [userId]);
+        const { rows: stored } = await ownerPool.query<{ used_at: Date }>("SELECT used_at FROM question_usage");
+
+        assert.ok(Math.abs(Date.now() - stored[0].used_at.getTime()) < 60_000, "used_at is now");
+    });
+
+    it("has an index on the user and the time: the foreign key's, and the daily count's", async () => {
+        const indexes = (await indexColumnsOf("question_usage")).map((columns) => columns.join(","));
+
+        assert.ok(indexes.includes("user_id,used_at"), `an index on user_id, used_at; the table has ${JSON.stringify(indexes)}`);
+    });
+
+    it("refuses a row of a user that does not exist (23503), and removes the rows of a user, and only theirs, when the user is deleted", async () => {
+        assert.equal((await failureOf(() => ownerPool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [randomUUID()])))?.code, "23503");
+
+        const ana = await seedUser("ana@example.com");
+        const bob = await seedUser("bob@example.com");
+        await ownerPool.query("INSERT INTO question_usage (user_id) VALUES ($1), ($1), ($2)", [ana, bob]);
+
+        await ownerPool.query("DELETE FROM users WHERE id = $1", [ana]);
+
+        assert.equal(await usageCount(), 1);
+        assert.equal((await ownerPool.query("SELECT 1 FROM question_usage WHERE user_id = $1", [bob])).rowCount, 1, "bob's row is still there");
+    });
+
+    it("lets the API role insert and read it, the way the search does", async () => {
+        const userId = await seedUser("ana@example.com");
+
+        await pool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [userId]);
+        const { rows } = await pool.query<{ count: number }>("SELECT count(*)::int AS count FROM question_usage WHERE user_id = $1 AND used_at > now() - interval '24 hours'", [userId]);
+
+        assert.equal(rows[0].count, 1);
+    });
+
+    it("is refused every UPDATE and DELETE by the API role (42501), so a question cannot be given back and the day's count cannot be rewritten, and the row is unchanged", async () => {
+        const userId = await seedUser("ana@example.com");
+        await ownerPool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [userId]);
+        const read = async () => (await ownerPool.query("SELECT * FROM question_usage")).rows;
+        const before = await read();
+        const statements: Record<string, string> = {
+            "UPDATE of the time (the day's count)": "UPDATE question_usage SET used_at = now() - interval '2 days'",
+            "UPDATE of the owner": `UPDATE question_usage SET user_id = '${randomUUID()}'`,
+            "UPDATE of a column set to itself": "UPDATE question_usage SET user_id = user_id",
+            "DELETE of one user's rows": `DELETE FROM question_usage WHERE user_id = '${userId}'`,
+            "DELETE of every row": "DELETE FROM question_usage"
+        };
+
+        assert.equal(before.length, 1);
+
+        for (const [label, statement] of Object.entries(statements)) {
+            assert.equal((await failureOf(() => pool.query(statement)))?.code, "42501", label);
+        }
+
+        assert.deepEqual(await read(), before, "the row is as it was written");
+    });
+});
+
 // The foreign keys of a run set to NULL when what they point at goes: a run is a record and the day's count, and it stays. The
 // delete is made by the API role, which has no UPDATE on runs: the action of a foreign key runs with the rights of the table's owner.
 describe("the runs table: what happens to a run when what it names is deleted", () => {

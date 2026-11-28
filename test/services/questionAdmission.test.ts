@@ -12,7 +12,7 @@ const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/tes
 const { admitQuestionService, createQuestionDeadline } = await import("../../src/v1/services/questionAdmission.service.js");
 const { AppError } = await import("../../src/v1/utils/appError.util.js");
 const { ModelTimeoutError } = await import("../../src/v1/utils/modelTimeoutError.util.js");
-const { countRows, seedRun, seedUser } = await import("../documentsFixtures.js");
+const { countRows, seedQuestionUsage, seedRun, seedUser } = await import("../documentsFixtures.js");
 
 const IN_PROGRESS = "You already have a question in progress, please wait for it to finish";
 const BUSY = "The server is busy, please try again in a few minutes";
@@ -202,65 +202,75 @@ describe("admitQuestionService: the questions waiting for the model (2 here)", (
     });
 });
 
+// The day's count reads question_usage (round 2, finding F6): a row for every embedding done for a question, whether or not its run
+// was stored afterwards. It does not read runs: a question that was embedded and then lost (a client that hung up during the
+// embedding) still counts, and a seeded run alone does not.
 describe("admitQuestionService: the questions of the day (3 here)", () => {
-    it("answers 429 when the user has 3 runs in the last 24 hours, and admits at 2", { timeout: 15_000 }, async () => {
+    it("answers 429 when the user has 3 counted questions in the last 24 hours, and admits at 2", { timeout: 15_000 }, async () => {
         const ana = await seedUser("ana@example.com");
 
-        await seedRun(ana, { createdAt: ago(1) });
-        await seedRun(ana, { createdAt: ago(12) });
+        await seedQuestionUsage(ana, 1, 1);
+        await seedQuestionUsage(ana, 1, 12);
         await admit(ana).then((ticket) => ticket.release());
 
-        await seedRun(ana, { createdAt: ago(23.9) });
+        await seedQuestionUsage(ana, 1, 23.9);
 
         await assert.rejects(admitQuestionService(ana), isRefusal(429, DAILY));
     });
 
-    it("does not count runs older than 24 hours, and counts the ones from 23 hours ago", { timeout: 15_000 }, async () => {
+    it("does not count questions older than 24 hours, and counts the ones from 23 hours ago", { timeout: 15_000 }, async () => {
         const ana = await seedUser("ana@example.com");
 
         for (const hours of [25, 30, 100]) {
-            await seedRun(ana, { createdAt: ago(hours) });
+            await seedQuestionUsage(ana, 1, hours);
         }
 
         await admit(ana).then((ticket) => ticket.release());
 
         for (const hours of [23, 22, 21]) {
-            await seedRun(ana, { createdAt: ago(hours) });
+            await seedQuestionUsage(ana, 1, hours);
         }
 
         await assert.rejects(admitQuestionService(ana), isRefusal(429, DAILY));
     });
 
-    it("does not count another user's runs", { timeout: 15_000 }, async () => {
+    it("does not count another user's questions", { timeout: 15_000 }, async () => {
         const ana = await seedUser("ana@example.com");
         const bob = await seedUser("bob@example.com");
 
-        for (let run = 0; run < 5; run++) {
-            await seedRun(bob);
-        }
+        await seedQuestionUsage(bob, 5);
 
         await admit(ana);
         await assert.rejects(admitQuestionService(bob), isRefusal(429, DAILY));
     });
 
-    it("counts a run of any status, and stores nothing itself: admitting adds no run", { timeout: 15_000 }, async () => {
+    it("counts question_usage and not runs: three stored runs and no usage is not a day's limit", { timeout: 15_000 }, async () => {
         const ana = await seedUser("ana@example.com");
 
-        await seedRun(ana, { status: "matched" });
-        await seedRun(ana, { status: "no_match" });
-        const before = await countRows("runs");
+        for (let run = 0; run < 3; run++) {
+            await seedRun(ana);
+        }
+
+        await admit(ana);
+    });
+
+    it("stores nothing itself: admitting adds no run and no usage row (the search writes the usage when the embedding is done)", { timeout: 15_000 }, async () => {
+        const ana = await seedUser("ana@example.com");
+
+        await seedQuestionUsage(ana, 2);
+        const runsBefore = await countRows("runs");
+        const usageBefore = await countRows("question_usage");
 
         (await admit(ana)).release();
 
-        assert.equal(await countRows("runs"), before);
+        assert.equal(await countRows("runs"), runsBefore);
+        assert.equal(await countRows("question_usage"), usageBefore);
     });
 
     it("frees the user's slot and the place in the line when it refuses with 429", { timeout: 15_000 }, async () => {
         const [ana, bob, cara] = [await seedUser("ana@example.com"), await seedUser("bob@example.com"), await seedUser("cara@example.com")];
 
-        for (let run = 0; run < 3; run++) {
-            await seedRun(ana);
-        }
+        await seedQuestionUsage(ana, 3);
 
         for (let attempt = 0; attempt < 4; attempt++) {
             await assert.rejects(admitQuestionService(ana), isRefusal(429, DAILY), `attempt ${attempt + 1}: always the daily limit, never 409 or 503`);
@@ -270,8 +280,8 @@ describe("admitQuestionService: the questions of the day (3 here)", () => {
         await admit(bob);
         await admit(cara);
 
-        // and ana's slot is free: once a day has passed for her runs she is admitted
-        await ownerPool.query("UPDATE runs SET created_at = now() - interval '2 days' WHERE user_id = $1", [ana]);
+        // and ana's slot is free: once a day has passed for her questions she is admitted
+        await ownerPool.query("UPDATE question_usage SET used_at = now() - interval '2 days' WHERE user_id = $1", [ana]);
         tickets.splice(0).forEach((ticket) => ticket.release());
         await admit(ana);
     });
@@ -281,9 +291,7 @@ describe("admitQuestionService: the questions of the day (3 here)", () => {
     it("answers 503 busy, and not the daily limit, to a user over her day when the line is full: the line is checked first", { timeout: 15_000 }, async () => {
         const [ana, bob, cara] = [await seedUser("ana@example.com"), await seedUser("bob@example.com"), await seedUser("cara@example.com")];
 
-        for (let run = 0; run < 3; run++) {
-            await seedRun(cara);
-        }
+        await seedQuestionUsage(cara, 3);
 
         await admit(ana);
         await admit(bob);

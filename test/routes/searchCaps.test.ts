@@ -4,10 +4,10 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { dropConnection, embeddings, startFakeOllama, waitForRequests } from "../doubles/fakeOllama.js";
+import { dropConnection, embeddings, holdRequest, startFakeOllama, waitForRequests } from "../doubles/fakeOllama.js";
 
-// The caps of a search that are not a per-minute count (layer 5): the questions of the day (3 here, counted from the runs the user
-// has in the last 24 hours), one question at a time for each user, and at most 2 questions waiting for the model's turn. The
+// The caps of a search that are not a per-minute count (layer 5): the questions of the day (3 here, counted from the question_usage
+// rows the user has in the last 24 hours), one question at a time for each user, and at most 2 questions waiting for the model's turn. The
 // model server is the double, and a question can be held there: the model serves one request at a time for the whole API, so a held
 // question is what makes the others wait. The requests are made over a real HTTP server, because some of the tests hang up.
 process.env.SECRET_KEY = "test-secret-only-for-these-tests-0123456789";
@@ -20,7 +20,7 @@ process.env.OLLAMA_BASE_URL = fake.url;
 const { app } = await import("../../src/app.js");
 const { closeTestPools, ownerPool, resetTestDatabase } = await import("../db/testDatabase.js");
 const { createTestUser } = await import("./testUsers.js");
-const { countRows, seedDocument, seedIndex, seedRun, waitFor } = await import("../documentsFixtures.js");
+const { countRows, seedDocument, seedIndex, seedQuestionUsage, seedRun, waitFor } = await import("../documentsFixtures.js");
 const { getModelTurnWaitingCount } = await import("../../src/v1/services/modelTurn.service.js");
 
 const DAILY = { message: "You have reached the daily limit of questions, please try again later" };
@@ -125,52 +125,63 @@ const seedSearcher = async (email: string, withIndex = true) => {
 
 const ago = (hours: number): Date => new Date(Date.now() - hours * 3_600_000);
 
+// The day's count reads question_usage (round 2, finding F6): one row for every embedding that was done for a question, written when
+// the embedding comes back (or when the client hangs up after the request was sent to Ollama), whether or not the run is stored
+// afterwards. A refusal, a cancel while waiting for the turn, a 503 and a 504 of the model server cost nothing.
 describe("the questions of the day (MAX_QUESTIONS_PER_DAY, 3 here)", () => {
-    it("answers 429 to a user with 3 runs in the last 24 hours, sends nothing to Ollama and stores nothing", { timeout: 20_000 }, async () => {
+    it("answers 429 to a user with 3 counted questions in the last 24 hours, sends nothing to Ollama and stores nothing", { timeout: 20_000 }, async () => {
         const ana = await seedSearcher("ana@example.com");
-        for (let run = 0; run < 3; run++) {
-            await seedRun(ana.user.id, { createdAt: ago(1 + run) });
-        }
+        await seedQuestionUsage(ana.user.id, 1, 1);
+        await seedQuestionUsage(ana.user.id, 1, 2);
+        await seedQuestionUsage(ana.user.id, 1, 3);
 
         const response = await post(ana, ana.documentId, "A question?");
 
         assert.equal(response.status, 429);
         assert.deepEqual(response.body, DAILY);
         assert.deepEqual(embedInputs(), []);
-        assert.equal(await countRows("runs"), 3, "the refused question stored nothing");
+        assert.equal(await countRows("runs"), 0, "the refused question stored no run");
+        assert.equal(await countRows("question_usage"), 3, "and was not counted");
     });
 
-    it("does not count runs older than 24 hours, counts the ones that were stored by searches, and lets the third question of the day in and refuses the fourth", { timeout: 40_000 }, async () => {
+    it("does not count questions older than 24 hours, counts the ones that searches wrote, and lets the third question of the day in and refuses the fourth", { timeout: 40_000 }, async () => {
         const ana = await seedSearcher("ana@example.com");
         const bob = await seedSearcher("bob@example.com");
-        for (let run = 0; run < 3; run++) {
-            await seedRun(bob.user.id, { createdAt: ago(25 + run) });
-        }
-        await seedRun(ana.user.id, { createdAt: ago(2) });
+        await seedQuestionUsage(bob.user.id, 3, 25);
+        await seedQuestionUsage(ana.user.id, 1, 2);
 
-        assert.equal((await post(bob, bob.documentId, "Bob's question?")).status, 200, "three runs from 25 hours ago are not counted");
+        assert.equal((await post(bob, bob.documentId, "Bob's question?")).status, 200, "three questions from 25 hours ago are not counted");
 
-        assert.equal((await post(ana, ana.documentId, "First of today?")).status, 200, "the second run of the day");
-        assert.equal((await post(ana, ana.documentId, "Second of today?")).status, 200, "the third run of the day");
+        assert.equal((await post(ana, ana.documentId, "First of today?")).status, 200, "the second question of the day");
+        assert.equal((await post(ana, ana.documentId, "Second of today?")).status, 200, "the third question of the day");
         const fourth = await post(ana, ana.documentId, "Third of today?");
 
-        assert.equal(fourth.status, 429, "the seeded run and the two stored by searches make three");
+        assert.equal(fourth.status, 429, "the seeded question and the two asked by searches make three");
         assert.deepEqual(fourth.body, DAILY);
-        assert.equal(await countRows("runs", "user_id = $1", [ana.user.id]), 3);
+        assert.equal(await countRows("question_usage", "user_id = $1", [ana.user.id]), 3);
+        assert.equal(await countRows("runs", "user_id = $1", [ana.user.id]), 2, "the seeded question has no run: only the searches stored one");
     });
 
-    it("does not count another user's runs", { timeout: 20_000 }, async () => {
+    it("does not count another user's questions", { timeout: 20_000 }, async () => {
         const ana = await seedSearcher("ana@example.com");
         const bob = await seedSearcher("bob@example.com");
-        for (let run = 0; run < 5; run++) {
-            await seedRun(bob.user.id);
-        }
+        await seedQuestionUsage(bob.user.id, 5);
 
         assert.equal((await post(ana, ana.documentId, "Ana's question?")).status, 200);
         assert.equal((await post(bob, bob.documentId, "Bob's question?")).status, 429);
     });
 
-    it("does not count a search that failed because Ollama was down: three failures and the next three searches are accepted", { timeout: 40_000 }, async () => {
+    it("counts the questions that were embedded and not the runs that are stored: three stored runs are not a day's limit", { timeout: 20_000 }, async () => {
+        const ana = await seedSearcher("ana@example.com");
+        for (let run = 0; run < 3; run++) {
+            await seedRun(ana.user.id, { createdAt: ago(1 + run) });
+        }
+
+        assert.equal((await post(ana, ana.documentId, "A question?")).status, 200);
+        assert.equal(await countRows("question_usage", "user_id = $1", [ana.user.id]), 1);
+    });
+
+    it("does not count a search that failed because Ollama was down: three failures write no usage and the next three searches are accepted", { timeout: 40_000 }, async () => {
         const ana = await seedSearcher("ana@example.com");
         fake.respond("/api/embed", dropConnection);
 
@@ -182,6 +193,7 @@ describe("the questions of the day (MAX_QUESTIONS_PER_DAY, 3 here)", () => {
         }
 
         assert.equal(await countRows("runs"), 0, "no failure stored a run");
+        assert.equal(await countRows("question_usage"), 0, "and no failure was counted");
         fake.respond("/api/embed", answerEmbeddings());
 
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -189,18 +201,72 @@ describe("the questions of the day (MAX_QUESTIONS_PER_DAY, 3 here)", () => {
         }
 
         assert.equal((await post(ana, ana.documentId, "One too many?")).status, 429, "only the three that ran are counted");
+        assert.equal(await countRows("question_usage"), 3);
     });
 
     it("answers 409 for a document without a ready index before it looks at the day: a user over the limit hears about the index", { timeout: 20_000 }, async () => {
         const ana = await seedSearcher("ana@example.com", false);
-        for (let run = 0; run < 3; run++) {
-            await seedRun(ana.user.id);
-        }
+        await seedQuestionUsage(ana.user.id, 3);
 
         const response = await post(ana, ana.documentId, "A question?");
 
         assert.equal(response.status, 409);
         assert.deepEqual(response.body, { message: "This document has no ready index for chunk size 1000" });
+    });
+});
+
+// Finding F6 (it changes decision D5) and T1: a client that hangs up while Ollama is embedding its question still used the model, so
+// the question is counted (a row of question_usage), although no run is stored. Hanging up before the request was sent to Ollama, while
+// waiting for the turn, is free (the test of "a client that hangs up" below). The embed connection is closed, and the user's place
+// is freed, so the user can ask again right away.
+describe("a client that hangs up during the embedding", () => {
+    it("counts the question: the usage row is written and no run is stored, the connection to Ollama is closed, and with the day's other questions used up the next one is a 429", { timeout: 60_000 }, async () => {
+        const ana = await seedSearcher("ana@example.com");
+        await seedQuestionUsage(ana.user.id, 2, 1);
+        const held = holdRequest();
+        fake.respond("/api/embed", held.handler);
+
+        const controller = new AbortController();
+        const leaving = post(ana, ana.documentId, "ana hangs up", controller.signal);
+        leaving.catch(() => {});
+        await within(10_000, "the embedding to reach Ollama", held.arrived);
+
+        controller.abort();
+        await assert.rejects(leaving);
+        await within(10_000, "the API to close its request to Ollama", held.closed);
+        await waitFor("the question to be counted", async () => (await countRows("question_usage", "user_id = $1", [ana.user.id]) === 3 ? true : undefined), 10_000);
+
+        assert.equal(await countRows("runs"), 0, "no run is stored for a question nobody was told the answer to");
+
+        fake.respond("/api/embed", answerEmbeddings());
+        const next = await post(ana, ana.documentId, "ana asks again");
+
+        assert.equal(next.status, 429, "two seeded questions and the one that was lost are the three of the day");
+        assert.deepEqual(next.body, DAILY);
+        assert.ok(!embedInputs().some((input) => input[0] === "ana asks again"), "and it never reached Ollama");
+    });
+
+    it("frees the user's place at once: the user can ask again right away, without a 409, and both questions are counted", { timeout: 60_000 }, async () => {
+        const ana = await seedSearcher("ana@example.com");
+        const held = holdRequest();
+        fake.respond("/api/embed", held.handler);
+
+        const controller = new AbortController();
+        const leaving = post(ana, ana.documentId, "ana hangs up", controller.signal);
+        leaving.catch(() => {});
+        await within(10_000, "the embedding to reach Ollama", held.arrived);
+
+        controller.abort();
+        await assert.rejects(leaving);
+        await within(10_000, "the API to close its request to Ollama", held.closed);
+        await waitFor("the question to be counted", async () => (await countRows("question_usage", "user_id = $1", [ana.user.id]) === 1 ? true : undefined), 10_000);
+
+        fake.respond("/api/embed", answerEmbeddings());
+        const next = await post(ana, ana.documentId, "ana asks again");
+
+        assert.equal(next.status, 200, `neither a 409 for a question in progress nor a 503: ${JSON.stringify(next.body)}`);
+        assert.equal(await countRows("runs", "user_id = $1", [ana.user.id]), 1, "only the second question was stored");
+        assert.equal(await countRows("question_usage", "user_id = $1", [ana.user.id]), 2, "the lost question and the answered one");
     });
 });
 
@@ -317,5 +383,6 @@ describe("a client that hangs up", () => {
         assert.equal((await within(20_000, "bob's second answer", again)).status, 200);
         assert.deepEqual(embedInputs(), [["ana holds the turn"], ["bob again"]], "no embedding was ever sent for the question bob gave up");
         assert.equal(await countRows("runs", "user_id = $1", [bob.user.id]), 1, "only the second question of bob was stored");
+        assert.equal(await countRows("question_usage", "user_id = $1", [bob.user.id]), 1, "and only the second was counted: leaving the line before the request was sent is free");
     });
 });

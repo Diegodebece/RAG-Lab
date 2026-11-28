@@ -35,7 +35,7 @@ const ALL_MIGRATIONS = [
     "006_documents.sql", "007_document_indexes.sql", "008_index_build_usage.sql", "009_runs.sql"
 ];
 
-const ALL_TABLES = ["chunks", "default_profile", "document_indexes", "documents", "index_build_usage", "profiles", "runs", "schema_migrations", "users"];
+const ALL_TABLES = ["chunks", "default_profile", "document_indexes", "documents", "index_build_usage", "profiles", "question_usage", "runs", "schema_migrations", "users"];
 
 // closes both pools once, after every suite in this file
 after(closeTestPools);

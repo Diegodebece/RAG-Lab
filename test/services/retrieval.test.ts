@@ -119,6 +119,62 @@ describe("findFragmentsService: the ranking", () => {
     });
 });
 
+// Findings F3 and T5. PostgreSQL treats NaN as greater than every number, so a chunk whose score is NaN passes "score >= minScore" and
+// sorts after every real score: it would be returned as a match (its score would be null in the JSON). The cosine similarity of the
+// question (1, 1) and a chunk (3e38, 3e38) overflows float4 (the products are infinite: infinity over infinity), and a chunk (0, 1e-30)
+// against the question (1, 0) underflows (0 over 0): both give NaN in this database's pgvector, and only the owner can store such a
+// chunk (the API refuses a vector like that from a model).
+describe("findFragmentsService: a chunk whose score is NaN", () => {
+    const matchesOf = (fragments: { chunkIndex: number; retrieval: string }[]): number[] => fragments.filter((fragment) => fragment.retrieval === "match").map((fragment) => fragment.chunkIndex);
+
+    it("does not return a chunk whose norm overflows float4 as a match, whatever topK and minScore are", { timeout: 15_000 }, async () => {
+        const userId = await seedUser("ana@example.com");
+        const document = await seedDocument(userId);
+        const index = await seedIndex(document.id, {
+            status: "ready",
+            chunks: textsOf("overflow", 5),
+            // scores against (1, 1): 1, 0.707, 0.707, 0.707, NaN
+            vectors: [[1, 1], [0, 1], [0, 1], [0, 1], [3e38, 3e38]]
+        });
+
+        const fragments = await findFragmentsService(userId, index.id, padVector([1, 1]), { topK: 10, minScore: 0, neighborWindow: 1 });
+
+        assert.deepEqual(matchesOf(fragments), [0, 1, 2, 3], "the chunk of position 4 is not among the matches");
+
+        for (const fragment of fragments) {
+            assert.ok(fragment.score === undefined || Number.isFinite(fragment.score), `chunk ${fragment.chunkIndex} has a score of ${String(fragment.score)}`);
+        }
+    });
+
+    it("does not return a chunk whose norm underflows float4 as a match", { timeout: 15_000 }, async () => {
+        const userId = await seedUser("ana@example.com");
+        const document = await seedDocument(userId);
+        const index = await seedIndex(document.id, { status: "ready", chunks: textsOf("underflow", 5), vectors: [[3, 4], [0, 1], [0, 1], [0, 1], [0, 1e-30]] });
+
+        const fragments = await findFragmentsService(userId, index.id, QUESTION, { topK: 10, minScore: 0.3, neighborWindow: 1 });
+
+        assert.deepEqual(summary(fragments), [[0, "match", 0.6], [1, "neighbor", undefined]]);
+    });
+
+    it("does not let it take a place among the topK, and returns an empty list when nothing else reaches minScore", { timeout: 15_000 }, async () => {
+        const userId = await seedUser("ana@example.com");
+        const document = await seedDocument(userId);
+        const only = await seedIndex(document.id, { status: "ready", chunkSize: 300, chunks: textsOf("only", 3), vectors: [[0, 1], [0, 1], [0, 1e-30]] });
+
+        assert.deepEqual(await findFragmentsService(userId, only.id, QUESTION, { topK: 3, minScore: 0.3, neighborWindow: 1 }), []);
+    });
+
+    it("can still return a chunk that scores NaN as a neighbor of a match: it is text next to a match and has no score", { timeout: 15_000 }, async () => {
+        const userId = await seedUser("ana@example.com");
+        const document = await seedDocument(userId);
+        const index = await seedIndex(document.id, { status: "ready", chunks: textsOf("next", 3), vectors: [[3, 4], [0, 1e-30], [0, 1]] });
+
+        const fragments = await findFragmentsService(userId, index.id, QUESTION, { topK: 3, minScore: 0.3, neighborWindow: 1 });
+
+        assert.deepEqual(summary(fragments), [[0, "match", 0.6], [1, "neighbor", undefined]]);
+    });
+});
+
 describe("findFragmentsService: the neighbors", () => {
     it("adds one neighbor on each side at window 1, and two at window 2, in the order m-2, m-1, m+1, m+2", { timeout: 15_000 }, async () => {
         const userId = await seedUser("ana@example.com");

@@ -142,6 +142,15 @@ export const seedUsage = async (userId: string, count: number, hoursAgo = 0): Pr
     );
 };
 
+// `count` questions of the user that were counted, each `hoursAgo` hours old (question_usage is what the daily limit of questions
+// counts: a row for every embedding that was done, whether or not the run was stored afterwards)
+export const seedQuestionUsage = async (userId: string, count: number, hoursAgo = 0): Promise<void> => {
+    await (await owner()).query(
+        "INSERT INTO question_usage (user_id, used_at) SELECT $1::uuid, now() - ($3::numeric * interval '1 hour') FROM generate_series(1, $2::int)",
+        [userId, count, hoursAgo]
+    );
+};
+
 export interface SeedRunOptions {
     // the kind the row says it is, and the kind inside its configuration; the table accepts only "retrieval" until layer 6
     kind?: string;
@@ -206,7 +215,7 @@ export const readRuns = async (where = "true", parameters: unknown[] = []): Prom
         parameters
     )).rows;
 
-export const countRows = async (table: "documents" | "document_indexes" | "chunks" | "index_build_usage" | "runs", where = "true", parameters: unknown[] = []): Promise<number> =>
+export const countRows = async (table: "documents" | "document_indexes" | "chunks" | "index_build_usage" | "runs" | "question_usage", where = "true", parameters: unknown[] = []): Promise<number> =>
     (await (await owner()).query<{ count: number }>(`SELECT count(*)::int AS count FROM ${table} WHERE ${where}`, parameters)).rows[0].count;
 
 export interface IndexRow {
