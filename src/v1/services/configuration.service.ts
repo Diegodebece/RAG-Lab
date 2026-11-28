@@ -8,7 +8,11 @@ import {
     MAX_DOCUMENTS_PER_USER,
     MAX_INDEX_BUILDS_PER_DAY,
     MAX_INDEX_BUILDS_PER_DAY_TOTAL,
-    MAX_PROFILES_PER_USER
+    MAX_PROFILES_PER_USER,
+    MAX_QUESTION_SECONDS,
+    MAX_QUESTIONS_PER_DAY,
+    QUESTION_MAX_CHARACTERS,
+    QUESTIONS_PER_MINUTE
 } from "../config/limits.config.js";
 import type { ConfigurationSettings, ConfigurationView, ResolvedConfiguration, SettingDefinition } from "../types/configuration.type.js";
 import { AppError } from "../utils/appError.util.js";
@@ -61,7 +65,7 @@ const readDefaultProfile = async (targetPool: Pool): Promise<DefaultProfileRow> 
 };
 
 // What each setting accepts, for a client that builds a form: the definition of every setting in order, the defaults the
-// database holds right now, and the limits on profiles.
+// database holds right now, and the limits on profiles, documents, index builds and questions.
 export const getConfigurationService = async (): Promise<ConfigurationView> => {
     const defaults = await readDefaultProfile(pool);
 
@@ -80,6 +84,12 @@ export const getConfigurationService = async (): Promise<ConfigurationView> => {
             maxActivePerUser: MAX_ACTIVE_INDEX_BUILDS_PER_USER,
             maxBuildsPerDay: MAX_INDEX_BUILDS_PER_DAY,
             maxBuildsPerDayTotal: MAX_INDEX_BUILDS_PER_DAY_TOTAL
+        },
+        questions: {
+            perMinute: QUESTIONS_PER_MINUTE,
+            maxPerDay: MAX_QUESTIONS_PER_DAY,
+            maxSeconds: MAX_QUESTION_SECONDS,
+            maxCharacters: QUESTION_MAX_CHARACTERS
         }
     };
 };

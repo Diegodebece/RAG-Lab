@@ -10,6 +10,8 @@ export type SettingsInput = Partial<ConfigurationSettings>;
 export interface ResolveConfigurationInput {
     profileId?: string;
     overrides?: SettingsInput;
+    // only the preview of a configuration reads it (previewConfigurationService); the resolver itself ignores it
+    documentId?: string;
 }
 
 // One definition of each setting's rule, built from its cap, so the caps are written once (configuration.config.ts) and
@@ -119,14 +121,23 @@ export const completeSettingsSchema = SettingsJoi.object<ConfigurationSettings>(
 
 // the plain hyphenated UUID of any version and case: the rule of isUuid, so the id is never valid to this schema and
 // unknown to the lookup that follows
-const profileIdRule = Joi.string().pattern(UUID_PATTERN).messages({
+export const profileIdRule = Joi.string().pattern(UUID_PATTERN).messages({
     "string.base": "Profile id must be a valid UUID",
     "string.empty": "Profile id must be a valid UUID",
     "string.pattern.base": "Profile id must be a valid UUID"
 });
 
-// the body of POST /v1/configuration/resolve: which profile to start from, and settings that win over it
+// the same rule for the id of a document
+const documentIdRule = Joi.string().pattern(UUID_PATTERN).messages({
+    "string.base": "Document id must be a valid UUID",
+    "string.empty": "Document id must be a valid UUID",
+    "string.pattern.base": "Document id must be a valid UUID"
+});
+
+// the body of POST /v1/configuration/resolve: which profile to start from, settings that win over it, and, to ask which index
+// the configuration would use, the document
 export const resolveConfigurationSchema = Joi.object<ResolveConfigurationInput>({
     profileId: profileIdRule,
-    overrides: settingsSchema
+    overrides: settingsSchema,
+    documentId: documentIdRule
 });

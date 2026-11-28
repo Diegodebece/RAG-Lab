@@ -73,6 +73,12 @@ describe("embedTextsService: the answer", () => {
         assert.equal(result.promptTokens, fakeTokenCount("one short text") + fakeTokenCount("a second and somewhat longer text"));
     });
 
+    it("accepts the largest token count an integer column holds, 2147483647", { timeout: 5000 }, async () => {
+        fake.respond("/api/embed", jsonBody(goodAnswer(1, { prompt_eval_count: 2_147_483_647 })));
+
+        assert.equal((await embedTextsService(MODEL, ["a"], { timeoutMs: 2000 })).promptTokens, 2_147_483_647);
+    });
+
     it("accepts a token count of 0", { timeout: 5000 }, async () => {
         fake.respond("/api/embed", jsonBody(goodAnswer(1, { prompt_eval_count: 0 })));
 
@@ -155,6 +161,11 @@ describe("embedTextsService: an answer that is not what the API needs", () => {
         "a fractional prompt_eval_count": jsonBody(goodAnswer(2, { prompt_eval_count: 2.5 })),
         "a prompt_eval_count written as text": jsonBody(goodAnswer(2, { prompt_eval_count: "7" })),
         "a prompt_eval_count that is null": jsonBody(goodAnswer(2, { prompt_eval_count: null })),
+        // stored in an integer column (finding O5): a count that does not fit would be refused by the database after the work was done,
+        // so it is refused where the answer is read, as the model's fault
+        "a prompt_eval_count of 2 ** 31, one above what an integer column holds": jsonBody(goodAnswer(2, { prompt_eval_count: 2 ** 31 })),
+        "a prompt_eval_count of 2 ** 53 - 1, a safe integer that no column holds": jsonBody(goodAnswer(2, { prompt_eval_count: Number.MAX_SAFE_INTEGER })),
+        "a prompt_eval_count of 1e12": jsonBody(goodAnswer(2, { prompt_eval_count: 1e12 })),
         "embeddings that are not a list": jsonBody(goodAnswer(2, { embeddings: "x" })),
         "no embeddings key": jsonBody({ model: MODEL, prompt_eval_count: 7 }),
         "an answer that is not an object": jsonBody([1, 2, 3]),

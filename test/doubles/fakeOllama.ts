@@ -27,9 +27,15 @@ export interface FakeOllama {
     close: () => Promise<void>;
 }
 
-// Ready: the models Ollama reports as installed (GET /api/tags).
-export const modelList = (names: string[]): FakeOllamaHandler => (req, res) => {
-    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ models: names.map((name) => ({ name })) }));
+// A model of the list: its name, and optionally the digest Ollama reports for it (the hash of its files).
+export type FakeModel = string | { name: string; digest?: string };
+
+// Ready: the models Ollama reports as installed (GET /api/tags). A model given as a plain name has no digest in the answer; one
+// given as { name, digest } has it.
+export const modelList = (models: FakeModel[]): FakeOllamaHandler => (req, res) => {
+    const entries = models.map((model) => (typeof model === "string" ? { name: model } : model.digest === undefined ? { name: model.name } : { name: model.name, digest: model.digest }));
+
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ models: entries }));
 };
 
 // An HTTP 200 with the given JSON value as its body, for answers of an unexpected shape.
@@ -107,6 +113,17 @@ export const fakeVectorFor = (text: string, dimensions = EMBEDDING_DIMENSIONS): 
     return Array.from({ length: dimensions }, (_, index) => ((seed + index) % 97) / 97 + 0.01);
 };
 
+// The first numbers of a vector, then zeros up to the dimensions: padVector([3, 4]) is (3, 4, 0, 0, ...). Integer vectors like this
+// have exact cosine similarities (a question (1, 0, ...) and a chunk (3, 4, 0, ...) give exactly 0.6), so a test can put a score
+// right on a threshold.
+export const padVector = (head: number[], dimensions = EMBEDDING_DIMENSIONS): number[] => {
+    if (head.length > dimensions) {
+        throw new Error(`a vector of ${head.length} numbers does not fit in ${dimensions} dimensions`);
+    }
+
+    return [...head, ...new Array<number>(dimensions - head.length).fill(0)];
+};
+
 // The token count the double reports for one text: a quarter of its length, at least 1. A request reports the sum.
 export const fakeTokenCount = (text: string): number => Math.max(1, Math.ceil(text.length / 4));
 
@@ -117,8 +134,12 @@ export interface EmbeddingsOptions {
     zeroVector?: boolean;
     // the answer has no prompt_eval_count
     omitTokenCount?: boolean;
+    // the answer reports this prompt_eval_count instead of the sum of fakeTokenCount of the inputs, for a count that is out of range
+    promptTokens?: number;
     // the first number of every vector is this value instead of the usual one, for a number a float4 cannot hold
     firstValue?: number;
+    // the vector of each text that is a key, padded with zeros to the dimensions; any other text gets the usual vector
+    vectors?: Record<string, number[]>;
     // runs after the request arrived and before the answer is sent, for a test that changes the database in the middle of a batch
     beforeAnswer?: (input: string[]) => Promise<void> | void;
 }
@@ -140,7 +161,8 @@ export const embeddings = (options: EmbeddingsOptions = {}): FakeOllamaHandler =
 
         const dimensions = options.dimensions ?? EMBEDDING_DIMENSIONS;
         const vectors = input.map((text) => {
-            const vector = options.zeroVector ? new Array<number>(dimensions).fill(0) : fakeVectorFor(text, dimensions);
+            const mapped = options.vectors !== undefined && Object.hasOwn(options.vectors, text) ? padVector(options.vectors[text], dimensions) : undefined;
+            const vector = mapped ?? (options.zeroVector ? new Array<number>(dimensions).fill(0) : fakeVectorFor(text, dimensions));
 
             if (options.firstValue !== undefined) {
                 vector[0] = options.firstValue;
@@ -151,12 +173,17 @@ export const embeddings = (options: EmbeddingsOptions = {}): FakeOllamaHandler =
         const answer: Record<string, unknown> = { model, embeddings: vectors };
 
         if (!options.omitTokenCount) {
-            answer.prompt_eval_count = input.reduce((sum, text) => sum + fakeTokenCount(text), 0);
+            answer.prompt_eval_count = options.promptTokens ?? input.reduce((sum, text) => sum + fakeTokenCount(text), 0);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(answer));
     })();
 };
+
+// The embed endpoint with chosen vectors: the vector in the map for each text that is a key (padded with zeros to 1024
+// numbers), and the usual one for any other text. The token count is the usual one.
+export const embeddingsFor = (vectors: Record<string, number[]>, options: EmbeddingsOptions = {}): FakeOllamaHandler =>
+    embeddings({ ...options, vectors });
 
 // Waits until the double has received this many requests to the path (or more), failing instead of waiting for ever.
 export const waitForRequests = async (fake: FakeOllama, path: string, count: number, timeoutMs = 10_000): Promise<void> => {

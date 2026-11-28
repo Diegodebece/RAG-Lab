@@ -237,6 +237,34 @@ describe("server startup: database schema", () => {
         assert.doesNotMatch(server.output().stdout, /Server running/);
     });
 
+    // The other test where the log is the behavior under test (the first is test/services/events.test.ts): a database error carries
+    // the failing statement, the row and the server's internals in its fields, and printing the whole object (console.error with the
+    // error as an argument) writes them all. The log says the name, the code and the message of the error, in one line.
+    it("says why the schema could not be checked in one line, with the code and the message of the database's error and none of its other fields", { timeout: 30_000 }, async () => {
+        const { resetTestDatabase, ownerPool } = await loadDatabase();
+        await resetTestDatabase();
+
+        try {
+            // the check reads schema_migrations: without the right to read it, the database refuses with permission denied (42501)
+            await ownerPool.query("REVOKE SELECT ON schema_migrations FROM rag_lab_api");
+            const server = await startServer();
+
+            assert.equal(await waitForExit(server), 1);
+
+            const { stderr, stdout } = server.output();
+            assert.ok(stderr.includes("the database schema could not be checked:"), `stderr was ${JSON.stringify(stderr)}`);
+            assert.ok(stderr.includes("[42501]"), "the code of the error");
+            assert.ok(stderr.includes("permission denied"), "its message");
+            assert.ok(!stderr.includes("routine"), "no field of the pg error object (routine)");
+            assert.ok(!stderr.includes("aclcheck_error"), "no field of the pg error object (the routine's name)");
+            assert.ok(!stderr.includes("severity"), "no field of the pg error object (severity)");
+            assert.doesNotMatch(stdout, /Server running/);
+        } finally {
+            // the next tests need a database the API role can read
+            await resetTestDatabase();
+        }
+    });
+
     it("starts when every migration is applied, and reports the database as up", { timeout: 15_000 }, async () => {
         const { resetTestDatabase } = await loadDatabase();
         await resetTestDatabase();

@@ -10,6 +10,7 @@ import { subscribeToEvents } from "./v1/services/events.service.js";
 import { recoverIndexBuildsService, startIndexingWorkerService, stopIndexingWorkerService } from "./v1/services/indexingQueue.service.js";
 import { getMigrationStateService } from "./v1/services/schema.service.js";
 import { isDatabaseUnreachableError } from "./v1/utils/databaseError.util.js";
+import { describeError } from "./v1/utils/describeError.util.js";
 
 // Docker waits 10 seconds after SIGTERM before killing the container: the requests in progress get 6 seconds,
 // then the database connections get 2 more (a request stuck on a frozen database holds its connection until then).
@@ -18,8 +19,6 @@ const POOL_CLOSE_TIMEOUT_MS = 2_000;
 
 // how long after a check that found the database unreachable the next one starts
 const DATABASE_RETRY_INTERVAL_MS = 3_000;
-
-const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const problems = getStartupConfigProblems(process.env);
 
@@ -102,7 +101,7 @@ const checkDatabase = async (): Promise<boolean> => {
             return false;
         }
 
-        console.error("Cannot start the server: the database schema could not be checked", error);
+        console.error(`Cannot start the server: the database schema could not be checked: ${describeError(error)}`);
         process.exit(1);
     }
 };
@@ -213,7 +212,7 @@ const shutDown = async (signal: string): Promise<void> => {
         console.log("Server stopped");
         process.exit(0);
     } catch (error) {
-        console.error("Could not shut down cleanly", error);
+        console.error(`Could not shut down cleanly: ${describeError(error)}`);
         process.exit(1);
     }
 };

@@ -1,5 +1,6 @@
 import pg from "pg";
 import type { Pool, PoolClient } from "pg";
+import { describeError } from "../utils/describeError.util.js";
 
 // What both kinds of connection share: the API's (db.config.ts) and the migration script's. This file reads no
 // environment variable, so the migration script can use it without DATABASE_URL, which is the API's.
@@ -26,7 +27,7 @@ export const createPool = ({ connectionString, queryTimeoutMs }: PoolOptions): P
     // An idle connection can break (for example when PostgreSQL restarts). Without a listener,
     // that "error" event would crash the process; the pool replaces the connection on its own.
     newPool.on("error", (error) => {
-        console.error("Unexpected error on an idle PostgreSQL connection", error);
+        console.error(`Unexpected error on an idle PostgreSQL connection: ${describeError(error)}`);
     });
 
     return newPool;
@@ -42,7 +43,7 @@ export const runInTransaction = async <T>(targetPool: Pool, callback: (client: P
     let broken = false;
     const onError = (error: Error): void => {
         broken = true;
-        console.error("A PostgreSQL connection broke during a transaction", error);
+        console.error(`A PostgreSQL connection broke during a transaction: ${describeError(error)}`);
     };
     client.on("error", onError);
 
@@ -57,7 +58,7 @@ export const runInTransaction = async <T>(targetPool: Pool, callback: (client: P
         } catch (rollbackError) {
             // the original error says what went wrong; a failed ROLLBACK must not replace it
             broken = true;
-            console.error("Could not roll back a transaction", rollbackError);
+            console.error(`Could not roll back a transaction: ${describeError(rollbackError)}`);
         }
         throw error;
     } finally {

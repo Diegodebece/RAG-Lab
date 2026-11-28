@@ -15,7 +15,8 @@ for (const name of [
     process.env[name] = RELAXED;
 }
 
-// the uploads per minute of one user may not go above 1000: the highest value the setting accepts
+// the uploads and the questions per minute of one user may not go above 1000: the highest value the settings accept
 process.env.UPLOAD_REQUESTS_PER_MINUTE = "1000";
+process.env.QUESTIONS_PER_MINUTE = "1000";
 
 export {};

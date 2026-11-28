@@ -1,4 +1,5 @@
 import type { LiveEvent } from "../types/events.type.js";
+import { describeError } from "../utils/describeError.util.js";
 
 type LiveEventListener = (event: LiveEvent) => void;
 
@@ -20,7 +21,7 @@ export const emitEvent = (event: LiveEvent): void => {
         try {
             listener(event);
         } catch (error) {
-            console.error("An event listener failed", error);
+            console.error(`An event listener failed: ${describeError(error)}`);
         }
     }
 };

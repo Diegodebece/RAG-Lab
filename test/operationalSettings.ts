@@ -32,6 +32,12 @@ export const OPERATIONAL_DEFAULTS: Record<string, string> = {
     MAX_QUEUED_INDEX_BUILDS: "20",
     MAX_INDEX_BUILDS_PER_DAY: "6",
     MAX_INDEX_BUILDS_PER_DAY_TOTAL: "100",
+    // questions (layer 5): asked per user per minute and per day, the seconds one may take (waiting for the model's turn
+    // included) and how many may wait for the turn at once
+    QUESTIONS_PER_MINUTE: "10",
+    MAX_QUESTIONS_PER_DAY: "30",
+    MAX_QUESTION_SECONDS: "60",
+    MAX_WAITING_QUESTIONS: "20",
     // how long one request to the model server may take before the API gives up on it
     OLLAMA_TIMEOUT_MS: "120000",
     // a closed port: a test that forgets to start the fake Ollama gets "connection refused" instead of reaching

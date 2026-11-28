@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { pool } from "./v1/config/db.config.js";
 import { createUserService } from "./v1/services/users.service.js";
 import { AppError } from "./v1/utils/appError.util.js";
+import { describeError } from "./v1/utils/describeError.util.js";
 import { emailRule } from "./v1/validators/auth.validator.js";
 
 // Creates the first admin: there is no self-registration, so the owner runs this once (`npm run create-admin --
@@ -39,7 +40,8 @@ const run = async (): Promise<void> => {
         await createUserService({ email, password, role: "admin" });
     } catch (creationError) {
         // "Email is already registered": nothing was changed, and no password is printed
-        console.error(creationError instanceof AppError ? `Could not create the admin: ${creationError.message}` : creationError);
+        const reason = creationError instanceof AppError ? creationError.message : describeError(creationError);
+        console.error(`Could not create the admin: ${reason}`);
         process.exitCode = 1;
         return;
     }
@@ -52,7 +54,7 @@ const run = async (): Promise<void> => {
 try {
     await run();
 } catch (error) {
-    console.error(error);
+    console.error(`Could not create the admin: ${describeError(error)}`);
     process.exitCode = 1;
 } finally {
     await pool.end();

@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { padVector } from "./doubles/fakeOllama.js";
 
-// Helpers for the tests of documents and indexes (layer 4). They put rows straight into the tables as the database
-// owner, the way a seed would, so a test can start from any state (an index half built, a failed one, another user's
-// full queue) without going through the API. They never use the app's own services: a test that seeded through the
-// code under test would agree with its mistakes. Everything is invented text.
+// Helpers for the tests of documents and indexes (layer 4) and of runs (layer 5). They put rows straight into the tables as
+// the database owner, the way a seed would, so a test can start from any state (an index half built, a failed one, another
+// user's full queue, a day of questions already asked) without going through the API. They never use the app's own services: a
+// test that seeded through the code under test would agree with its mistakes. Everything is invented text.
 
 export const DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:0.6b";
 
@@ -45,6 +46,10 @@ export interface SeedIndexOptions {
     chunks?: string[] | number;
     // how many of the first chunks already hold a vector; a ready index has all of them
     embeddedCount?: number;
+    // The vector of each chunk, by position: the first numbers of it, padded with zeros to 1024 (see padVector). It replaces the
+    // seeded vector of the chunks it covers, whether or not they are among the first `embeddedCount`. Integer vectors have exact
+    // cosine similarities: a question (1, 0) and a chunk (3, 4) score exactly 0.6.
+    vectors?: number[][];
     embeddingTokens?: number;
     attempts?: number;
     error?: string | null;
@@ -110,6 +115,15 @@ export const seedIndex = async (documentId: string, options: SeedIndexOptions = 
         [id, chunks, embeddedCount, vectorLiteral(SEEDED_VECTOR_VALUE)]
     );
 
+    if (options.vectors !== undefined) {
+        await pool.query(
+            `UPDATE chunks SET embedding = chosen.embedding::vector
+             FROM unnest($2::int[], $3::text[]) AS chosen(chunk_index, embedding)
+             WHERE chunks.index_id = $1 AND chunks.chunk_index = chosen.chunk_index`,
+            [id, options.vectors.map((_, position) => position), options.vectors.map((vector) => vectorLiteral(padVector(vector)))]
+        );
+    }
+
     return { id, documentId, chunkSize, embeddingModel, chunks };
 };
 
@@ -128,7 +142,80 @@ export const seedUsage = async (userId: string, count: number, hoursAgo = 0): Pr
     );
 };
 
-export const countRows = async (table: "documents" | "document_indexes" | "chunks" | "index_build_usage", where = "true", parameters: unknown[] = []): Promise<number> =>
+// `count` questions of the user that were counted, each `hoursAgo` hours old (question_usage is what the daily limit of questions
+// counts: a row for every embedding that was done, whether or not the run was stored afterwards)
+export const seedQuestionUsage = async (userId: string, count: number, hoursAgo = 0): Promise<void> => {
+    await (await owner()).query(
+        "INSERT INTO question_usage (user_id, used_at) SELECT $1::uuid, now() - ($3::numeric * interval '1 hour') FROM generate_series(1, $2::int)",
+        [userId, count, hoursAgo]
+    );
+};
+
+export interface SeedRunOptions {
+    // the kind the row says it is, and the kind inside its configuration; the table accepts only "retrieval" until layer 6
+    kind?: string;
+    status?: "matched" | "no_match";
+    // when the run happened: what the daily count of questions looks at
+    createdAt?: string | Date;
+    profileId?: string | null;
+    documentId?: string | null;
+    indexId?: string | null;
+}
+
+// One stored run of the user (a question that was answered), made as the owner. The defaults are a retrieval run that matched
+// nothing, now, with no profile, document or index. Returns its id.
+export const seedRun = async (userId: string, options: SeedRunOptions = {}): Promise<string> => {
+    const kind = options.kind ?? "retrieval";
+    const configuration = JSON.stringify({
+        kind,
+        version: 1,
+        settings: { chunkSize: 1000, embeddingModel: DEFAULT_EMBEDDING_MODEL, retrievalMode: "vector", topK: 3, minScore: 0.3, neighborWindow: 1 }
+    });
+    const { rows } = await (await owner()).query<{ id: string }>(
+        `INSERT INTO runs (user_id, kind, status, profile_id, document_id, index_id, configuration, configuration_hash, question_hash, question_characters,
+                           fragments, embedding_tokens, wait_ms, embedding_ms, retrieval_ms, total_ms, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 15, '[]'::jsonb, 0, 0, 0, 0, 0, COALESCE($10::timestamptz, now()))
+         RETURNING id`,
+        [userId, kind, options.status ?? "no_match", options.profileId ?? null, options.documentId ?? null, options.indexId ?? null,
+            configuration, sha256Of(configuration), sha256Of("a seeded question"), options.createdAt ?? null]
+    );
+
+    return rows[0].id;
+};
+
+export interface RunRow {
+    id: string;
+    userId: string;
+    kind: string;
+    status: string;
+    profileId: string | null;
+    documentId: string | null;
+    indexId: string | null;
+    configuration: Record<string, unknown>;
+    configurationHash: string;
+    questionHash: string;
+    questionCharacters: number;
+    fragments: Record<string, unknown>[];
+    embeddingTokens: number;
+    waitMs: number;
+    embeddingMs: number;
+    retrievalMs: number;
+    totalMs: number;
+    createdAt: Date;
+}
+
+// every row of runs, oldest first, as the owner reads them
+export const readRuns = async (where = "true", parameters: unknown[] = []): Promise<RunRow[]> =>
+    (await (await owner()).query<RunRow>(
+        `SELECT id, user_id AS "userId", kind, status, profile_id AS "profileId", document_id AS "documentId", index_id AS "indexId", configuration,
+                configuration_hash AS "configurationHash", question_hash AS "questionHash", question_characters AS "questionCharacters", fragments,
+                embedding_tokens AS "embeddingTokens", wait_ms AS "waitMs", embedding_ms AS "embeddingMs", retrieval_ms AS "retrievalMs",
+                total_ms AS "totalMs", created_at AS "createdAt"
+         FROM runs WHERE ${where} ORDER BY created_at, id`,
+        parameters
+    )).rows;
+
+export const countRows = async (table: "documents" | "document_indexes" | "chunks" | "index_build_usage" | "runs" | "question_usage", where = "true", parameters: unknown[] = []): Promise<number> =>
     (await (await owner()).query<{ count: number }>(`SELECT count(*)::int AS count FROM ${table} WHERE ${where}`, parameters)).rows[0].count;
 
 export interface IndexRow {

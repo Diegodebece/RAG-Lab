@@ -22,6 +22,10 @@ export const SETTING_KEYS = [
     "answerMode"
 ] as const;
 
+// The settings a search (retrieval only, no answer) runs with and stores: the other five do not apply to it, so a search never
+// accepts, stores or hashes them.
+export const RETRIEVAL_SETTING_KEYS = ["chunkSize", "embeddingModel", "retrievalMode", "topK", "minScore", "neighborWindow"] as const;
+
 // What each setting may hold. `kind` says whether changing it needs the documents indexed again (index) or only a
 // new question (question). A setting with `allowed` takes exactly one of those values, compared as written; the models
 // are limited to the ones the health check requires (REQUIRED_MODELS in ollama.config.ts), so a setting can never name

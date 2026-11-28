@@ -1,11 +1,13 @@
 openapi: 3.1.0
 info:
   title: RAG Lab API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     The API contract of RAG Lab for the frontend. Layer 1 (Foundations) added the health check; layer 2 (Accounts and
     authentication) added login, logout and the user endpoints; layer 3 (Configuration as data) added the
-    configuration and profile endpoints; layer 4 (Documents and indexes) added the document and index endpoints.
+    configuration and profile endpoints; layer 4 (Documents and indexes) added the document and index endpoints;
+    layer 5 (Retrieval) added the search of a document, the `questions` limits of the configuration and the
+    `documentId` of the dry run.
     Every later layer adds its paths here, in the same change that adds them to the code.
 
     All paths start with `/v1`. Every response is JSON and carries `Cache-Control: no-store`.
@@ -58,6 +60,8 @@ tags:
     description: The signed-in user's own documents, uploaded as text
   - name: Indexes
     description: The indexes of a document (one per chunk size and embedding model), built in the background
+  - name: Search
+    description: Retrieval over one of the signed-in user's documents; each search stores a run
 paths:
   /v1/health:
     get:
@@ -462,8 +466,8 @@ paths:
       description: |
         Everything a client needs to build a form for the settings: the configuration `version`, the definition of each
         setting in a fixed order (its type, and its allowed values or its range), the `defaults` the database holds
-        right now, the limits on profiles, the limits on documents (for an upload form) and the limits on building
-        indexes. Any signed-in user may read it.
+        right now, the limits on profiles, the limits on documents (for an upload form), the limits on building
+        indexes and the limits on questions (for a search box). Any signed-in user may read it.
 
         Values must be sent exactly as the definition says: numbers are JSON numbers, never text, and a value is never
         rounded or clamped by the server (a number with more decimals than `decimals` is refused, so 0.30000000000000004
@@ -522,6 +526,11 @@ paths:
                     maxActivePerUser: 1
                     maxBuildsPerDay: 6
                     maxBuildsPerDayTotal: 100
+                  questions:
+                    perMinute: 10
+                    maxPerDay: 30
+                    maxSeconds: 60
+                    maxCharacters: 1000
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -553,6 +562,17 @@ paths:
 
         It stays a dry run when `overrides` holds index-time settings (`chunkSize`, `embeddingModel`): nothing is
         indexed. An index is built only by `POST /v1/documents` and `POST /v1/documents/{id}/indexes`.
+
+        With `documentId`, `data` also holds `index`: the `id` and `status` of the index of that document at the
+        resolved `chunkSize` and `embeddingModel`, or `null` when the document has none. The document is looked up
+        after the configuration resolves, so a configuration problem is answered first. A `documentId` that is not a
+        UUID is a 400 ("Document id must be a valid UUID"); a document that does not exist or is not the caller's (an
+        admin's request included) is a 404 "Document not found". Without `documentId`, `data` has no `index` key.
+        Still nothing is written, no model is called and no limit on questions is spent.
+
+        `hash` is the hash of the full configuration (all eleven settings). It never equals the
+        `configurationHash` of a search run, which hashes the six retrieval settings and the kind only (see
+        `POST /v1/documents/{id}/search`).
       requestBody:
         required: false
         content:
@@ -615,13 +635,20 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
-          description: The profile does not exist, or belongs to another user ("Profile not found").
+          description: |
+            The profile does not exist, or belongs to another user ("Profile not found"); or, when `documentId` is
+            given, the document does not exist or is not the caller's ("Document not found").
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example:
-                message: Profile not found
+              examples:
+                profile:
+                  value:
+                    message: Profile not found
+                document:
+                  value:
+                    message: Document not found
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
@@ -1161,6 +1188,265 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+  /v1/documents/{id}/search:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The document's id (see `GET /v1/documents/{id}`).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Search]
+      operationId: searchDocument
+      summary: Search a document for a question
+      security:
+        - bearerAuth: []
+      description: |
+        Retrieval only: there is no answer text yet. It embeds the question with the embedding model, searches the
+        document's ready index exactly (cosine similarity, the best `topK` chunks whose score is at least
+        `minScore`) and returns those chunks, the matches, followed by their neighbors within `neighborWindow`.
+        It stores one run for the search and returns it. The request waits for the model, so it can take seconds.
+
+        **Configuration.** It resolves the caller's configuration like `POST /v1/configuration/resolve` (the default
+        profile, then the profile named by `profileId`, then `overrides`), but a search uses only the six retrieval
+        settings: `chunkSize`, `embeddingModel`, `retrievalMode`, `topK`, `minScore` and `neighborWindow`. A
+        setting that does not apply (`smallModel`, `temperature`, `maxTokens`, `answerLanguage`, `answerMode`) in
+        `overrides` is a 400 "<Label> does not apply to a search", whatever its value. The profile is still checked
+        in full: a stored profile outside today's caps is a 400 "The configuration is not valid" even when the
+        offending setting is not a retrieval one. The index searched is the one at the resolved `chunkSize` and
+        `embeddingModel`; it must be `ready`. This route never builds an index: build one with
+        `POST /v1/documents/{id}/indexes` first, and use `index` of `POST /v1/configuration/resolve` to see its
+        state.
+
+        **The run.** `configuration` is what ran (`kind`, `version` and the six settings) and `configurationHash` is
+        the SHA-256 (lowercase hex) of its canonical JSON. It is not the `hash` that `POST /v1/configuration/resolve`
+        gives for the same settings: that one covers all eleven settings and never equals a run's. Two searches that
+        differ only in the five answer settings (through the profile) have the same `configurationHash`. A client
+        never sends a snapshot, a hash or a configuration: they are refused as unknown fields. The server stores the
+        question only as a keyed hash and its length, and never the text of the fragments.
+
+        **Fragments.** `F1`, `F2` and so on, in the order the model will read them: the matches first, best score
+        first (a tie goes to the lower `chunkIndex`), then the neighbors of each match in document order, each
+        neighbor once. A match has a `score`; a neighbor has none. `text` is the text of the user's own document:
+        show it as plain text, never as HTML. `status` is `matched`, or `no_match` when no chunk reached `minScore`
+        (then `fragments` is `[]`; it is a 200, and the run is stored).
+
+        **Size.** The response is the fragments' text, so it grows with `topK`, `neighborWindow` and `chunkSize`: at
+        the largest values (30 matches, a window of 2, chunks of 5000 characters) it can reach about 2.25 MB.
+
+        **Limits**, in the order they are checked. None of the refusals stores a run, and only a question that
+        reached the model counts toward the day.
+        1. 429 over `questions.perMinute` per user (10 by default), counted before the body is read, every request
+           included. The counter is by user id alone: logging out and in does not start it again. It is separate
+           from the counters of uploads and index creation.
+        2. 413 for a body over 16 kB. 400 for a body that does not pass validation.
+        3. The configuration (404 or 400 for the profile, 500 for a profile at another configuration version),
+           then 404 for the document, then 409 for an index that is not ready.
+        4. 409 when the user already has a question in progress: one at a time per user.
+        5. 503 when `MAX_WAITING_QUESTIONS` questions are already waiting for the model (20 by default).
+        6. 429 over `questions.maxPerDay` questions in the last 24 hours (30 by default). A question counts when its
+           embedding was done, or when the client hung up after the request had been sent to the model. A refusal, a
+           hang-up while waiting for the model's turn, and a failure of the model server (503, 504, a malformed
+           answer) are free. A question counts even when its run was not stored afterwards.
+        7. 503 "The server is busy" when the model's turn did not come within the time the question has left.
+           `questions.maxSeconds` (60 by default) is the time a search has in all, waiting included.
+        8. The model server: 503 "The model server is not available", 504 "The model server did not answer in time"
+           (also when almost no time was left, so nothing was sent, or the time ran out while the index was being
+           searched), and 500 for an answer that is not what the API needs.
+        9. 404 or 409 when the document or the index was deleted while the question was being embedded and nothing
+           matched: the same answers as before; no run is stored.
+
+        The model's turn is shared with the indexing of documents, one request at a time for the whole server, so a
+        search waits for the batch being embedded and for the searches ahead of it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+            example:
+              question: Who is the narrator?
+              overrides:
+                topK: 5
+      responses:
+        "200":
+          description: The search ran and its run was stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchRunResponse"
+              example:
+                success: true
+                message: Search completed successfully
+                data:
+                  id: 9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d
+                  kind: retrieval
+                  status: matched
+                  documentId: 7c1d9e2a-3b4f-4a5d-8e6f-0a1b2c3d4e5f
+                  indexId: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  profileId: null
+                  configuration:
+                    kind: retrieval
+                    version: 1
+                    settings:
+                      chunkSize: 1000
+                      embeddingModel: qwen3-embedding:0.6b
+                      retrievalMode: vector
+                      topK: 5
+                      minScore: 0.3
+                      neighborWindow: 1
+                  configurationHash: 0000000000000000000000000000000000000000000000000000000000000000
+                  fragments:
+                    - id: F1
+                      chunkIndex: 12
+                      text: The text of the chunk that matched.
+                      retrieval: match
+                      score: 0.71
+                    - id: F2
+                      chunkIndex: 11
+                      text: The text of the chunk before it.
+                      retrieval: neighbor
+                  tokens:
+                    embedding: 9
+                  timings:
+                    waitMs: 0.41
+                    embeddingMs: 40.2
+                    retrievalMs: 3.1
+                    totalMs: 51.7
+                  createdAt: "2026-11-27T12:10:00.000Z"
+        "400":
+          description: |
+            The body does not pass validation ("Validation error", with `details`), or the settings stored in the
+            profile are outside today's caps ("The configuration is not valid", with every problem in `details`).
+            Validation problems: "Question is required", "Question must be a string", "Question cannot be empty",
+            "Question cannot have more than 1000 characters" (counted after trimming), a setting outside its cap, a
+            setting that does not apply ("<Label> does not apply to a search"), "Profile id must be a valid UUID"
+            and any field this route does not have (`snapshot`, `hash`, `configuration` and `configurationHash`
+            included: "<field> is not allowed").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                question:
+                  value:
+                    message: Validation error
+                    details:
+                      - Question cannot be empty
+                notApplicable:
+                  value:
+                    message: Validation error
+                    details:
+                      - Temperature does not apply to a search
+                storedProfileOutsideCaps:
+                  value:
+                    message: The configuration is not valid
+                    details:
+                      - Top K must be at most 30
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: |
+            The profile does not exist or is not the caller's ("Profile not found"), or the document does not exist,
+            is not the caller's (an admin's request included) or its id is not a UUID ("Document not found"). Also
+            the document deleted while the question was being embedded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                profile:
+                  value:
+                    message: Profile not found
+                document:
+                  value:
+                    message: Document not found
+        "409":
+          description: |
+            The document has no ready index at the resolved chunk size and model: it is missing, queued, being built
+            or failed ("This document has no ready index for chunk size N"; nothing is built). Or the user already
+            has a question in progress ("You already have a question in progress, please wait for it to finish").
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noReadyIndex:
+                  value:
+                    message: This document has no ready index for chunk size 1000
+                questionInProgress:
+                  value:
+                    message: You already have a question in progress, please wait for it to finish
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          description: |
+            Either the per-minute limit of questions, with `Retry-After` ("Too many requests, please try again
+            later"), or the day's limit ("You have reached the daily limit of questions, please try again later"),
+            which no `Retry-After` helps with: say so to the user. The per-user limit of 120 requests per minute and
+            the per-address floor give the first message too.
+          headers:
+            RateLimit:
+              $ref: "#/components/headers/RateLimit"
+            RateLimit-Policy:
+              $ref: "#/components/headers/RateLimitPolicy"
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                requestLimit:
+                  value:
+                    message: Too many requests, please try again later
+                daily:
+                  value:
+                    message: You have reached the daily limit of questions, please try again later
+        "500":
+          description: |
+            An unexpected failure ("Internal server error"). It is also the answer when the model server returned
+            something this API cannot use (a malformed embedding or token count), when the profile was saved by
+            another configuration version, and when the default profile is not valid. No run is stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: Internal server error
+        "503":
+          description: |
+            The server is busy ("The server is busy, please try again in a few minutes": too many questions are
+            waiting, or the model's turn did not come in time), the model server cannot be reached ("The model
+            server is not available"), or the database cannot be reached (the usual message). Try again later; none
+            of them counts toward the day.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                busy:
+                  value:
+                    message: The server is busy, please try again in a few minutes
+                modelServer:
+                  value:
+                    message: The model server is not available
+                database:
+                  value:
+                    message: The database is not available, please try again later
+        "504":
+          description: |
+            The model server did not answer in time ("The model server did not answer in time"), or the time of the
+            question ran out. No run is stored. A question whose embedding was already done still counts toward the
+            day when the time ran out afterwards.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                message: The model server did not answer in time
   /v1/documents/{id}/indexes:
     parameters:
       - name: id
@@ -1696,7 +1982,7 @@ components:
           description: The most decimal places a value may have.
     ConfigurationView:
       type: object
-      required: [version, defaults, settings, profiles, documents, indexes]
+      required: [version, defaults, settings, profiles, documents, indexes, questions]
       properties:
         version:
           type: integer
@@ -1745,6 +2031,23 @@ components:
             maxBuildsPerDayTotal:
               type: integer
               description: The most builds all users together may start in the last 24 hours. A user who finds it used up gets a 429 although their own limit is not.
+        questions:
+          type: object
+          description: The limits on questions (searches today, answers in a later layer).
+          required: [perMinute, maxPerDay, maxSeconds, maxCharacters]
+          properties:
+            perMinute:
+              type: integer
+              description: The most questions a user may send per minute (429 over it, with `Retry-After`). The counter is by user and survives a logout and a login.
+            maxPerDay:
+              type: integer
+              description: The most questions a user may send to the model in the last 24 hours (429 over it; no `Retry-After` helps).
+            maxSeconds:
+              type: integer
+              description: The time one question has in all, in seconds, waiting for the model's turn included.
+            maxCharacters:
+              type: integer
+              description: The longest question, in characters, counted after trimming.
     ConfigurationSnapshot:
       type: object
       description: The configuration a question runs with, complete and checked against the caps.
@@ -1771,7 +2074,22 @@ components:
           pattern: "^[0-9a-f]{64}$"
           description: |
             SHA-256 in lowercase hex of the canonical JSON of the snapshot (keys sorted at every level, no spaces,
-            UTF-8). The profile id and the dates are not part of it. An identifier, not a security control.
+            UTF-8). The profile id and the dates are not part of it. An identifier, not a security control. It covers
+            all eleven settings, so it never equals the `configurationHash` of a search run.
+        index:
+          description: |
+            Present only when the request had a `documentId`: the index of that document at the resolved `chunkSize`
+            and `embeddingModel`, or null when it has none.
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [id, status]
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                status:
+                  $ref: "#/components/schemas/IndexStatus"
     Profile:
       type: object
       description: A saved configuration. The owner's id and the configuration version are never returned.
@@ -1838,6 +2156,10 @@ components:
           description: The profile to start from, one of the caller's own. Plain hyphenated form, any case.
         overrides:
           $ref: "#/components/schemas/SettingsInput"
+        documentId:
+          type: string
+          format: uuid
+          description: One of the caller's documents. When given, the answer says which index of it the configuration would use.
     ConfigurationViewResponse:
       type: object
       required: [success, message, data]
@@ -2060,6 +2382,170 @@ components:
           type: string
         data:
           $ref: "#/components/schemas/DocumentIndex"
+    RetrievalSettingsInput:
+      type: object
+      additionalProperties: false
+      description: |
+        The `overrides` of a search: only the six retrieval settings, each optional. A key that is one of the other
+        five settings is a 400 "<Label> does not apply to a search", whatever its value; any other key is refused as
+        an unknown setting. Nothing is converted, rounded or clamped.
+      properties:
+        chunkSize:
+          $ref: "#/components/schemas/Settings/properties/chunkSize"
+        embeddingModel:
+          $ref: "#/components/schemas/Settings/properties/embeddingModel"
+        retrievalMode:
+          $ref: "#/components/schemas/Settings/properties/retrievalMode"
+        topK:
+          $ref: "#/components/schemas/Settings/properties/topK"
+        minScore:
+          $ref: "#/components/schemas/Settings/properties/minScore"
+        neighborWindow:
+          $ref: "#/components/schemas/Settings/properties/neighborWindow"
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      required: [question]
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: The question, 1 to 1000 characters after trimming (`questions.maxCharacters`). It is embedded as it is, trimmed, with no instruction added.
+        profileId:
+          type: string
+          format: uuid
+          description: The profile to start from, one of the caller's own.
+        overrides:
+          $ref: "#/components/schemas/RetrievalSettingsInput"
+    RetrievalSnapshot:
+      type: object
+      description: What a search ran with, and what its hash covers. Nothing else is part of it.
+      required: [kind, version, settings]
+      properties:
+        kind:
+          type: string
+          const: retrieval
+        version:
+          type: integer
+          description: The configuration version.
+        settings:
+          type: object
+          required: [chunkSize, embeddingModel, retrievalMode, topK, minScore, neighborWindow]
+          properties:
+            chunkSize:
+              $ref: "#/components/schemas/Settings/properties/chunkSize"
+            embeddingModel:
+              $ref: "#/components/schemas/Settings/properties/embeddingModel"
+            retrievalMode:
+              $ref: "#/components/schemas/Settings/properties/retrievalMode"
+            topK:
+              $ref: "#/components/schemas/Settings/properties/topK"
+            minScore:
+              $ref: "#/components/schemas/Settings/properties/minScore"
+            neighborWindow:
+              $ref: "#/components/schemas/Settings/properties/neighborWindow"
+    Fragment:
+      type: object
+      description: A chunk of the document placed in the result, a match or the neighbor of one.
+      required: [id, chunkIndex, text, retrieval]
+      properties:
+        id:
+          type: string
+          pattern: "^F[1-9][0-9]*$"
+          description: "`F1`, `F2` and so on, in the order of the array."
+        chunkIndex:
+          type: integer
+          minimum: 0
+          description: The chunk's position in the index (0 is the first).
+        text:
+          type: string
+          description: |
+            The chunk's text, from the user's own document. It is not sanitized for display and can hold anything the
+            document held: render it as plain text, never as HTML.
+        retrieval:
+          type: string
+          enum: [match, neighbor]
+        score:
+          type: number
+          description: The cosine similarity, from `minScore` to 1. Only on a `match`.
+    SearchRun:
+      type: object
+      description: One search, as stored, with the fragments it returned. The text of the fragments is not stored.
+      required: [id, kind, status, documentId, indexId, profileId, configuration, configurationHash, fragments, tokens, timings, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          const: retrieval
+        status:
+          type: string
+          enum: [matched, no_match]
+          description: "`no_match`: no chunk reached `minScore`; `fragments` is empty."
+        documentId:
+          type: string
+          format: uuid
+        indexId:
+          type: string
+          format: uuid
+        profileId:
+          type:
+            - string
+            - "null"
+          format: uuid
+          description: The profile asked for; null when the request named none.
+        configuration:
+          $ref: "#/components/schemas/RetrievalSnapshot"
+        configurationHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: |
+            SHA-256 in lowercase hex of the canonical JSON of `configuration`. It is not the `hash` of
+            `POST /v1/configuration/resolve`, which covers all eleven settings and never equals this one.
+        fragments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Fragment"
+        tokens:
+          type: object
+          required: [embedding]
+          properties:
+            embedding:
+              type: integer
+              minimum: 0
+              description: The tokens of the question, as the model server counted them.
+        timings:
+          type: object
+          description: Milliseconds, with two decimals.
+          required: [waitMs, embeddingMs, retrievalMs, totalMs]
+          properties:
+            waitMs:
+              type: number
+              description: Waiting for the model's turn.
+            embeddingMs:
+              type: number
+            retrievalMs:
+              type: number
+              description: The search of the index and the neighbors.
+            totalMs:
+              type: number
+              description: From the start of the request in the service to the end of the search.
+        createdAt:
+          type: string
+          format: date-time
+    SearchRunResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/SearchRun"
   responses:
     Unauthorized:
       description: |
@@ -2203,7 +2689,7 @@ components:
     PayloadTooLarge:
       description: |
         The body is over the limit of its route ("request entity too large"). It is refused before it is parsed. The
-        limit is 16 kB on the configuration, profile and index routes. On `POST /v1/documents` it is 3 bytes per
+        limit is 16 kB on the configuration, profile, index and search routes. On `POST /v1/documents` it is 3 bytes per
         allowed character plus 16 kB (about 3 MB with the default of 1,000,000 characters).
       content:
         application/json:
@@ -2226,7 +2712,8 @@ components:
         Over a limit. The same body whichever one it is: the per-address floor (300 requests per minute per client
         address, any path), the limit of the route (health checks, logins, failed logins, password changes, account
         creations) or the per-user limit of protected paths (120 per minute). Wait `Retry-After` seconds. The upload
-        and index-building routes have limits of their own and a few more 429 messages: see `IndexBuildLimit`.
+        and index-building routes have limits of their own and a few more 429 messages: see `IndexBuildLimit`. The
+        search route has its own too, and the day's limit of questions: see `POST /v1/documents/{id}/search`.
       headers:
         RateLimit:
           $ref: "#/components/headers/RateLimit"

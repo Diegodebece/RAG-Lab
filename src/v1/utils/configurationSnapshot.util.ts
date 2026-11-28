@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import type { ConfigurationSnapshot } from "../types/configuration.type.js";
+import { RETRIEVAL_SETTING_KEYS } from "../config/configuration.config.js";
+import type { ConfigurationSettings, ConfigurationSnapshot } from "../types/configuration.type.js";
+import type { RetrievalSettings, RetrievalSnapshot } from "../types/runs.type.js";
+
+type RetrievalSettingKey = (typeof RETRIEVAL_SETTING_KEYS)[number];
 
 const isPlainObject = (value: object): value is Record<string, unknown> => {
     const prototype = Object.getPrototypeOf(value);
@@ -56,3 +60,25 @@ export const hashSnapshotText = (text: string): string => createHash("sha256").u
 // with it cannot alter what it later stores as the configuration it used.
 export const freezeSnapshot = (snapshot: ConfigurationSnapshot): Readonly<ConfigurationSnapshot> =>
     Object.freeze({ version: snapshot.version, settings: Object.freeze({ ...snapshot.settings }) });
+
+// the value of one retrieval setting, copied from the full settings into the retrieval ones (generic, so each key keeps its own type)
+const copySetting = <K extends RetrievalSettingKey>(target: Partial<RetrievalSettings>, source: Readonly<ConfigurationSettings>, key: K): void => {
+    target[key] = source[key];
+};
+
+// What a search runs with and stores: { kind: "retrieval", version, settings } with the six retrieval settings and not the five
+// answer ones, frozen. The keys are copied one by one as own properties of the full settings, never spread or read through the
+// prototype, so nothing but those six can get in. Two searches that differ only in an answer setting give the same text and
+// the same hash.
+export const toRetrievalSnapshot = (snapshot: Readonly<ConfigurationSnapshot>): Readonly<RetrievalSnapshot> => {
+    const settings: Partial<RetrievalSettings> = {};
+
+    for (const key of RETRIEVAL_SETTING_KEYS) {
+        if (Object.hasOwn(snapshot.settings, key)) {
+            copySetting(settings, snapshot.settings, key);
+        }
+    }
+
+    // the resolver gave all six settings, checked against the caps, so the copy is complete
+    return Object.freeze({ kind: "retrieval", version: snapshot.version, settings: Object.freeze(settings as RetrievalSettings) });
+};

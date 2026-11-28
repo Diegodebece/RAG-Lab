@@ -1,5 +1,5 @@
 import { EMBEDDING_DIMENSIONS, FLOAT4_MAX } from "../config/indexing.config.js";
-import { OLLAMA_BASE_URL } from "../config/ollama.config.js";
+import { MAX_REPORTED_TOKENS, OLLAMA_BASE_URL } from "../config/ollama.config.js";
 import { MalformedModelAnswerError } from "../utils/malformedModelAnswerError.util.js";
 import { ModelTimeoutError } from "../utils/modelTimeoutError.util.js";
 import { ModelUnavailableError } from "../utils/modelUnavailableError.util.js";
@@ -100,13 +100,22 @@ const requestOllama = async ({ method, path, body }: OllamaRequest, { timeoutMs,
 // The names of the models installed in Ollama (GET /api/tags), exactly as Ollama writes them, tag included
 // ("qwen3.5:4b"). An answer of another shape is a plain Error, for the same reason as a non-OK one.
 export const listInstalledModelsService = async (options: RequestOptions): Promise<string[]> => {
+    const models = await listInstalledModelDigestsService(options);
+
+    return models.map((model) => model.name);
+};
+
+// The same list with the digest Ollama reports for each model (decision D2 of layer 5): the evaluation harness records it at the
+// start and the end of a sweep, to see whether a model was pulled again in the middle of it. A model whose entry has no digest, or
+// one that is not text, has a digest of null. Failures are the same as listInstalledModelsService's.
+export const listInstalledModelDigestsService = async (options: RequestOptions): Promise<{ name: string; digest: string | null }[]> => {
     const body = await requestOllama({ method: "GET", path: "/api/tags" }, options);
 
     if (!isModelList(body)) {
         throw new Error("Ollama must return a list of models, each with a name");
     }
 
-    return body.models.map((model) => model.name);
+    return body.models.map((model) => ({ name: model.name, digest: "digest" in model && typeof model.digest === "string" ? model.digest : null }));
 };
 
 const isVector = (value: unknown): value is number[] =>
@@ -141,7 +150,8 @@ export const embedTextsService = async (model: string, texts: string[], options:
 
     const promptTokens = "prompt_eval_count" in body ? body.prompt_eval_count : undefined;
 
-    if (typeof promptTokens !== "number" || !Number.isSafeInteger(promptTokens) || promptTokens < 0) {
+    // an integer from 0 to what an integer column holds: it is stored as it is, and a bigger one is the model server's fault
+    if (typeof promptTokens !== "number" || !Number.isSafeInteger(promptTokens) || promptTokens < 0 || promptTokens > MAX_REPORTED_TOKENS) {
         throw new MalformedModelAnswerError("Ollama must return the number of tokens it embedded");
     }
 

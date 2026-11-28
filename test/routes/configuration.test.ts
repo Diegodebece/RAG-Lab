@@ -7,6 +7,8 @@ import { startFakeOllama } from "../doubles/fakeOllama.js";
 
 const SECRET = "test-secret-only-for-these-tests-0123456789";
 process.env.SECRET_KEY = SECRET;
+// the file reports the limits on questions, so this one is the app's default and not the relaxed value of the import above
+process.env.QUESTIONS_PER_MINUTE = "10";
 
 // resolving a configuration must never reach the model server: the double records every request, so a test can see none came
 const fake = await startFakeOllama();
@@ -62,9 +64,20 @@ describe("GET /v1/configuration", () => {
         assert.equal(response.status, 200);
         assert.equal(response.body.success, true);
         assert.equal(response.body.message, "Configuration retrieved successfully");
-        assert.deepEqual(Object.keys(response.body.data).sort(), ["defaults", "documents", "indexes", "profiles", "settings", "version"]);
+        assert.deepEqual(Object.keys(response.body.data).sort(), ["defaults", "documents", "indexes", "profiles", "questions", "settings", "version"]);
         assert.equal(response.body.data.version, 1);
         assert.deepEqual(response.body.data.profiles, { maxPerUser: 20, maxNameLength: 100 });
+    });
+
+    // what a client that builds a question box needs to know, and what the harness reads before a sweep to see whether its runs fit
+    it("reports the limits on questions, with the values of the server: per minute, per day, the seconds one may take and its length", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+
+        const response = await view(ana.auth);
+
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body.data.questions, { perMinute: 10, maxPerDay: 30, maxSeconds: 60, maxCharacters: 1000 });
+        assert.deepEqual(Object.keys(response.body.data.questions).sort(), ["maxCharacters", "maxPerDay", "maxSeconds", "perMinute"]);
     });
 
     // what a client that builds an upload form needs to know: the limits on documents and on the builds of indexes
@@ -497,5 +510,152 @@ describe("POST /v1/configuration/resolve", () => {
 
         assert.equal(response.status, 400);
         assert.equal(typeof response.body.message, "string");
+    });
+
+    // Covers behavior that exists today (the plan's D17): a default profile moved to another version while the server runs is the
+    // server's own fault, so the client gets the generic 500 and nothing about the data.
+    it("answers 500 with the generic message when the default profile was moved to another configuration version while the server runs", { timeout: 15_000 }, async (t) => {
+        t.mock.method(console, "error", () => {});
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const profileId = await seedProfile(ana.id, "{\"temperature\": 0.5}");
+        await ownerPool.query("UPDATE default_profile SET version = 2");
+
+        for (const body of [{}, { profileId }]) {
+            const response = await resolve(ana.auth, body);
+
+            assert.equal(response.status, 500, JSON.stringify(body));
+            assert.deepEqual(response.body, GENERIC_500, JSON.stringify(body));
+        }
+    });
+});
+
+// Layer 5 (D8): the body may name a document of the caller's, and the answer then says which index the resolved chunk size and model
+// would use. It stays a dry run: it builds nothing, counts nothing and asks the model server for nothing.
+describe("POST /v1/configuration/resolve with a documentId", () => {
+    const INDEX_STATES = ["queued", "indexing", "ready", "failed"] as const;
+
+    it("says which index the document has for the resolved chunk size and model: { id, status } for a queued, indexing, ready or failed one", { timeout: 30_000 }, async () => {
+        for (const status of INDEX_STATES) {
+            const user = await createTestUser({ email: `${status}@example.com` });
+            const document = await seedDocument(user.id, { filename: `${status}.txt` });
+            const index = await seedIndex(document.id, { status, chunkSize: 1000, error: status === "failed" ? "Indexing failed" : null });
+
+            const response = await resolve(user.auth, { documentId: document.id });
+
+            assert.equal(response.status, 200, `${status}: ${JSON.stringify(response.body)}`);
+            assert.deepEqual(response.body.data.index, { id: index.id, status }, status);
+        }
+    });
+
+    it("answers index: null when the document has no index at the resolved size and model", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedDocument(ana.id);
+        await seedIndex(document.id, { status: "ready", chunkSize: 500 });
+
+        const response = await resolve(ana.auth, { documentId: document.id });
+
+        assert.equal(response.status, 200, JSON.stringify(response.body));
+        assert.equal(response.body.data.index, null);
+        assert.equal(Object.hasOwn(response.body.data, "index"), true, "a key with a null, and not a missing key");
+    });
+
+    it("answers for the index of the chunk size in the overrides and the profile, and not for the default size", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedDocument(ana.id);
+        const thousand = await seedIndex(document.id, { status: "ready", chunkSize: 1000 });
+        const five = await seedIndex(document.id, { status: "queued", chunkSize: 500 });
+        const profileId = await seedProfile(ana.id, "{\"chunkSize\": 500}");
+
+        const byDefault = await resolve(ana.auth, { documentId: document.id });
+        const byOverride = await resolve(ana.auth, { documentId: document.id, overrides: { chunkSize: 500 } });
+        const byProfile = await resolve(ana.auth, { documentId: document.id, profileId });
+        const overProfile = await resolve(ana.auth, { documentId: document.id, profileId, overrides: { chunkSize: 1000 } });
+        const missing = await resolve(ana.auth, { documentId: document.id, overrides: { chunkSize: 300 } });
+
+        assert.deepEqual(byDefault.body.data.index, { id: thousand.id, status: "ready" });
+        assert.deepEqual(byOverride.body.data.index, { id: five.id, status: "queued" });
+        assert.deepEqual(byProfile.body.data.index, { id: five.id, status: "queued" });
+        assert.deepEqual(overProfile.body.data.index, { id: thousand.id, status: "ready" });
+        assert.equal(missing.body.data.index, null);
+    });
+
+    it("answers with the keys hash, index, profileId and snapshot only when a documentId is given, and the same answer as before without one", { timeout: 15_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedDocument(ana.id);
+        await seedIndex(document.id, { status: "ready" });
+
+        const withDocument = await resolve(ana.auth, { documentId: document.id });
+        const without = await resolve(ana.auth, {});
+
+        assert.deepEqual(Object.keys(withDocument.body.data).sort(), ["hash", "index", "profileId", "snapshot"]);
+        assert.deepEqual(Object.keys(without.body.data).sort(), ["hash", "profileId", "snapshot"]);
+        assert.deepEqual(withDocument.body.data.snapshot, without.body.data.snapshot, "the configuration is the same one");
+        assert.equal(withDocument.body.data.hash, without.body.data.hash, "and has the hash it always had: the full one, answer settings included");
+        assert.equal(withDocument.body.data.hash, DEFAULT_SNAPSHOT_HASH);
+    });
+
+    it("answers 404 'Document not found' for another user's document, an admin's request for it and an unknown id, and 400 for a malformed id", { timeout: 20_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const bob = await createTestUser({ email: "bob@example.com" });
+        const admin = await createTestUser({ email: "admin@example.com", role: "admin" });
+        const document = await seedDocument(ana.id);
+        await seedIndex(document.id, { status: "ready" });
+
+        for (const caller of [bob, admin]) {
+            for (const documentId of [document.id, randomUUID()]) {
+                const response = await resolve(caller.auth, { documentId });
+
+                assert.equal(response.status, 404, documentId);
+                assert.deepEqual(response.body, { message: "Document not found" }, documentId);
+            }
+        }
+
+        for (const documentId of ["not-a-uuid", `{${document.id}}`, document.id.replaceAll("-", ""), ""]) {
+            const response = await resolve(ana.auth, { documentId });
+
+            assert.equal(response.status, 400, documentId);
+            assert.equal(response.body.message, "Validation error", documentId);
+            assert.deepEqual(response.body.details, ["Document id must be a valid UUID"], documentId);
+        }
+    });
+
+    it("checks the document after the configuration: a profile that is not found, or a configuration that is not valid, is answered before an unknown document", { timeout: 20_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const outOfCap = await seedProfile(ana.id, "{\"topK\": 31}");
+
+        const noProfile = await resolve(ana.auth, { documentId: randomUUID(), profileId: randomUUID() });
+        assert.equal(noProfile.status, 404);
+        assert.deepEqual(noProfile.body, { message: "Profile not found" });
+
+        const invalid = await resolve(ana.auth, { documentId: randomUUID(), profileId: outOfCap });
+        assert.equal(invalid.status, 400);
+        assert.equal(invalid.body.message, "The configuration is not valid");
+
+        const badOverride = await resolve(ana.auth, { documentId: randomUUID(), overrides: { topK: 31 } });
+        assert.equal(badOverride.status, 400);
+        assert.equal(badOverride.body.message, "Validation error");
+    });
+
+    it("stays a dry run: no index, chunk, usage or run row is made, and nothing reaches the model server, also for a size the document has no index for", { timeout: 20_000 }, async () => {
+        const ana = await createTestUser({ email: "ana@example.com" });
+        const document = await seedDocument(ana.id);
+        await seedIndex(document.id, { status: "ready", chunkSize: 1000 });
+        const before = [await countRows("document_indexes"), await countRows("chunks"), await countRows("index_build_usage"), await countRows("runs")];
+        fake.requests.splice(0);
+
+        for (const overrides of [undefined, { chunkSize: 300 }, { chunkSize: 5000, topK: 9 }]) {
+            const response = await resolve(ana.auth, { documentId: document.id, ...(overrides ? { overrides } : {}) });
+
+            assert.equal(response.status, 200, JSON.stringify(overrides));
+        }
+
+        assert.deepEqual([await countRows("document_indexes"), await countRows("chunks"), await countRows("index_build_usage"), await countRows("runs")], before);
+        assert.deepEqual(fake.requests, [], "nothing reached the model server");
+    });
+
+    it("answers 401 without a token", { timeout: 15_000 }, async () => {
+        const response = await request(app).post("/v1/configuration/resolve").send({ documentId: randomUUID() });
+
+        assert.equal(response.status, 401);
     });
 });
