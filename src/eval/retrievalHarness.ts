@@ -27,8 +27,9 @@ import type { RunLine, SearchTimings, Summary } from "./results.js";
 // grid (a smaller k, a minimum score, the other window) is derived from the wide run, and the reference run proves the derivation.
 // Every input is an explicit option, so the tests call it directly; src/eval/retrieval.ts is the only file that reads the environment.
 //
-// The results hold ids and numbers only. A question, a passage of the evidence or a piece of a document is never written to a file or
-// printed, and neither is the password or the token.
+// The results hold ids and numbers, and the names of the documents (the file names of the owner's own documents). They go only to the
+// private data folder and to the operator's terminal: never to the repository, a commit or a pull request. A question, a passage of the
+// evidence or a piece of a document is never written to a file or printed, and neither is the password or the token.
 
 export interface RetrievalSweepOptions {
     // where the API listens, and the harness account
@@ -139,6 +140,8 @@ interface PreparedCase {
 }
 
 interface Prepared {
+    // the real path of the data folder, as assertDataDirectory returned it: the sweep folder is made below this one
+    dataDirectory: string;
     setSha256: string;
     cases: PreparedCase[];
     documents: Map<string, PreparedDocument>;
@@ -269,6 +272,7 @@ const prepare = async (options: RetrievalSweepOptions): Promise<Prepared> => {
     });
 
     return {
+        dataDirectory,
         setSha256: loaded.sha256,
         cases: prepared,
         documents,
@@ -907,7 +911,7 @@ const finish = async (context: Context, abortMessage: string | null): Promise<vo
     });
     await writeJsonFile(folder, "summary.json", summary);
 
-    // the printed lines are numbers and ids
+    // the printed lines are numbers, ids and document names, for the operator's terminal
     for (const line of formatSummary(summary)) {
         output(line);
     }
@@ -951,7 +955,7 @@ const runSweep = async (context: Context): Promise<RetrievalSweepOutcome> => {
 
     // a sweep never overwrites another
     try {
-        state.folder = await createSweepFolder(path.resolve(options.dataDirectory), options.setName, state.startedAt);
+        state.folder = await createSweepFolder(prepared.dataDirectory, options.setName, state.startedAt);
         await createRunsFile(state.folder);
     } catch (error) {
         state.folder = null;

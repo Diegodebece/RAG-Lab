@@ -4,8 +4,9 @@ import { contextAtK, fullAtK, hitAtK, nearestRankPercentile, topScore } from "./
 import type { Match, Passage } from "./metrics.js";
 
 // What a sweep writes, in a folder of its own in the data directory: manifest.json (what it ran on), runs.jsonl (one line for each
-// search) and summary.json (the numbers), and what it prints. Everything here is ids and numbers: never a question, a passage, a piece
-// of a document, a password or a token.
+// search) and summary.json (the numbers), and what it prints. Everything here is ids, numbers and the names of the documents (the
+// owner's own file names), and it goes only to the private data folder and to the operator's terminal: never a question, a passage,
+// a piece of a document, a password or a token.
 
 export const RECALL_KS = [1, 3, 5, 10, 20, 30];
 export const CONTEXT_WINDOWS = [1, 2];

@@ -35,7 +35,7 @@ export interface ApiClient {
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
-// how long to wait before each of the three more tries of a 503 or a 504
+// how long to wait before each of the three more tries of a 503 (a 504 is returned at once, with no retry)
 const BUSY_RETRY_DELAYS_MS = [2000, 5000, 10_000];
 
 // the most times a request waits out a per-minute limit before it gives up
@@ -186,7 +186,9 @@ export const createApiClient = (options: ApiClientOptions): ApiClient => {
                 continue;
             }
 
-            if ((response.status === 503 || response.status === 504) && busyRetries < BUSY_RETRY_DELAYS_MS.length) {
+            // a 504 is not tried again: the server says the question took all the time it had, and asking again would spend another
+            // question of the day on the same slow model
+            if (response.status === 503 && busyRetries < BUSY_RETRY_DELAYS_MS.length) {
                 await sleep(BUSY_RETRY_DELAYS_MS[busyRetries]);
                 busyRetries += 1;
                 continue;
