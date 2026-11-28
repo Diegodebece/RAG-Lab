@@ -1,16 +1,20 @@
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { getSecretKey } from "../config/auth.config.js";
 import { pool } from "../config/db.config.js";
+import { MIN_MODEL_CALL_MS } from "../config/limits.config.js";
 import { OLLAMA_TIMEOUT_MS } from "../config/ollama.config.js";
 import type { Fragment, RetrievalRun, RetrievalSettings, RunStatus, RunTimings } from "../types/runs.type.js";
 import { hashSnapshotText, toCanonicalJson, toRetrievalSnapshot } from "../utils/configurationSnapshot.util.js";
 import { isForeignKeyViolation } from "../utils/dbErrors.util.js";
+import { ModelTimeoutError } from "../utils/modelTimeoutError.util.js";
+import { RequestCancelledError } from "../utils/requestCancelledError.util.js";
 import type { SearchDocumentInput } from "../validators/runs.validator.js";
 import { resolveConfigurationService } from "./configuration.service.js";
 import { findReadyIndexService } from "./documentIndexes.service.js";
 import { runWithModelTurnService } from "./modelTurn.service.js";
 import { embedTextsService } from "./ollama.service.js";
-import { admitQuestionService, createQuestionDeadline } from "./questionAdmission.service.js";
+import { admitQuestionService, createQuestionDeadline, recordQuestionUsageService } from "./questionAdmission.service.js";
 import { findFragmentsService } from "./retrieval.service.js";
 
 // milliseconds with two decimals, the unit and precision the runs table and the response use
@@ -25,8 +29,24 @@ const toQueryText = (mode: RetrievalSettings["retrievalMode"], question: string)
     }
 };
 
-// SHA-256 of the trimmed question as UTF-8: pairs the same question across runs without keeping its text
-const hashQuestion = (question: string): string => createHash("sha256").update(question, "utf8").digest("hex");
+// What names the key of the question hashes: a change to how they are made takes a new version here, so old and new hashes are
+// never taken for each other.
+const QUESTION_HASH_KEY_LABEL = "rag-lab:question-hash:v1";
+
+// HMAC-SHA-256 of the trimmed question as UTF-8, keyed from SECRET_KEY: it pairs the same question across runs without keeping its
+// text, and nobody who only holds the table can compute the hash of a guessed question. Rotating SECRET_KEY changes every hash, so
+// the runs from before a rotation are no longer paired with the ones after it.
+const hashQuestion = (question: string): string => {
+    const secretKey = getSecretKey();
+
+    if (!secretKey) {
+        throw new Error("SECRET_KEY is not set");
+    }
+
+    const key = createHmac("sha256", secretKey).update(QUESTION_HASH_KEY_LABEL).digest();
+
+    return createHmac("sha256", key).update(question, "utf8").digest("hex");
+};
 
 // what the table keeps of a fragment: where it was, why it was returned and its score, never its text
 const toStoredFragment = (fragment: Fragment): { chunkIndex: number; retrieval: Fragment["retrieval"]; score?: number } => ({
@@ -90,10 +110,13 @@ const insertRun = async (run: RunToStore): Promise<{ id: string; createdAt: Date
 // Searches one of the caller's documents for a question, and stores the run. In this order, and a refusal at any step stores and
 // counts nothing: the configuration is resolved (the profile and the caps), the ready index of the document at the resolved chunk
 // size and model is found (it never builds one: a missing or unfinished index is a 409), the question is admitted (one at a time
-// per user, a place in the line, the day's count), it waits for the model's turn and is embedded within the time the question has
-// left, the index is searched after the turn is released, and the run is inserted. The signal takes the question out of the line, or
-// stops the embedding, when the client disconnects; once the embedding is back, the run is stored and counted whatever the client
-// does.
+// per user, a place in the line, the day's count of question_usage), it waits for the model's turn and is embedded within the time
+// the question has left (under MIN_MODEL_CALL_MS left, nothing is sent), the question is counted (a row of question_usage) as soon
+// as the embedding is done, the index is searched after the turn is released, and the run is inserted. The signal takes the
+// question out of the line, or stops the embedding, when the client disconnects; a client that hangs up after the request was sent
+// is counted too, because the model did the work. Once the embedding is back, the question stays counted whatever happens to the
+// run: an index or a document that went meanwhile is the refusal it would have been before the embedding, and a question that ran
+// out of time while the index was searched is a 504, both with no run stored.
 export const searchDocumentService = async (userId: string, documentId: string, input: SearchDocumentInput, signal?: AbortSignal): Promise<RetrievalRun> => {
     const started = performance.now();
     const deadline = createQuestionDeadline();
@@ -107,6 +130,7 @@ export const searchDocumentService = async (userId: string, documentId: string, 
     const configurationHash = hashSnapshotText(configurationText);
     const { settings } = snapshot;
     const index = await findReadyIndexService(userId, documentId, settings);
+    const questionHash = hashQuestion(input.question);
 
     const ticket = await admitQuestionService(userId);
 
@@ -116,17 +140,49 @@ export const searchDocumentService = async (userId: string, documentId: string, 
         const queued = performance.now();
         const maxWaitMs = deadline.timeLeft();
 
-        const embedded = await runWithModelTurnService(async () => {
+        // true once the request is on its way to Ollama: from then on the model works for the question, whatever the client does
+        const call = { requestSent: false };
+
+        // what runs when the turn comes
+        const embedInTurn = async (): Promise<{ vector: number[]; tokens: number; waitMs: number; embeddingMs: number }> => {
             ticket.started();
             const waitMs = elapsedSince(queued);
             const embeddingStarted = performance.now();
+            const timeLeft = deadline.timeLeft();
+
+            // a question that finds almost no time left cannot be a real embedding: it is the 504 of a model that was too slow, and
+            // nothing is sent
+            if (timeLeft < MIN_MODEL_CALL_MS) {
+                throw new ModelTimeoutError();
+            }
+
+            // an aborted signal sends nothing (the wrapper refuses before it calls fetch), and a question that was not sent is free
+            call.requestSent = signal?.aborted !== true;
+
             const { embeddings, promptTokens } = await embedTextsService(settings.embeddingModel, [toQueryText(settings.retrievalMode, input.question)], {
-                timeoutMs: Math.min(deadline.timeLeft(), OLLAMA_TIMEOUT_MS),
+                timeoutMs: Math.min(timeLeft, OLLAMA_TIMEOUT_MS),
                 signal
             });
 
             return { vector: embeddings[0], tokens: promptTokens, waitMs, embeddingMs: elapsedSince(embeddingStarted) };
-        }, { maxWaitMs, signal });
+        };
+
+        let embedded: Awaited<ReturnType<typeof embedInTurn>>;
+
+        try {
+            embedded = await runWithModelTurnService(embedInTurn, { maxWaitMs, signal });
+        } catch (error) {
+            // the client hung up after the request was sent: Ollama did the work, so the question counts. A failure of the model
+            // server (503, 504, a malformed answer) and a cancel before the request was sent cost nothing.
+            if (call.requestSent && error instanceof RequestCancelledError) {
+                await recordQuestionUsageService(userId);
+            }
+
+            throw error;
+        }
+
+        // the embedding is done: the question counts, whatever becomes of the run (the search below can fail, and the index can be gone)
+        await recordQuestionUsageService(userId);
 
         const retrievalStarted = performance.now();
         const fragments = await findFragmentsService(userId, index.id, embedded.vector, {
@@ -136,8 +192,17 @@ export const searchDocumentService = async (userId: string, documentId: string, 
         });
         const retrievalMs = elapsedSince(retrievalStarted);
 
+        // nothing was close enough, or the index went while the question was being embedded: the same checks as before the
+        // question was admitted tell them apart, and a gone document or index is the refusal it would have been then, with no run
+        if (fragments.length === 0) {
+            await findReadyIndexService(userId, documentId, settings);
+        }
+
         const status: RunStatus = fragments.length === 0 ? "no_match" : "matched";
         const timings: RunTimings = { waitMs: embedded.waitMs, embeddingMs: embedded.embeddingMs, retrievalMs, totalMs: elapsedSince(started) };
+
+        // the time of the question is up: the answer is the 504 of a model that was too slow, and no run is stored (the usage row stays)
+        deadline.timeLeft();
 
         const stored = await insertRun({
             userId,
@@ -147,7 +212,7 @@ export const searchDocumentService = async (userId: string, documentId: string, 
             indexId: index.id,
             configurationText,
             configurationHash,
-            questionHash: hashQuestion(input.question),
+            questionHash,
             questionCharacters: input.question.length,
             fragmentsText: JSON.stringify(fragments.map(toStoredFragment)),
             embeddingTokens: embedded.tokens,

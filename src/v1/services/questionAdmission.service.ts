@@ -29,9 +29,9 @@ export interface QuestionTicket {
 
 // Decides whether a question may start now. The first three steps run with nothing awaited in between, so requests that arrive in
 // the same moment cannot all pass: the user's own question in progress (409), the line (503), and then the user and the place are
-// taken. Then it counts the user's runs of the last 24 hours (a run is stored only when it completed, so a failure of the model
-// server costs the user nothing) and refuses at the limit (429). A refusal leaves nothing taken. The caller releases the ticket in a
-// `finally`, on every path.
+// taken. Then it counts the user's questions of the last 24 hours, the rows of question_usage (one is written when an embedding is
+// done, so a failure of the model server costs the user nothing, and a client that hangs up during the embedding is still counted)
+// and refuses at the limit (429). A refusal leaves nothing taken. The caller releases the ticket in a `finally`, on every path.
 export const admitQuestionService = async (userId: string): Promise<QuestionTicket> => {
     if (usersInProgress.has(userId)) {
         throw new AppError(409, IN_PROGRESS_MESSAGE);
@@ -66,7 +66,7 @@ export const admitQuestionService = async (userId: string): Promise<QuestionTick
 
     try {
         const { rows } = await pool.query<{ count: number }>(
-            "SELECT count(*)::int AS count FROM runs WHERE user_id = $1 AND created_at > now() - interval '24 hours'",
+            "SELECT count(*)::int AS count FROM question_usage WHERE user_id = $1 AND used_at > now() - interval '24 hours'",
             [userId]
         );
 
@@ -79,6 +79,12 @@ export const admitQuestionService = async (userId: string): Promise<QuestionTick
     }
 
     return { started, release };
+};
+
+// Counts one question against the user's day. The caller writes it when the embedding is done, or when the client hung up after
+// the request was sent to the model: the model did the work either way. The row stays whatever happens to the run afterwards.
+export const recordQuestionUsageService = async (userId: string): Promise<void> => {
+    await pool.query("INSERT INTO question_usage (user_id) VALUES ($1)", [userId]);
 };
 
 export interface QuestionDeadline {

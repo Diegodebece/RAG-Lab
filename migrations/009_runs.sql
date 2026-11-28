@@ -1,4 +1,5 @@
--- One row for every question the API answered: the record of what ran, and the count the daily limit of questions reads.
+-- One row for every question the API answered: the record of what ran. The daily limit of questions does not read it but
+-- question_usage, below: a question that used the model counts even when its run was never stored.
 -- Layer 5 stores retrieval runs only; layer 6 widens kind and status with its own migration.
 CREATE TABLE runs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -26,7 +27,7 @@ CREATE TABLE runs (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- one user's runs of the last day: the foreign key's index, and the daily count
+-- one user's runs, by time: the foreign key's index
 CREATE INDEX runs_user_id_created_at_idx ON runs (user_id, created_at);
 
 -- runs of the same configuration, for the comparisons of later layers
@@ -37,6 +38,22 @@ CREATE INDEX runs_profile_id_idx ON runs (profile_id);
 CREATE INDEX runs_document_id_idx ON runs (document_id);
 CREATE INDEX runs_index_id_idx ON runs (index_id);
 
--- insert-only for the API: a run is a record and the daily count, never rewritten or given back. The SET NULL and CASCADE
--- actions of the foreign keys run with the rights of the table's owner, so deleting a profile, a document or an index still works.
+-- insert-only for the API: a run is a record, never rewritten or given back. The SET NULL and CASCADE actions of the foreign
+-- keys run with the rights of the table's owner, so deleting a profile, a document or an index still works.
 REVOKE UPDATE, DELETE ON runs FROM rag_lab_api;
+
+-- One row for every embedding the API did for a question, whether the embedding came back or the client hung up while it ran
+-- (the model did the work either way), and whether or not the run was stored afterwards. The daily limit of questions counts
+-- these rows, so a question cannot be repeated for free by hanging up. A question that never reached the model (a refusal, a
+-- wait for the turn that was cancelled, a model server that failed) writes none.
+CREATE TABLE question_usage (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    used_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- one user's questions of the last day (its first column is the foreign key's)
+CREATE INDEX question_usage_user_id_used_at_idx ON question_usage (user_id, used_at);
+
+-- written once and only ever counted
+REVOKE UPDATE, DELETE ON question_usage FROM rag_lab_api;

@@ -19,13 +19,17 @@ interface FragmentOptions {
 export const findFragmentsService = async (userId: string, indexId: string, questionVector: number[], options: FragmentOptions): Promise<Fragment[]> => {
     const vector = JSON.stringify(questionVector);
 
-    // <=> is the cosine distance, so 1 - distance is the similarity; ties keep the document's order
+    // <=> is the cosine distance, so 1 - distance is the similarity; ties keep the document's order. PostgreSQL treats NaN as greater
+    // than every number, so a chunk whose distance is NaN (a norm that under- or overflows float4: only the owner can store one) would
+    // pass the minimum and be returned with a score that JSON writes as null: it is left out here, and buildFragments refuses any
+    // score that is still not finite.
     const { rows: matches } = await pool.query<ScoredChunk>(
         `SELECT c.chunk_index AS "chunkIndex", c.text, (1 - (c.embedding <=> $3::vector))::float8 AS score
          FROM chunks c
          JOIN document_indexes di ON di.id = c.index_id
          JOIN documents d ON d.id = di.document_id
          WHERE c.index_id = $1 AND d.user_id = $2 AND di.status = 'ready' AND c.embedding IS NOT NULL
+           AND NOT ((c.embedding <=> $3::vector) = 'NaN'::float8)
            AND 1 - (c.embedding <=> $3::vector) >= $4
          ORDER BY c.embedding <=> $3::vector, c.chunk_index
          LIMIT $5`,

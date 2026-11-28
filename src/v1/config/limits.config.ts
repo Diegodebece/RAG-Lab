@@ -87,8 +87,14 @@ export const QUESTIONS_PER_MINUTE = readIntegerSetting("QUESTIONS_PER_MINUTE", 1
 
 export const QUESTION_WINDOW_MS = MINUTE_MS;
 
-// questions one user may have answered in the last 24 hours, counted from the runs table
+// questions one user may have sent to the model in the last 24 hours, counted from the question_usage table: a row for every
+// embedding that was done, so a question whose client hung up, or whose run was not stored, still counts
 export const MAX_QUESTIONS_PER_DAY = readIntegerSetting("MAX_QUESTIONS_PER_DAY", 30, 1, 100_000);
+
+// The least time a question must have left, once its turn has come, for the API to call the model at all: a request with a few
+// milliseconds left cannot be a real embedding, and the model server would be left working for nobody. Under it the answer is the
+// 504 of a model that was too slow.
+export const MIN_MODEL_CALL_MS = 250;
 
 // how long one question may take in all, waiting for the model's turn included. Cloudflare cuts a response at 100 seconds,
 // so the top is 90.

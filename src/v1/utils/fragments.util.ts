@@ -36,7 +36,15 @@ export const getNeighborIndexes = (matches: Pick<ChunkText, "chunkIndex">[], win
 
 // Matches first (best score first), then the neighbors of each match within the window, without duplicates. At window 1 it is the
 // order of RAG1 and RAG Web, so the ids F1..Fn the model sees are the ones it was evaluated with.
+// A match whose score is not a finite number is a fault upstream, and it throws: JSON writes NaN and Infinity as null, so it would be
+// answered, and stored, as a match with no score at all.
 export const buildFragments = (matches: ScoredChunk[], neighbors: ChunkText[], window: number): Fragment[] => {
+    for (const match of matches) {
+        if (!Number.isFinite(match.score)) {
+            throw new Error(`The score of chunk ${match.chunkIndex} is not a finite number`);
+        }
+    }
+
     const neighborsByIndex = new Map(neighbors.map((neighbor) => [neighbor.chunkIndex, neighbor]));
     const included = new Set(matches.map((match) => match.chunkIndex));
     const ordered: Omit<Fragment, "id">[] = matches.map((match) => ({

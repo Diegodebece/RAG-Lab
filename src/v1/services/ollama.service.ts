@@ -1,5 +1,5 @@
 import { EMBEDDING_DIMENSIONS, FLOAT4_MAX } from "../config/indexing.config.js";
-import { OLLAMA_BASE_URL } from "../config/ollama.config.js";
+import { MAX_REPORTED_TOKENS, OLLAMA_BASE_URL } from "../config/ollama.config.js";
 import { MalformedModelAnswerError } from "../utils/malformedModelAnswerError.util.js";
 import { ModelTimeoutError } from "../utils/modelTimeoutError.util.js";
 import { ModelUnavailableError } from "../utils/modelUnavailableError.util.js";
@@ -150,7 +150,8 @@ export const embedTextsService = async (model: string, texts: string[], options:
 
     const promptTokens = "prompt_eval_count" in body ? body.prompt_eval_count : undefined;
 
-    if (typeof promptTokens !== "number" || !Number.isSafeInteger(promptTokens) || promptTokens < 0) {
+    // an integer from 0 to what an integer column holds: it is stored as it is, and a bigger one is the model server's fault
+    if (typeof promptTokens !== "number" || !Number.isSafeInteger(promptTokens) || promptTokens < 0 || promptTokens > MAX_REPORTED_TOKENS) {
         throw new MalformedModelAnswerError("Ollama must return the number of tokens it embedded");
     }
 

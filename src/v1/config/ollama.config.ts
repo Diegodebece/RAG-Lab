@@ -9,6 +9,10 @@ export const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://localhost
 // take a while to answer the first time, so the default is two minutes.
 export const OLLAMA_TIMEOUT_MS = readIntegerSetting("OLLAMA_TIMEOUT_MS", 120_000, 1000, 600_000);
 
+// The most tokens an answer of Ollama may report (prompt_eval_count): the largest value of the integer columns that store it
+// (PostgreSQL integer, 2 ** 31 - 1). A larger count would be refused by the database after the work was done.
+export const MAX_REPORTED_TOKENS = 2_147_483_647;
+
 // The models the API needs installed to be fully healthy: the router and the embedding model. The models a profile may
 // choose are limited by the caps in configuration.config.ts, and the answer models are added there when they exist.
 export const REQUIRED_MODELS = ["qwen3.5:4b", "qwen3-embedding:0.6b"];
