@@ -2,7 +2,7 @@
 
 Status: design agreed on 2026-11-25 in a conversation held in the RAG Web project. Building follows the order in
 section 13; layer 1 (Foundations) and layer 2 (Accounts and authentication) were built on 2026-11-26, and layer 3
-(Configuration as data) and layer 4 (Documents and indexes) on 2026-11-27. Every session
+(Configuration as data), layer 4 (Documents and indexes) and layer 5 (Retrieval endpoint) on 2026-11-27. Every session
 and agent working on RAG Lab reads this file first. Decisions change only with the owner's approval, and
 each change is recorded here.
 
@@ -137,14 +137,23 @@ profiles.
 
 - Documents belong to one user; admins get the same 404 as anyone else. Builds start only in the document services (`createDocumentService`, `createDocumentIndexService`); `findReadyIndexService` never builds and answers 409 when the index is not ready; `POST /v1/configuration/resolve` stays a dry run that accepts index-time overrides and starts nothing. This closes the layer 3 finding about index-time overrides triggering builds.
 - An upload creates the document and its first index (202), taking a missing `chunkSize` or `embeddingModel` from the default profile through the resolver. A request for an index that is queued, indexing or ready answers 200; a failed one is queued again (202) and counts as a build.
-- Index builds are capped per user and for the server (section 12). The search is exact, with no vector index (HNSW or IVFFlat) until layer 5 measures.
+- Index builds are capped per user and for the server (section 12). The search is exact, with no vector index (HNSW or IVFFlat). Changed on 2026-11-27 (layer 5): layer 5 keeps it exact and builds the measurement (the harness records the search time per index); whether exact search needs HNSW is decided by the owner with the numbers of experiment E1, and an approximate index would itself go through the experiment loop.
 
 **The snapshot and its hash.** Resolving a configuration gives `{ version, settings }` with all eleven settings. Its
 hash is the SHA-256 (hex) of its canonical JSON: keys sorted at every level, no spaces, UTF-8. The profile id and the
 dates are outside, so identical settings from two profiles or two users are one configuration. The hash is an
 identifier, not a security control. Layer 5's runs table stores `configuration jsonb`, `configuration_hash text`
 (indexed) and `profile_id` (nullable, `ON DELETE SET NULL`); layer 3 has no snapshot table. Layer 6 adds a `fixed`
-section (`num_ctx`, `seed`, `think`, the prompt id) with a version bump; layers 5 and 13 add the model digests.
+section (`num_ctx`, `seed`, `think`, the prompt id) with a version bump; layer 13 adds the model digests (changed on
+2026-11-27, layer 5: not layer 5, see below).
+
+**Built in layer 5 (decided by the owner on 2026-11-27, with the plan).**
+
+- **The runs table** (migration 009). One row for every search: the kind (`retrieval`; layer 6 widens it), the status (`matched` or `no_match`), the profile, document and index ids (each `ON DELETE SET NULL`, so a deleted profile, document or index leaves its runs), the configuration and its hash, the question's keyed hash and its length (never the text), the fragments as `{ chunkIndex, retrieval, score? }` (never their text), the embedding tokens, and the timings (wait, embedding, retrieval and total, in milliseconds). It is insert-only for the API role: a run is a record, never rewritten or given back.
+- **What a run stores** is `{ kind: "retrieval", version, settings }` with the six retrieval settings, and its hash is the SHA-256 of exactly that. The five answer settings do not apply to a search: an override of one is a 400, and two profiles that differ only in them give one hash. The profile is still resolved and checked in full. A client never sends a snapshot or a hash. `POST /v1/configuration/resolve` keeps its hash over all eleven settings, so it never equals a run's.
+- **Model digests** are not stored per run or per index in layer 5. The harness records the digest of every installed model from `/api/tags` at the start and at the end of each sweep and warns when one changed, which is what experiment E1's comparability needs on this machine, where models change only when the owner pulls them. Storing a digest in each index and refusing a question whose model differs is for layer 13 (hosting), where someone else may update a model.
+- **Questions.** The question is stored as an HMAC-SHA-256 keyed from `SECRET_KEY`, not as text or a plain hash: a question can quote a document the user later deletes, and a plain hash of a short text can be guessed. Layer 10 decides whether run history needs the text.
+- **Caps.** The daily count of questions is read from `question_usage` (insert-only, one row for every question that reached the model), not from `runs`. See section 12.
 
 ## 5. Token accounting (as fine as possible)
 
@@ -156,6 +165,8 @@ Per question and per model call:
 - input tokens served from Ollama's prompt cache (a cached prefix lowers `prompt_eval_count`; verify);
 - thinking tokens and answer tokens separately (both are inside `eval_count`);
 - the sum over both calls when the cascade escalates.
+
+Changed on 2026-11-27 (layer 5): the question's embedding tokens are stored in every run (`runs.embedding_tokens`, the `prompt_eval_count` of the embed call, an integer from 0 to 2147483647: a larger value is a malformed answer).
 
 Per document: embedding tokens of every chunk, per index (chunk size). Changed on 2026-11-27 (layer 4): the embedding tokens are built as one total per index (`embedding_tokens`, the sum of the `prompt_eval_count` of the stored batches, in `document_indexes`). Per-chunk counts come with layer 9's tokenizer.
 
@@ -207,6 +218,15 @@ Starts from RAG1's harness and improves it:
 Evaluation data is private: it stays git-ignored.
 
 Decided on 2026-11-27 (layer 4): the harness uploads the evaluation documents through the API as a harness account, and reuses them by `contentHash` (the SHA-256 of the stored text) instead of uploading them on every run. The same text twice for the same user is a 409, so the harness looks the hash up first.
+
+Built in layer 5 (decided by the owner on 2026-11-27, with the plan): the retrieval-only harness, `npm run eval:retrieval` (`src/eval/`, a client of the API that nothing imports).
+
+- **Account and caps.** An ordinary `user` account made with the admin endpoint, its credentials only in `.env`. For a sweep the owner raises the caps in the development server's `.env`; the harness's preflight names each variable that does not fit. There is no exemption in code until layer 10.
+- **Runs.** Two searches per question and chunk size: a wide run (`topK` 30, `minScore` 0) and a reference run (the default configuration). Under exact search the top k of the top 30, the minimum score and the neighbors derive exactly, so every point of the grid comes from the wide run, and the reference run proves the derivation. Each build finishes before the first search, and the first search of a sweep is left out of the latency figures.
+- **Evidence matching.** The evidence passage is matched in the text after Unicode NFC and whitespace collapse (the chunker's own), exactly and case-sensitively; evidence that is not found is listed by id and left out of recall. The metrics: the rank of the first match that overlaps the passage, hit@k, full@k (the whole passage inside the top k matches) and context@k,w (inside the top k plus their neighbors within w, which is what the answer model reads), so every failure is labeled retrieval or answer. A case may have several passages. `--check` does the matching offline before any cap is spent.
+- **Where the files are.** Private, in `RAG_LAB_DATA_DIR`: the evaluation sets (`eval\sets\<name>.json`, RAG1's format as it is, read without a copy that can drift), the documents as UTF-8 text (`eval\documents\<name>.txt`, named after the file name in each case's `indexPath`) and the results (`results\retrieval\<time>-<set>\`: the manifest, one line per run and the summary, holding ids, numbers and the documents' file names, never a question, a passage or a document's text). The harness refuses a data folder inside any git checkout and links that leave it.
+- **Models.** The harness records the model digests at the start and the end of a sweep (see section 4). It reads the model server through its own `OLLAMA_BASE_URL`, and that address is not checked against the API's: both must point at the same Ollama.
+- **The vector index.** The harness records the search time per index next to the embedding and total times, on the largest index (about 2,000 chunks at size 300). That answers layer 4's D12 (section 4) with numbers; the owner decides after E1.
 
 ## 8. Agent team
 
@@ -421,7 +441,12 @@ The skills were copied from RAG Web unchanged, except for these changes:
   parent first, a retry that probes the model server (timeouts included, database errors kept apart), build caps under
   a user lock plus an advisory lock with a lock-free pre-check, `describeError` for logs, an upload limiter before a
   derived body limit, a nested router, 202 for accepted work and 200 for "ensure", and index-time fields built from
-  the caps.
+  the caps;
+- with layer 5 (2026-11-27) the skills gained the patterns of a model call made while a request waits: synchronous
+  admission and a deadline shared by every step, a usage table that the daily cap counts (and not the results table),
+  an HMAC hash of user text, NaN guards, a re-check after the model call, a limiter keyed by user id alone, a result
+  table that is insert-only with `SET NULL` foreign keys, overrides that forbid the settings that do not apply, the
+  rule that no log takes an error object (checked by a scan), and the rules of `src/eval/`.
 
 `CLAUDE.md` is RAG Web's standards with a RAG Lab section on top: the loops, the approval gates, GitHub, private
 data and the hooks.
@@ -435,6 +460,18 @@ data and the hooks.
   embeddings, layer 6 for answers), taking RAG Web's values: 10 questions per minute, 30 per day, 1 at a time per
   user, 60 s per question, 20 waiting. Layer 10 adds per-user token budgets per day. Still open, needing the owner or
   measurements: the token budgets (after layer 9), and an exemption or higher caps for the harness account (layer 10).
+  Decided on 2026-11-27 (layer 5), taking RAG Web's values, all in `.env` with a range except the constants: 10
+  questions per minute per user (`QUESTIONS_PER_MINUTE`, 1 to 1000, in memory, counted before the body is read, keyed by
+  user id alone so a logout and a login do not reset it), 30 questions per user in the last 24 hours
+  (`MAX_QUESTIONS_PER_DAY`, 1 to 100000, 429), 60 seconds per question, waiting for the model included
+  (`MAX_QUESTION_SECONDS`, 1 to 90, because Cloudflare cuts a response at 100 s), 20 questions waiting for the model,
+  all users together (`MAX_WAITING_QUESTIONS`, 1 to 1000, 503; indexing batches are not counted), and one question at a
+  time per user (a constant, 409). The day's count reads `question_usage`, one row for every question whose embedding
+  was done or whose client hung up after the request reached Ollama (the model did the work); a refusal, a cancel while
+  waiting, a 503, a 504 and a malformed answer are free, and the row stays even when the run is not stored. A question
+  shorter than 250 ms of time left is not sent. The in-memory parts (the one-at-a-time set, the waiting count, the
+  per-minute counter) hold for one process; layer 13 revisits them. Still open: the exemption for the harness account
+  (layer 10; until then the owner raises the caps in `.env` for a sweep).
   Decided on 2026-11-27 (layer 4): the build caps, all in `.env` with a range: 3 documents per user
   (`MAX_DOCUMENTS_PER_USER`, 409), 5 uploads per minute per user (`UPLOAD_REQUESTS_PER_MINUTE`, also the limit of
   `POST /v1/documents/:id/indexes`, with its own counter), 1 index build in progress per user
@@ -458,7 +495,7 @@ goes through the experiment loop once the layers before it exist.
 | 2 | Accounts and authentication | Users, login, tokens |
 | 3 | Configuration as data | Caps, default profile, user profiles, the snapshot of a question's configuration |
 | 4 | Documents and indexes | One index per chunk size; the indexing queue. Built 2026-11-27 |
-| 5 | Retrieval endpoint | The runs table and the retrieval-only harness |
+| 5 | Retrieval endpoint | The runs table and the retrieval-only harness. Built 2026-11-27; the outcome of layer 4's D12 (does exact search need HNSW?) is pending the first sweep, E1 |
 | E1 | Retrieval sweeps | Chunk size, chunking, retrieval mode, top_k, neighbors |
 | 6 | Questions | Answers with the small model. Must include the defences against prompt injection from document text (below), with tests |
 | 7 | Answer harness | Scorer, LLM judge, paired statistics |
