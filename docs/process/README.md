@@ -37,5 +37,5 @@ The per-call records (`calls.jsonl`) and gzip copies of the transcripts are kept
 | #6 `feature/accounts` | 2026-11-26 16:50 | 618 | 783,160 | 96,953,397 | USD 33.03 | 23 % |
 | #7 `feature/configuration` | 2026-11-26 21:58 | 482 | 606,775 | 68,002,425 | USD 27.75 | 29 % |
 | #8 `feature/documents` | 2026-11-27 14:10 | 554 | 856,177 | 100,837,812 | USD 33.79 | 20 % |
-| `feature/retrieval` | 2026-11-27 19:08 | 0 | 0 | 0 | USD 0.00 | 0 % |
+| `feature/retrieval` | 2026-11-27 19:08 | 672 | 918,332 | 137,498,974 | USD 40.37 | 15 % |
 <!-- usage-summary:end -->
